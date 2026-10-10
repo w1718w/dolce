@@ -24,8 +24,15 @@ import {
 import { keyHit, VISUAL_ACTIONS, type VisualAction, type VisualMode } from "./keys";
 import { type Clip, clipFor, itemsToText, setClip } from "./clipboard";
 import { clipOfChords, directionTextOf, locate, measureCtx } from "../../model/edit";
-import { harmonyText } from "../../model/jianpu";
+import { harmonyText, keySpelling } from "../../model/jianpu";
 import { showTransposeDialog, transposeText } from "./transpose";
+import { transcribeScore } from "../../model/transcribe";
+import { dropEmbeddedLayout, forgetNoteLayout } from "../../model/xmlsurface";
+import {
+  CHROMATIC_PRESET_ID, emitTranscribedSource, sanitizeTranscriptionPresetId, sanitizeTranscriptionPresets,
+  showTranscriptionDialog, sourceDiff, type TranscriptionPreset,
+} from "../transcription";
+import type { DocFormatId } from "../formats";
 import { lyricTextOf, setLyricText } from "./lyrics";
 import { selectionInfo } from "./selinfo";
 import { type InlineDone, inlineEditing, openInlineEditor } from "./inline";
@@ -42,6 +49,7 @@ const CLIPBOARD_ACTIONS = new Set(["edit.copy", "edit.cut", "edit.paste"]);
 const actionById = (id: string): VisualAction => VISUAL_ACTIONS.find((a) => a.id === id)!;
 
 export interface VisualHost {
+  readonly docFormat: DocFormatId;
   readonly view: EditorView;
   /** 当前的双向定位索引（每次重排后重建） */
   readonly sync: SyncIndex;
@@ -129,6 +137,9 @@ export class VisualEditController {
   private beatCursor = -1;
   /** 记号面板：显示与否持久化 */
   showPalette = false;
+  /** “转记…”里的用户预设与上次使用项。 */
+  transcriptionPresets: TranscriptionPreset[] = [];
+  transcriptionPreset = CHROMATIC_PRESET_ID;
   private paletteEl: HTMLElement | null = null;
   private paletteBtn: HTMLButtonElement | null = null;
   private paletteRefresh: (() => void) | null = null;
@@ -209,11 +220,16 @@ export class VisualEditController {
     this.syncButtons();
   }
 
-  loadSettings(s: { showFormatMarks?: unknown; beatCheck?: unknown; noteSound?: unknown; showPalette?: unknown }): void {
+  loadSettings(s: {
+    showFormatMarks?: unknown; beatCheck?: unknown; noteSound?: unknown; showPalette?: unknown;
+    transcriptionPresets?: unknown; transcriptionPreset?: unknown;
+  }): void {
     if (typeof s.showPalette === "boolean") this.showPalette = s.showPalette;
     if (typeof s.showFormatMarks === "boolean") this.showFormatMarks = s.showFormatMarks;
     if (typeof s.noteSound === "boolean") this.noteSound = s.noteSound;
     if (typeof s.beatCheck === "boolean") this.beatCheck = s.beatCheck;
+    this.transcriptionPresets = sanitizeTranscriptionPresets(s.transcriptionPresets);
+    this.transcriptionPreset = sanitizeTranscriptionPresetId(s.transcriptionPreset, this.transcriptionPresets);
     this.syncButtons();
   }
 
@@ -1269,6 +1285,7 @@ export class VisualEditController {
       case "edit.paste": return this.paste(clipFor(null), null);
       case "edit.repeat": return this.repeat();
       case "edit.transpose": return this.transpose();
+      case "edit.transcribe": return this.transcribe();
       case "lyric.entry": return this.startLyrics();
       case "chord.entry": return this.startChords();
       case "text.entry": return this.startAttached("annotation");
@@ -1711,6 +1728,50 @@ export class VisualEditController {
       if (whole) this.apply(transposeText(c, n));
       else this.editNotes((cc, f, t) => shiftSemitones(cc, f, t, n), true);
     });
+    return true;
+  }
+
+  /** 转记：实际音高不动，全曲统一到目标 `1=?`，并按预设重算升降号。 */
+  private transcribe(): boolean {
+    showTranscriptionDialog(
+      { presets: this.transcriptionPresets, selectedId: this.transcriptionPreset },
+      (state) => {
+        this.transcriptionPresets = state.presets;
+        this.transcriptionPreset = state.selectedId;
+        this.host.saveSettings();
+      },
+      (options) => {
+        this.host.scorePane.focus({ preventScroll: true });
+        if (!this.host.syncFresh()) this.host.reloadNow();
+        const source = this.host.modelEditing() ? this.host.freshModel() : this.host.syncDoc();
+        if (!source) {
+          this.host.setStatus(tr("tx.unreadable"));
+          return;
+        }
+        const doc = this.host.modelEditing() ? source : structuredClone(source);
+        try {
+          const result = transcribeScore(doc, options, this.host.modelEditing()
+            ? { forgetStem: forgetNoteLayout, forgetLayout: dropEmbeddedLayout }
+            : {});
+          if (result.notes === 0) {
+            this.host.setStatus(tr("tx.noNotes"));
+            return;
+          }
+          const before = this.host.view.state.doc.toString();
+          const after = this.host.modelEditing()
+            ? this.host.writeModel(doc)
+            : emitTranscribedSource(this.host.docFormat, before, source, doc);
+          if (after !== before) {
+            this.host.view.dispatch({ changes: [sourceDiff(before, after)], userEvent: "input.visual", scrollIntoView: false });
+            this.host.reloadNow();
+          }
+          this.host.setStatus(tr("tx.done", { key: keySpelling({ fifths: options.fifths }) }));
+        } catch (error) {
+          console.error("transcription failed", error);
+          this.host.setStatus(tr("tx.failed", { error: error instanceof Error ? error.message : String(error) }));
+        }
+      },
+    );
     return true;
   }
 

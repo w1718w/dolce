@@ -1218,7 +1218,7 @@ export function transposeScore(doc: ScoreDoc, n: number, hooks: EditHooks = {}):
 }
 
 /** MIDI 音高拼成音名：调内音优先，其次本位，再按 `sign` 取升或降。 */
-function spellMidi(midi: number, fifths: number, sign: number): Pitch {
+export function spellMidi(midi: number, fifths: number, sign: number): Pitch {
   let best: Pitch | null = null;
   let rank = Infinity;
   for (const step of STEPS) {
