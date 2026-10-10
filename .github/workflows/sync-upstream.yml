@@ -1,0 +1,61 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 每天 02:17（北京时间）检查一次，避开整点拥堵。
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+env:
+  NPM_CONFIG_REGISTRY: https://registry.npmmirror.com
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Merge upstream when conflict-free
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/lodebar2026/dolce.git
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          git merge --no-edit upstream/main
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Node
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify merged web build
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          npm ci
+          npm run build
+
+      - name: Push verified merge
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:${{ github.event.repository.default_branch }}

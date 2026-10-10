@@ -1,11 +1,71 @@
-name: Build
+name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NPM_CONFIG_REGISTRY: https://registry.npmmirror.com
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release-draft: ${{ steps.release.outputs.draft }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate tag and versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p "require('./package.json').version")"
+          tauri_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          if [[ "${version}" != "${package_version}" || "${version}" != "${tauri_version}" || "${version}" != "${cargo_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package (${package_version}), Tauri (${tauri_version}), and Cargo (${cargo_version}) versions."
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify web build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Create draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft)"
+          else
+            gh release create "${GITHUB_REF_NAME}" --verify-tag --draft --generate-notes --title "${GITHUB_REF_NAME}"
+            draft=true
+          fi
+          echo "draft=${draft}" >> "${GITHUB_OUTPUT}"
+
   build:
+    needs: prepare
     permissions:
       contents: write
     strategy:
@@ -18,9 +78,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
-
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v5
 
@@ -46,11 +104,8 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
-      # 先单独编一遍 exe 校验：ort 静态链进来的 ONNX Runtime 是 /MD 编的，exe 直接导入
-      # MSVCP140*/VCRUNTIME140*，这些 DLL 随包内置（src-tauri/tauri.windows.conf.json 的
-      # resources）。清单漏了要在**上传之前**红，而不是等用户在干净的 Windows 上撞见
-      # 「找不到 MSVCP140_1.dll」。下面 tauri-action 那步是增量编译，不会重来一遍。
-      - name: 校验 Windows 包内置的 VC++ 运行库
+      # ort 静态链进来的 ONNX Runtime 是 /MD 编的；在上传安装包前确认 VC++ DLL 齐全。
+      - name: Verify bundled VC++ runtime
         if: matrix.os == 'windows-latest'
         run: |
           npm run build
@@ -58,39 +113,36 @@ jobs:
           cargo build --release --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
           node scripts/win-crt.mjs --verify=src-tauri/target/${{ matrix.target }}/release/dolce.exe
 
-      - name: Build and upload to release
+      - name: Build and upload installers
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.event.release.tag_name }}
-          releaseName: ${{ github.event.release.name }}
-          releaseBody: ${{ github.event.release.body }}
-          releaseDraft: false
-          prerelease: ${{ github.event.release.prerelease }}
+          tagName: ${{ github.ref_name }}
+          releaseDraft: ${{ needs.prepare.outputs.release-draft }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
-
-  # Web 版随同一 release 部署到 GitHub Pages
   pages-build:
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v5
+
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Type check
-        run: npx tsc --noEmit
-      - name: Build (subpath base for project Pages)
-        run: npm run build
+
+      - name: Build web app
+        run: |
+          npm ci
+          npm run build
         env:
           BASE_PATH: /dolce/
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
@@ -109,3 +161,14 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+
+  publish:
+    needs: [build, pages-deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release after all artifacts succeed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false
