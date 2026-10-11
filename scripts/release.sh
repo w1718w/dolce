@@ -36,6 +36,6 @@ git push origin HEAD:main
 git tag -s "${TAG}" -m "${TAG}"
 git push origin "${TAG}"
 
-REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+REPO="$(gh repo view "$(git remote get-url origin)" --json nameWithOwner --jq .nameWithOwner)"
 echo "==> ${TAG} 已交给 GitHub Actions 自动发布"
 echo "    https://github.com/${REPO}/actions/workflows/build.yml"
