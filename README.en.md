@@ -5,6 +5,11 @@
 > **Dolce** (悦谱) is an open-source editor and typesetter for **jianpu** (Chinese numbered musical notation) and
 > staff notation: write, recognize, typeset, play back and export scores — in the browser with nothing to install, or as a Windows / macOS desktop app.
 
+> **This is [w1718w's independently maintained custom build](https://github.com/w1718w/dolce/tree/custom/main),
+> not the upstream release.** It adds whole-score, pitch-preserving transcription presets. See the
+> [custom-build notes](docs/自定义版.md); [use it online](https://w1718w.github.io/dolce/) ·
+> [download it](https://github.com/w1718w/dolce/releases/latest) · [upstream Dolce](https://github.com/lodebar2026/dolce).
+
 [![Release](https://img.shields.io/github/v/release/lodebar2026/dolce?display_name=tag)](https://github.com/lodebar2026/dolce/releases)
 [![Live demo](https://img.shields.io/badge/%F0%9F%8C%90%20Live%20demo-online-2b6cb0)](https://lodebar2026.github.io/dolce/en/)
 ![Platform](https://img.shields.io/badge/platform-Web%20%7C%20macOS%20%7C%20Windows-555)

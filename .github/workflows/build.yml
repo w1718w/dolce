@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v*-custom.*"
 
 permissions:
   contents: read
@@ -30,8 +30,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ ! "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-fork\.([1-9][0-9]*)$ ]]; then
-            echo "Tag ${GITHUB_REF_NAME} must use v<upstream-version>-fork.<revision> (for example, v0.8.2-fork.1)."
+          if [[ ! "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-custom\.([1-9][0-9]*)$ ]]; then
+            echo "Tag ${GITHUB_REF_NAME} must use v<upstream-version>-custom.<revision> (for example, v0.8.2-custom.1)."
             exit 1
           fi
           source_version="${BASH_REMATCH[1]}"
