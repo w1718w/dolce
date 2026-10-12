@@ -1,0 +1,15 @@
+version: "1"
+
+rules:
+  - base: main
+    upstream: lodebar2026:main
+    mergeMethod: hardreset
+    mergeUnstable: true
+
+  - base: custom/main
+    upstream: main
+    mergeMethod: merge
+    mergeUnstable: false
+
+label: ":arrow_heading_down: pull"
+conflictLabel: "merge-conflict"
