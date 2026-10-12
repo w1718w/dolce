@@ -758,10 +758,13 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
     });
+    // CodeMirror 会把 CRLF 规范成 LF；源位置索引必须按编辑器实际保存的文本建立，
+    // 否则每过一行就多偏一位，末行条目会越过文档结尾并中断整个导入流程。
+    const editorText = this.getText();
     // dispatch triggers updateListener -> scheduleReload, but reload now for snappiness
     // （防抖那一遍撤掉：同一份文本不必 200ms 后再排一次）
     clearTimeout(this.debounceTimer);
-    this.reload(text);
+    this.reload(editorText);
   }
 
   private scheduleReload(): void {
@@ -2225,7 +2228,8 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
 
   /** FormatHost：`.musicxml` 读成 `ScoreDoc` → 简谱档排版；五线谱/混排档另读一份（`mixedDoc`）。 */
   reloadMusicXml(text: string): boolean {
-    this.mixed._setMixedXml(text);
+    // 打开/落地时已按这份原文读过混排那份，原文没变就不再读
+    if (!this.mixed.mixedDoc || this.mixed._mixedXmlText !== text) this.mixed._setMixedXml(text);
     let doc: ScoreDoc;
     try {
       doc = musicXmlFormat.toScoreDoc(text);
