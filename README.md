@@ -5,8 +5,7 @@
 > 开源的简谱与五线谱编辑、识谱与排版工具：写谱、识谱、排版、试听、导出，浏览器即开即用，也有 Windows / macOS 桌面版；界面中英双语。
 
 > **这是 [w1718w 二次开发的自定义版](https://github.com/w1718w/dolce/tree/custom/main)**，并非上游原版。
-> 本版新增保持实际音高不变的全曲转记与预设。见[自定义版说明](docs/自定义版.md)；
-> [在线使用](https://w1718w.github.io/dolce/) · [下载自定义版](https://github.com/w1718w/dolce/releases/latest) ·
+> 本版新增保持实际音高不变的全曲转记与预设。
 > [上游 Dolce](https://github.com/lodebar2026/dolce)。
 
 [![Release](https://img.shields.io/github/v/release/lodebar2026/dolce?display_name=tag)](https://github.com/lodebar2026/dolce/releases)
