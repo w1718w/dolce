@@ -1080,6 +1080,15 @@ function paintNote(c: OriginalCtx,
     t.classes.add("annotation"); // 可视化编辑认挂载记号用（`notePartEls`）
     g.add(t);
   }
+  // 曲中转调标签：新调首音上方，与和弦/注释同一槽；那一槽已有字就再往上叠一行（`place.ts::noteTextTop`）。
+  // 左缘对齐数字左缘、往右写——居中的话行首那个会伸出左边距
+  if (note.keyLabel) {
+    const font = new Font(m.font.text, m.size.chord);
+    const y = baseline + m.note.chordY - (note.chord || note.annotation ? m.size.chord * 1.2 : 0);
+    const t = text(note.keyLabel, x - m.ink.noteHeight * 0.35, y, font, c.ink); // 数字宽约墨迹高的 0.7
+    t.classes.add("key-change");
+    g.add(t);
+  }
 
   // 倚音：主音左/右侧的小号数字（默认八分，故带一条减时线）
   paintGrace(c, g, note.graceBefore, x, baseline, -1);

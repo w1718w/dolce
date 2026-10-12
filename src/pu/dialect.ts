@@ -102,6 +102,7 @@ const TOMATO: DialectSpec = {
   barlines: [
     [":|:", "repeat-both"],
     [":||", "repeat-end"],
+    ["||:", "repeat-start"], // 与 `|:` 同义（曲首/段首常见的粗细写法）
     ["||/", "double"],
     ["|:", "repeat-start"],
     [":|", "repeat-end"],
@@ -155,6 +156,8 @@ const SHIGE: DialectSpec = {
   // 诗歌本的小节线是 `| || ||| |: :| :|:`：`|||` 才是左细右粗的终止线。
   barlines: [
     [":|:", "repeat-both"],
+    [":||", "repeat-end"], // 与 `:|` 同义
+    ["||:", "repeat-start"], // 与 `|:` 同义
     ["|||", "end"],
     // 规范未列 `||/`，但实际谱面里大量使用（沿用番茄的「两边细双线」）。
     ["||/", "double"],

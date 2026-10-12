@@ -220,6 +220,13 @@ export function buildMeasures(
         return;
       }
       if (el.kind === "barline") {
+        if (measure === null && el.type === "repeat-start") {
+          // 曲首的 `|:`：不造空小节（空小节会让反复推理抛「measure has no chord」、整首退回不展开反复），
+          // 只给紧跟着的那个小节记「反复起点」
+          pendingRepeatForward = true;
+          newMeasureNeeded = true;
+          return;
+        }
         const mea: MeasureOut = measure ?? open();
         mea.seq.push("barline");
         closeVolta(mea);
