@@ -22,21 +22,21 @@ import { headerCredits, type HeaderCredit, type WordLine } from "../omrkit/heade
 import { applyTuplet, attachDynamicTexts, attachNotations, attachWedges, findNotations, findTuplets, markLyricExtends } from "../staffomr/notations";
 import type { PObj, SPage, Staff, Sym, Tag } from "../staffomr/model";
 import { buildRasterPage, makeSymObj, makeTextObj, type RasterSym } from "./adapt";
-import { binSig, blobImage, extendVSegs, findBlobs, findBraces, findPrimitives, groupByLeftInk, ledgerGrid, joinVSegs, removeStaffLines, repairLineCuts, verticalStrokes, type BeamQuad, type LineSeg, type RasterPrims } from "./prims";
-import { archCavity, stemWalledCavity, findRasterHeads, hollowHeadsByPitch, headsOnBareStems, headsBetweenStemPairs, probeBareStems, hollowHeadsFromCavities, hollowHeadsAlongStems, hollowHeadsFromHoles, hollowHeadsOnStemSeeds, reseatHollowHeads, hollowHeadsOnLedgers, hollowSlit, inkColumn, judgeHeadBox, mergeHoles } from "./notehead";
+import { binSig, blobImage, extendVSegs, findBlobs, findBraces, findPrimitives, groupByLeftInk, ledgerGrid, joinVSegs, removeStaffLines, removeStaffLinesByRun, repairLineCuts, verticalStrokes, type BeamQuad, type LineSeg, type RasterPrims } from "./prims";
+import { archCavity, stemWalledCavity, findRasterHeads, hollowHeadsByPitch, headsOnBareStems, headsBetweenStemPairs, probeBareStems, hollowHeadsFromCavities, hollowHeadsAlongStems, hollowHeadsFromHoles, hollowHeadsOnStemSeeds, reseatHollowHeads, stemOf, hollowHeadsOnLedgers, hollowSlit, inkColumn, judgeHeadBox, mergeHoles } from "./notehead";
 import { bootstrapClefs, matchTemplate, RasterGlyphLookup, type BootStaff } from "./rasterglyphs";
 import { sigDistance } from "../omrkit/glyphdict";
 import { completeStaffBars, cutJianpuStrip, eraseInBand, findJianpuBands, jianpuKey, type JianpuStrip } from "./jianpuband";
 import { fuseJianpu, type FuseStats, type JianpuRow } from "./jianpufuse";
 import { CHAR_MAX as LYRIC_CHAR_MAX, findLyricRows, foldLyricChars, isLatinRow, LATIN_MIN_CHAINED, latinCells, mapCharsToCells, splitMixedChars, stripKey, stripOf, stripWithout, type LyricRow, type LyricStrip, type OcrChar } from "./lyric";
 import { candidateMap, findHoles, repairedLayer, traceContours, type Contour, type ContourMap } from "./contour";
-import { buildHeadMasks, buildHollowMasks, headFromStemBlock, scoreAt, solidHeadsAlongStems, splitHeadCluster } from "./headmask";
+import { buildHeadMasks, buildHollowMasks, headFromStemBlock, scoreAt, scoreAtMasked, solidHeadsAlongStems, splitHeadCluster } from "./headmask";
 import { headProb, trainHeadClassifier } from "./headclass";
 import { findStaffLabels, labelKey, normalizeLabel, type LabelStrip } from "./stafflabel";
 import { findHarmonyStrips, harmonyKey, harmonyLine, readHarmonyStrip, type HarmonyStrip, type HarmonyToken } from "./harmony";
 import { findFusedWedges, findRasterWedges, type RasterWedge } from "./wedge";
 import { groupDynamics, type RasterDynamic } from "./dynamics";
-import { extendArcEnds, findFusedSlurs, findRasterDashedSlurs, findRasterSlurs, findStubSlurs } from "./slur";
+import { extendArcEnds, findFusedSlurs, findRasterDashedSlurs, findRasterSlurs, findStubSlurs, judgeArcUnion } from "./slur";
 import { ContourLedger } from "./ledger";
 import { attachHarmonies, attachLyrics, buildLyricLines, type LyricLine } from "../staffomr/textanalyze";
 import { attachSlurs, markSlurNotes, reconnectSlurs, type SlurArc } from "../staffomr/slur";
@@ -46,6 +46,8 @@ import { estimateUnit, findStaffLines, groupStaves, localLineModel, pitchPos, pi
 import { completeStaffLines } from "./dewarp";
 import { rasterizePage, type RasterPage } from "./rasterpage";
 import { median, rowHasInk, unionRect as union, overlapFrac } from "../omrkit/geom";
+import { connectedComponents } from "../omrkit/ccl";
+import { areaClose, close, ellipseOpen } from "../omrkit/morph";
 import { type LineFrame, makePitchSteps, ledgerCandidates, makePitchGrid, sharedLegers, ownLegers } from "./pitchgrid";
 import { bridgeFaintBars, pastSysLine, joinThroughBars, inkSystemBarlines, bridgeFaintSysLines, dropLoneBarlines, voteSystemBarlines } from "./barvote";
 import { nearRestLine, restKind, nearStaffStart, fillAround, isEighthRest, symbolInk, isStackedPair, isBarRest, enclosedWhite, crossRuns, midOfStaff, offStaffRest, sharpCrossbars, tallStrokes, longestVRun, splitAt, sharpShape, wholesByShape, openCavities, STAFF_START } from "./restshape";
@@ -205,6 +207,42 @@ const CLF_P = 0.8;
 /** 第二遍拆块的尺寸上限（线距的倍数）。取的正是 `findBlobs` 自己的上限
  *  （宽 6 格、高 9 格）——**等于不再设限**，拆出来的头全交给判别器把关。
  *  写成 9×5.5 / 12×7 / 16×9 实测结果完全相同，因为再大的块 `findBlobs` 根本不出。 */
+/** 斑点补头（判别器那一段之后）：开运算椭圆的半轴（格）——比扫描件的线宽、干宽都粗，比实心头的半高细。 */
+const SPOT_RX = 0.28;
+const SPOT_RY = 0.22;
+/** 斑点的尺寸闸（格）与离外线多远以内（格，带加线的头）。 */
+const SPOT_W = [0.6, 1.9] as const;
+const SPOT_H = [0.45, 1.5] as const;
+const SPOT_BAND = 3;
+/** 干的证据：头心起往干那头量多长（格）、那一列墨要占几成（断成虚线的干也算）。 */
+const SPOT_STEM = 2.5;
+/** 压在符杠中线上的斑点，矮过这个（格）才当杠片：真杠开运算后只剩杠厚（半格上下），头有大半格高——
+ *  扫描件上同高的几个头被残线连成一条厚「杠」，真头就压在它中线上（破碎扫描 p10 m96）。 */
+const SPOT_BEAM_H = 0.75;
+const SPOT_STEM_INK = 0.65;
+const SPOT_BAR = 3;
+/** 斑点宽、高都要到本页已认实心头斑点中位数的这么多；本页够 `SPOT_RULER_N` 个才有尺子。 */
+const SPOT_RULER = 0.8;
+const SPOT_RULER_N = 8;
+/** 斑点宽的上限：本页中位数的这么多倍。 */
+const SPOT_RULER_MAX = 1.3;
+/** 斑点那一路判别器的门槛：比块那几路（`CLF_P`）松，因为另有干的证据。扫过 0.8 / 0.65 / 0.5：
+ *  合唱谱扫描件四份 84.27·80.97·85.31·92.12 / 84.43·80.93·85.63·92.12 / 84.39·80.93·85.66·91.95（破碎扫描·是爱·望十架·爱是从神而来）。 */
+const SPOT_P = 0.65;
+/** 空心头的斑点：先填上不过这么大（格²）的小内腔再开运算。 */
+const HSPOT_HOLE = 0.8;
+/** 头心小椭圆里原图的白要占这么多（有内腔）。 */
+const HSPOT_WHITE = 0.25;
+/** 本页空心模板的分。 */
+const HSPOT_SCORE = 0.3;
+/** 本页已认空心头的斑点够这么多个才有尺子。 */
+const HSPOT_RULER_N = 4;
+/** 叠成一摞的和弦斑点的高度上限（格）：三个三度叠头。 */
+const HSPOT_STACK_H = 3.4;
+/** 旁边没干的斑点宽到这么多格才按全音符试。 */
+const HSPOT_WHOLE_W = 1.5;
+/** 原图墨柱补的干：头心离墨柱一端不过这么多格。 */
+const HSPOT_STEM_END = 0.75;
 const BIG_W = 6;
 const BIG_H = 9;
 
@@ -276,6 +314,17 @@ const LYRIC_ARC_REACH = 1.5;
 const TEXT_ARC_PAD = 0.5;
 /** 免判的弧离谱表（上下线）不过这么多格。 */
 const TEXT_ARC_STAFF = 2;
+/** 按游程去线图上拼弧：两截之间的空隙上限、每截的高度上限（格）。弧顶贴线那段实测 0.3~1.1 格。 */
+const RUN_BRIDGE = 1.2;
+const RUN_PIECE_H = 1;
+/** 按游程去线图上的块，逐列平均墨厚的上限（格）放宽到这么多：弧顶压线那段连着线一起留下，块比去线图上的厚（破碎 p2 m4 两个八分下方那条）。 */
+const RUN_THIN_MEAN = 0.3;
+/** 按游程补出来的短弧（不到 `RUN_FLAT_W` 格宽）高宽比上限：上沿并进谱线的空心头剩下下半个碗（1.3 格宽、高宽比 0.8，望十架 p1 m10），
+ *  真的短弧在 0.5 以下；宽的不管——盒子常被连着的残线撑高（主我敬拜你 m11 那条 2.8×1.8 格） */
+const RUN_FLAT = 0.6;
+const RUN_FLAT_W = 2;
+/** 松叶算「在上一行歌词下面」要低过字的下沿这么多格（`notations.ts::ownerStaff` 的歌词下沿按它往下让）。 */
+const LYRIC_BELOW = 0.5;
 /** 行首半截弧的窗口：第一个音左边几格以内；上下离谱表几格以内。 */
 const STUB_LEAD = 3;
 const STUB_REACH = 4;
@@ -901,16 +950,18 @@ export async function recognizeRasterPage(
   }
 
   /** 块的中心压在某条符杠的中线上（半个杠厚以内）：那是提走符杠之后剩下的杠头，不是符头。 */
-  const onBeamLine = (b: Rect, ext = 0) => {
+  const onBeamLine = (b: Rect, ext = 0) => beamsThrough(b, ext) > 0;
+  /** 块的中心压在几条符杠的中线上（`onBeamLine` 的计数版）。 */
+  const beamsThrough = (b: Rect, ext = 0) => {
     const cxb = b.x + b.w / 2;
     const cyb = b.y + b.h / 2;
     // `ext`：两端各外推多远。杠的拟合常收不到最末一截（有一位神 m4，杠拟合到 757、剩下 759~773 一截连着干尖被收成 F♯5）；
     // 只给几何闸那一路外推，判别器那一路外推了会剔掉真头（当我们回到天家 −0.4）
-    return prims.beams.some((q) => {
+    return prims.beams.filter((q) => {
       if (cxb < Math.min(q.x0, q.x1) - ext || cxb > Math.max(q.x0, q.x1) + ext) return false;
       const t = q.x1 === q.x0 ? 0 : (cxb - q.x0) / (q.x1 - q.x0);
       return Math.abs(cyb - (q.y0 + (q.y1 - q.y0) * t)) <= Math.max(q.lw, unit.space * 0.25);
-    });
+    }).length;
   };
   /**
    * 块**正接在一条够厚的符杠的端头上**：杠端的 x 落在块的横向范围内（±2px）、上下与杠盒交叠，杠厚 0.35 格以上。
@@ -2828,6 +2879,41 @@ export async function recognizeRasterPage(
   const clfHeads: RasterSym[] = [];
   /** 已有符头压着的位置不再出（「头 + 干」那一路只记账、不标块，这一遍会在同一块里再拆一次）。 */
   const headTaken = (hb: Rect) => [...syms, ...clfHeads].some((s0) => /^notehead/.test(s0.code) && overlapFrac(hb, s0.box) > 0.3);
+  /** 头盒 `b` 旁边（左沿往下、右沿往上）有没有一根干：那一列从头心起 `SPOT_STEM` 格里墨占 `SPOT_STEM_INK` 以上。 */
+  const stemBeside = (b: Rect, between = false): boolean => {
+    const cy = Math.round(b.y + b.h / 2);
+    const len = Math.round(unit.space * SPOT_STEM);
+    const col = (x: number, dir: 1 | -1): number => {
+      let n = 0;
+      for (let k = 1; k <= len; k++) {
+        const y = cy + dir * k;
+        if (y < 0 || y >= raster.bin.h) return 0;
+        n += raster.bin.data[y * raster.bin.w + x];
+      }
+      return n / len;
+    };
+    const best = (x0: number, x1: number, dir: 1 | -1): number => {
+      let m = 0;
+      for (let x = Math.max(0, Math.round(x0)); x <= Math.min(raster.bin.w - 1, Math.round(x1)); x++) m = Math.max(m, col(x, dir));
+      return m;
+    };
+    // `between`：左右两缘都有同向的干——两根干中间夹着的一截短杠（破碎 p8 m85 十六分的第二层杠没拟合成杠，补上内腔后是个头大小的斑点）
+    if (between)
+      return ([1, -1] as const).some((dir) => best(b.x - unit.space * 0.2, b.x + unit.space * 0.3, dir) >= SPOT_STEM_INK && best(b.x + b.w - unit.space * 0.3, b.x + b.w + unit.space * 0.2, dir) >= SPOT_STEM_INK);
+    return (
+      best(b.x - unit.space * 0.2, b.x + unit.space * 0.3, 1) >= SPOT_STEM_INK ||
+      best(b.x + b.w - unit.space * 0.3, b.x + b.w + unit.space * 0.2, -1) >= SPOT_STEM_INK
+    );
+  };
+  /** 斑点中段每一列在原图上都是纵贯 `SPOT_BAR` 格以上的墨：终止线、段落线那根粗线（0.6 格宽，开运算留得下，
+   *  自己又给自己作了「干」的证据；我灵镇静 m26 出了两个头）。头的干在盒边，中段只有一个头高 */
+  const solidBar = (b: Rect): boolean => {
+    for (let x = Math.round(b.x + b.w * 0.25); x <= Math.round(b.x + b.w * 0.75); x++) {
+      const run = vRunAt(raster.bin, x, Math.round(b.y + b.h / 2));
+      if (!run || run[1] - run[0] < unit.space * SPOT_BAR) return false;
+    }
+    return true;
+  };
   if (clf) {
     for (const c of blobs) {
       if (claimed.has(c.id) || dictClaimed.has(c.id) || merged.has(c.id)) continue;
@@ -2877,6 +2963,63 @@ export async function recognizeRasterPage(
       }
     }
     syms.push(...clfHeads);
+
+    // ── **不靠连通块的实心头：原图开运算的斑点** ─────────────────────────────
+    //
+    // 上面几路都从连通块出发：块的尺寸、块里的拆法、块有没有被认领。扫描件上「头 + 干 + 尾」常再粘上一截弧、
+    // 几粒噪点，块就出了每一路的闸；字典又会把整块认成别的字形（节拍器的「四分音符」）。漏音归因
+    //（`raster-gap.mjs`）量出扫描件漏掉的实心头里，头的墨完好的占大半，干断成虚线的也不少。
+    // 这里直接在**原图**上找：椭圆结构元的开运算抹掉比它细的笔画——谱线、符干、细弧——实心头留成一个斑点，
+    // 不管它和谁连着。斑点只给位置，收不收要三样证据都在：落在音位格上、判别器过（`SPOT_P`，有干作证所以比块那几路松）、
+    // 旁边有干（原图上那一列墨占六成以上，断成虚线的干也算）。已有符号压着的、矮的又压在符杠中线上的不要。
+    // 两张图的斑点都当候选：原图直接开，和先补一道 3×3 闭运算再开。扫描件的头常是一片网点，直接开会缩成一小粒、甚至抹光
+    //（破碎扫描 p5 m61 G2）；先闭又会把上下贴着的和弦两个头并成一个过高的斑点（是爱 p5 m65）。同一处只收一次
+    const rx = Math.max(1, Math.round(unit.space * SPOT_RX));
+    const ry = Math.max(1, Math.round(unit.space * SPOT_RY));
+    const closed = { ...raster.bin, data: raster.bin.data.slice() };
+    close(closed, 1);
+    const spotComps = [...connectedComponents(ellipseOpen(raster.bin, rx, ry), 4), ...connectedComponents(ellipseOpen(closed, rx, ry), 4)];
+    const inBand = (y: number) => groups.some((g) => y > g.lines[0].y - unit.space * SPOT_BAND && y < g.lines[4].y + unit.space * SPOT_BAND);
+    // 本页的尺子：已认实心头所在斑点的中位宽高。升号交叉处、粗圈空心头留下的斑点比真头小一圈（f37 0.69×0.59、0.82×0.64 格，
+    // 同页真头 1.1×0.85 上下）；网点印的扫描件头开运算后也缩，尺子跟着缩
+    const known = syms.filter((s0) => s0.code === "noteheadBlack").map((s0) => s0.box);
+    const onHead = spotComps.filter((c) => known.some((kb) => overlapFrac(c.bbox, kb) > 0.5));
+    const medW = onHead.length >= SPOT_RULER_N ? median(onHead.map((c) => c.bbox.w)) : 0;
+    const medH = onHead.length >= SPOT_RULER_N ? median(onHead.map((c) => c.bbox.h)) : 0;
+    const spotHeads: RasterSym[] = [];
+    for (const c of spotComps) {
+      const b = c.bbox;
+      const w = b.w / unit.space;
+      const h = b.h / unit.space;
+      if (w < SPOT_W[0] || w > SPOT_W[1] || h < SPOT_H[0] || h > SPOT_H[1]) continue;
+      if (b.w < medW * SPOT_RULER || b.h < medH * SPOT_RULER) continue;
+      // 两根干之间的一截短杠整段留成斑点（追思歌 m14：41×20 像素，同页真头斑点中位 31×22），比头宽出一截
+      if (medW && b.w > medW * SPOT_RULER_MAX) continue;
+      const cy = b.y + b.h / 2;
+      if (!inBand(cy)) continue;
+      // 节拍器字形（`metNote*`）压着的不算占用：谱表带里「头 + 干 + 尾」被字典认成了节拍器的音符（破碎扫描 p1 m6 B♭3），收了头就把它换掉；
+      // 保持音的短横也是：它比开运算的椭圆细，自己留不下斑点，头大小的斑点压着它，是头的残片被认成了保持音（同页 m16 G4）
+      const over = syms.filter((s0) => overlapFrac(b, s0.box) > 0.2 || overlapFrac(s0.box, b) > 0.2);
+      if (over.some((s0) => !/^met/.test(s0.code))) continue;
+      const beamsHit = beamsThrough(b);
+      if (beamsHit >= 2 || (beamsHit === 1 && b.h < unit.space * SPOT_BEAM_H)) continue;
+      const gy = pitchGrid(cy);
+      if (gy === null) continue;
+      if (!stemBeside(b)) continue;
+      if (solidBar(b)) continue;
+      if (headProb(clf, raster.bin, masks, unit, b, gy, onLineY(gy)) < SPOT_P) continue;
+      const hw = Math.round(unit.space * 1.25);
+      const hh = Math.round(unit.space * 0.95);
+      const box = { x: Math.round(b.x + b.w / 2 - hw / 2), y: Math.round(gy - hh / 2), w: hw, h: hh };
+      if (headTaken(box) || spotHeads.some((s0) => overlapFrac(box, s0.box) > 0.3)) continue;
+      spotHeads.push({ box, code: "noteheadBlack" });
+      ledger.claim(box, "spot:noteheadBlack");
+      for (const s0 of over) {
+        const i = syms.indexOf(s0);
+        if (i >= 0) syms.splice(i, 1);
+      }
+    }
+    syms.push(...spotHeads);
   }
 
   // ── 空心头按模板再搜 ─────────────────────────────────────────────────────
@@ -3291,6 +3434,121 @@ export async function recognizeRasterPage(
       syms.push(f);
       added.push(f);
       ledger.claim(f.box, "along:noteheadHalf");
+    }
+    // ── **不靠连通块的空心头：补上内腔再开运算的斑点** ─────────────────────────
+    //
+    // 实心头那一路（判别器之后）的空心版。上面几路都靠内腔或参照头：内腔被谱线切碎、圈被网点糊开口，参照头本身也没认出
+    //（三度叠头整摞都漏，是爱 m36、m48）时就都进不来。这里先在**原图**上把不过 `HSPOT_HOLE` 格²的小白块填上（`areaClose`），
+    // 空心头就成了实心椭圆，再用实心那一路同一个椭圆开运算，头留成斑点。收不收看：头心原图上有白（`HSPOT_WHITE`，实心头、
+    // 杠的交叉处没有）、本页空心模板的分（`HSPOT_SCORE`）、竖段表里找得到干或原图上量得到墨柱（钉盒缘、补进 `inkStems`）。
+    // 三度叠头的圈补实后连成一根高斑点（不过 `HSPOT_STACK_H` 格），按音位逐级试；旁边没干又够宽的按全音符试（爱是从神而来 m62 的三度叠全音符）。
+    // 符杠压着的、左右两缘都有同向干的（两根干之间的短杠）不要。本页凑不出空心模板的不做（信心使我得胜：没有模板分把关，八分的符杠围出的白全收成了头）。
+    if (alongMasks.length) {
+      const sp = unit.space;
+      const filled = { ...raster.bin, data: raster.bin.data.slice() };
+      areaClose(filled, Math.round(sp * sp * HSPOT_HOLE));
+      const rx = Math.max(1, Math.round(sp * SPOT_RX));
+      const ry = Math.max(1, Math.round(sp * SPOT_RY));
+      const comps = connectedComponents(ellipseOpen(filled, rx, ry), 4);
+      const halves = syms.filter((s0) => s0.code === "noteheadHalf").map((s0) => s0.box);
+      const onHalf = comps.filter((c) => halves.some((kb) => overlapFrac(c.bbox, kb) > 0.5));
+      const medW = onHalf.length >= HSPOT_RULER_N ? median(onHalf.map((c) => c.bbox.w)) : 0;
+      const medH = onHalf.length >= HSPOT_RULER_N ? median(onHalf.map((c) => c.bbox.h)) : 0;
+      const hw = halves.length ? median(halves.map((q) => q.w)) : Math.round(sp * 1.3);
+      const hh = halves.length ? median(halves.map((q) => q.h)) : Math.round(sp * 1.1);
+      /** 头心那个小椭圆里（谱线行不算）原图的白占比：空心头有内腔，实心头、粗线交叉没有 */
+      const white = (cx: number, cy: number): number => {
+        let n = 0;
+        let k = 0;
+        const ax = sp * 0.3;
+        const ay = sp * 0.18;
+        for (let y = Math.round(cy - ay); y <= Math.round(cy + ay); y++) {
+          if (y < 0 || y >= raster.bin.h || gridYs.some((ly) => Math.abs(ly - y) <= unit.lineThick / 2 + 0.5)) continue;
+          for (let x = Math.round(cx - ax); x <= Math.round(cx + ax); x++) {
+            if (x < 0 || x >= raster.bin.w || ((x - cx) / ax) ** 2 + ((y - cy) / ay) ** 2 > 1) continue;
+            n++;
+            if (!raster.bin.data[y * raster.bin.w + x]) k++;
+          }
+        }
+        return n ? k / n : 0;
+      };
+      const hspotStems = [...prims.vSegs, ...stemSegs, ...inkStems];
+      const steps = makePitchSteps(groups);
+      for (const c of comps) {
+        const b = c.bbox;
+        const w = b.w / sp;
+        const h = b.h / sp;
+        const cx = b.x + b.w / 2;
+        const cy = b.y + b.h / 2;
+        // 叠成一摞的和弦（三度叠头的圈补实后连成一根高斑点）：按音位逐级试
+        const stack = h > SPOT_H[1] && h <= HSPOT_STACK_H;
+        if (w < SPOT_W[0] || w > SPOT_W[1] || h < SPOT_H[0] || (h > SPOT_H[1] && !stack)) continue;
+        if (medW && (b.w < medW * SPOT_RULER || (!stack && b.h < medH * SPOT_RULER) || b.w > medW * SPOT_RULER_MAX)) continue;
+        if (!groups.some((g) => cy > g.lines[0].y - sp * SPOT_BAND && cy < g.lines[4].y + sp * SPOT_BAND)) continue;
+        // 符杠压着的不要：两层短杠夹着一条谱线，围出的白条补上后也是个头大小的斑点（破碎 p6 m66 十六分那一截杠）
+        if (beamsThrough(b)) continue;
+        // 斑点压着实心头、符尾的不要：八分的符尾顺着干往下甩，与干、谱线围出的白补实后连着头成一根高斑点（主使我喜乐、来敬拜荣耀王）；
+        // 一根干上也不会一半实心一半空心
+        if (syms.some((s0) => /^(noteheadBlack|flag)/.test(s0.code) && (overlapFrac(b, s0.box) > 0.2 || overlapFrac(s0.box, b) > 0.2))) continue;
+        // 旁边没干、又够全音符宽的：按全音符试（不要干）
+        const whole = !stemBeside(b) && w >= HSPOT_WHOLE_W;
+        if (!whole && !stemBeside(b)) continue;
+        if (stemBeside(b, true)) continue;
+        if (solidBar(b)) continue;
+        const ys: number[] = [];
+        if (stack) for (const st of steps(b.y + sp * 0.35, b.y + b.h - sp * 0.35)) ys.push(st.y);
+        else {
+          const gy = pitchGrid(cy);
+          if (gy === null) continue;
+          ys.push(gy);
+        }
+        const cands: { box: Rect; s: number; ink: LineSeg | null; y: number }[] = [];
+        for (const gy of ys) {
+          const box = whole ? { x: b.x, y: Math.round(gy - hh / 2), w: b.w, h: hh } : { x: Math.round(cx - hw / 2), y: Math.round(gy - hh / 2), w: hw, h: hh };
+          const over = syms.filter((s0) => overlapFrac(box, s0.box) > 0.2 || overlapFrac(s0.box, box) > 0.2);
+          if (over.length) continue;
+          const wh = white(cx, gy);
+          if (wh < HSPOT_WHITE) continue;
+          const m = alongMasks.find((k) => k.onLine === onLineY(gy)) ?? alongMasks[0];
+          let sc = 0;
+          for (let dx = -2; dx <= 2; dx++) for (let dy = -1; dy <= 1; dy++) sc = Math.max(sc, scoreAtMasked(raster.bin, m, cx + dx, gy + dy));
+          if (sc < HSPOT_SCORE) continue;
+          if (whole) {
+            box.x = Math.round(cx - box.w / 2);
+            if (headTaken(box)) continue;
+            cands.push({ box, s: sc, ink: null, y: gy });
+            continue;
+          }
+          // 干要在竖段表里找得到（盒缘贴着），盒缘钉在干上：只凭原图那一列有墨的，后面挂不上干、落成全音符（是爱 p4 m60 的 B♭5）。
+          // 一摞里中间的头挂在干的中段。竖段表里没有的（扫描件的干断成虚线）：原图上量墨柱（断口 ≤2 像素），够一根干长就补进 `inkStems`
+          let v = stemOf(box, hspotStems, unit, nl, stack);
+          let ink: LineSeg | null = null;
+          const col = inkColumn(raster.bin, box, unit, false);
+          // 原图上这一列墨通到已认的实心头上的不要：一根干上不会一半实心一半空心。八分的符尾贴着干、与谱线围出的白补实后成了斑点，
+          // 竖段表里的干断在符尾根上、看着像挂在干端，原图上那一列却一直通到干端的实心头（新编 336、203）。
+          // 竖段表里的干也要「头心在墨柱一端」的话，挡掉和弦里另几个头没认出、干从这个头两头都伸出去的真头（是爱 m46 C5）
+          if (col && syms.some((s0) => s0.code === "noteheadBlack" && s0.box.x - unit.space * 0.25 <= col[2] && s0.box.x + s0.box.w + unit.space * 0.25 >= col[2] && s0.box.y <= col[1] && s0.box.y + s0.box.h >= col[0])) continue;
+          // 墨柱补的干，头心要离它一端不过 `HSPOT_STEM_END`：没有竖段表作证，两头都伸出去的多半是别的东西（和弦另几个头也没认出时宁可不收，是爱 p4 m60 的 B♭5）
+          const atEnd = (c: [number, number, number]) => stack || Math.min(Math.abs(c[0] - gy), Math.abs(c[1] - gy)) <= sp * HSPOT_STEM_END;
+          if (!v && col && col[1] - col[0] >= sp * SPOT_STEM && atEnd(col)) v = ink = { x0: col[2], y0: col[0], x1: col[2], y1: col[1], lw: unit.lineThick, maxLw: unit.lineThick * 2 };
+          if (!v) continue;
+          const vx = (v.x0 + v.x1) / 2;
+          box.x = Math.abs(box.x + box.w - vx) <= Math.abs(box.x - vx) ? Math.round(vx - box.w) : Math.round(vx);
+          if (headTaken(box)) continue;
+          cands.push({ box, s: sc, ink, y: gy });
+        }
+        // 一摞里相邻一级（半格）不能都是头：按模板分先后，离已收的不到 0.75 格的让位
+        cands.sort((p, q) => q.s - p.s);
+        const picked: typeof cands = [];
+        for (const k of cands) if (!picked.some((q) => Math.abs(q.y - k.y) < sp * 0.75)) picked.push(k);
+        for (const k of picked) {
+          if (k.ink) inkStems.push(k.ink);
+          const f: RasterSym = { box: k.box, code: whole ? "noteheadWhole" : "noteheadHalf" };
+          syms.push(f);
+          added.push(f);
+          ledger.claim(k.box, `hspot:${f.code}`);
+        }
+      }
     }
     // 这里补出来的头错过了上面找附点那一步，单给它们再找一次（我灵镇静 m10 附点二分 F4）
     if (added.length)
@@ -3806,6 +4064,8 @@ export async function recognizeRasterPage(
   // 字格**不论有没有 OCR 缓存都要切**：切出来的字格是「这块墨是歌词」这一判断本身，
   // 与认不认得出那个字是两回事。账本按字格记一笔，无主表里才不会把整页歌词
   // 当成「从没看见的墨」（缓存没命中时曾经就是这样，覆盖率一下子低二十个点）。
+  /** 各行谱下方歌词的下沿：松叶隔着上一行的歌词、紧贴着下一行谱的，归下一行（`notations.ts::ownerStaff`，与矢量路同一条） */
+  const lyricBottom = new Map<Staff, number>();
   {
     // **认领了却没落成音符的「符头」也还给歌词**：歌词字的笔画（点、口字框）常被收成符头，
     // 归不上谱表又被扔掉，可认领还在，那一格字就从歌词行里缺了
@@ -3851,6 +4111,11 @@ export async function recognizeRasterPage(
       for (let i = notes.length - 1; i >= 0; i--) if (inText(notes[i])) notes.splice(i, 1);
     }
     for (const row of rows) for (const cell of row.cells) ledger.claim(cell, "lyric");
+    for (const row of rows) {
+      const st = pg.staves[row.staffIndex];
+      // 往下让半格：与歌词同一高度、印在末字右边的松叶，中心比字的下沿还低几个像素（爱是从神而来 p5 m63 女声那条），不算在歌词下面
+      if (st) lyricBottom.set(st, Math.max(lyricBottom.get(st) ?? -Infinity, ...row.cells.map((c) => c.y + c.h + unit.space * LYRIC_BELOW)));
+    }
     const objs = [];
     lyricStats.rows = rows.length;
     const stripRow = new Map<LyricStrip, LyricRow>();
@@ -4178,7 +4443,7 @@ export async function recognizeRasterPage(
       if (c) ledger.claim(c.bbox, `wedge:${wg.type}`);
     }
   }
-  attachWedges(pg, notes, wedges);
+  attachWedges(pg, notes, wedges, lyricBottom);
 
   // ── 弧线（圆滑线 / 连音线）────────────────────────────────────────────────
   //
@@ -4201,6 +4466,7 @@ export async function recognizeRasterPage(
   // **在修补图上取候选**（`prims.ts::repairLineCuts`）：贴着线斜穿的弧去线时断成几截，补回压线那几列后整条一块。
   // 修补图上的一块，组成它的去线图碎块全是候选（无主或只被符杠、歌词、谱线认过）才整块判；
   // 连上了别的东西（符头、干）的，退回去线图上一块一块判（同以前）
+  { const D = (globalThis as any).process?.env?.SLDBG?.split(",").map(Number); if (D) for (const c of cmap.contours) { const b = c.bbox; if (b.x + b.w < D[0] || b.x > D[2] || b.y + b.h < D[1] || b.y > D[3]) continue; console.log("DBG", c.id, b, "w", c.w.toFixed(2), "h", c.h.toFixed(2), "cmp", c.compact.toFixed(3), "area", c.area, ledger.claimsOf(c.id).map((k) => k.by).join("|"), "arc?", findRasterSlurs(cmap, unit, [c], 0, repaired).map((a) => [a.lx, a.ly, a.rx, a.ry])); } }
   const candIds = new Set([...ledger.unclaimed(), ...beamOnly].map((c) => c.id));
   const cand = candidateMap(cmap, rlayer, (id) => candIds.has(id));
   const whole = cand.merged;
@@ -4267,6 +4533,90 @@ export async function recognizeRasterPage(
     for (const sl of fused) ledger.claim({ x: sl.obj.box.left, y: sl.obj.box.top, w: sl.obj.box.right - sl.obj.box.left, h: sl.obj.box.bottom - sl.obj.box.top }, "slur:fused");
     slurs.push(...fused);
   }
+  // ── 按游程去线的图上补认弧（`prims.ts::removeStaffLinesByRun`）──────────────
+  //
+  // 弧腹压在谱线上的扁弧（两个八分上下的小弧，宁静 p4 m56、p8 m96）在去线图上连线一起抹了，只剩两条腿，过不了弧线那几道闸。
+  // 按游程去线留得下它：线心处竖游程比线厚的整段留着。只当补充的候选——不碰已认的弧、块里没有符头；补出来的两端都挂得上音才留（`runArcs`）
+  const runArcs = new Set<SlurArc>();
+  {
+    const sp = unit.space;
+    const runNl = removeStaffLinesByRun(raster.bin, staffLines.map((l) => l.y), unit);
+    const runMap = traceContours(runNl, unit, contourStaves);
+    const taken = slurs.map((sl) => sl.obj.box);
+    const heads = notes.filter((n) => !n.rest).map((n) => n.sym.box);
+    const fermatas = cmap.contours.filter((c) => ledger.claimsOf(c.id).some((k) => /fermata/.test(k.by))).map((c) => c.bbox);
+    const cands = runMap.contours.filter((c) => {
+      const b = c.bbox;
+      if (taken.some((t) => b.x < t.right && b.x + b.w > t.left && b.y < t.bottom && b.y + b.h > t.top)) return false;
+      // 延长记号的弧（点认成了记号、弧在去线图上没留下）：弧下 1 格内有延长记号的不要（赞美一神）
+      if (fermatas.some((f) => f.x + f.w > b.x - sp * 0.5 && f.x < b.x + b.w + sp * 0.5 && f.y + f.h > b.y - sp && f.y < b.y + b.h + sp)) return false;
+      if (heads.some((hb) => (hb.left + hb.right) / 2 > b.x && (hb.left + hb.right) / 2 < b.x + b.w && (hb.top + hb.bottom) / 2 > b.y && (hb.top + hb.bottom) / 2 < b.y + b.h)) return false;
+      // 块里竖着穿过一根竖段的（干、小节线穿线那段游程长、留了下来，与两旁残留的线连成一块，善牧恩慈歌）
+      if ([...prims.vSegs, ...stemSegs].some((v) => { const vx = (v.x0 + v.x1) / 2; return vx > b.x && vx < b.x + b.w && Math.min(v.y0, v.y1) <= b.y + b.h * 0.3 && Math.max(v.y0, v.y1) >= b.y + b.h * 0.7; })) return false;
+      // 整块落在一条谱线的线带里的是线本身（扫描件谱线局部厚一像素，按线宽去不掉，两个头之间留下一截微弯的线）
+      const band = unit.lineThick + 1;
+      if (staffLines.some((l) => b.y >= l.y - band && b.y + b.h <= l.y + band + 1)) return false;
+      const cy = b.y + b.h / 2;
+      return pg.staves.some((st) => cy > st.box.top - sp * 4 && cy < st.box.bottom + sp * 4);
+    });
+    { const D = (globalThis as any).process?.env?.SLDBG?.split(",").map(Number); if (D) for (const c of runMap.contours) { const b = c.bbox; if (b.x + b.w < D[0] || b.x > D[2] || b.y + b.h < D[1] || b.y > D[3]) continue; console.log("RUN", c.id, b, "w", c.w.toFixed(2), "h", c.h.toFixed(2), "cmp", c.compact.toFixed(3), "cand", cands.includes(c), "arc?", findRasterSlurs(runMap, unit, [c], 0).map((a) => [a.lx, a.ly, a.rx, a.ry, a.above])); } }
+    // 弧心下（上）一格内有个点的是延长记号（没认出来的：赞美一神低音谱表下方那个）。
+    // 去线图上弧自己剩下的那截（弧顶压线，只剩线上一小块）不算点：它的墨在游程去线图上属于这条弧（宁静 p9 m104 两个八分上方）
+    const dotUnder = (sl: SlurArc) => {
+      const b = sl.obj.box;
+      const w = b.right - b.left;
+      const own = new Set(runMap.contours.filter((c) => c.bbox.x >= b.left && c.bbox.y >= b.top && c.bbox.x + c.bbox.w <= b.right + 1 && c.bbox.y + c.bbox.h <= b.bottom + 1).map((c) => c.id));
+      const ofArc = (c: Contour) => {
+        const d = c.bbox;
+        for (let y = d.y; y < d.y + d.h; y++) for (let x = d.x; x < d.x + d.w; x++) if (cmap.labels[y * cmap.w + x] === c.id && own.has(runMap.labels[y * runMap.w + x]!)) return true;
+        return false;
+      };
+      return cmap.contours.some((c) => {
+        const d = c.bbox;
+        if (d.w > sp * 0.6 || d.h > sp * 0.6) return false;
+        const cx = d.x + d.w / 2, cy = d.y + d.h / 2;
+        if (cx < b.left + w / 3 || cx > b.right - w / 3) return false;
+        if (!(sl.above ? cy > b.top && cy < b.bottom + sp * 1.2 : cy < b.bottom && cy > b.top - sp * 1.2)) return false;
+        return !ofArc(c);
+      });
+    };
+    const flat = (sl: SlurArc) => {
+      const w = sl.obj.box.right - sl.obj.box.left;
+      return w >= sp * RUN_FLAT_W || sl.obj.box.bottom - sl.obj.box.top <= w * RUN_FLAT;
+    };
+    for (const sl of findRasterSlurs(runMap, unit, cands, pg.objs.length + pg.segs.length + 1000 + slurs.length, undefined, RUN_THIN_MEAN)) {
+      if (dotUnder(sl) || !flat(sl)) continue;
+      slurs.push(sl);
+      runArcs.add(sl);
+    }
+    // 弧顶（弧底）整段贴在谱线上的，按游程也去掉了，断成左右两截、各自不够宽：相向的两头落在同一条线的线带里、隔着不过 `RUN_BRIDGE` 格的，
+    // 拼成一条再判（宁静 p8 m102、p4 m56 两个八分上下那条）
+    const endY = (c: Contour, right: boolean) => {
+      const x = right ? c.bbox.x + c.bbox.w - 1 : c.bbox.x;
+      let sum = 0, n = 0;
+      for (let y = c.bbox.y; y < c.bbox.y + c.bbox.h; y++) if (runMap.labels[y * runMap.w + x] === c.id) (sum += y), n++;
+      return n ? sum / n : NaN;
+    };
+    const used = (c: Contour) => slurs.some((sl) => c.bbox.x < sl.obj.box.right && c.bbox.x + c.bbox.w > sl.obj.box.left && c.bbox.y < sl.obj.box.bottom && c.bbox.y + c.bbox.h > sl.obj.box.top);
+    const pieces = cands.filter((c) => c.h <= RUN_PIECE_H && !used(c)).sort((a, b) => a.bbox.x - b.bbox.x);
+    const lineBand = unit.lineThick + 1;
+    for (const a of pieces) {
+      if (used(a)) continue;
+      const ay = endY(a, true);
+      const line = staffLines.find((l) => Math.abs(l.y - ay) <= lineBand);
+      if (!line) continue;
+      for (const b of pieces) {
+        const gap = b.bbox.x - (a.bbox.x + a.bbox.w);
+        if (b === a || gap < 0 || gap > sp * RUN_BRIDGE || used(b)) continue;
+        if (Math.abs(endY(b, false) - line.y) > lineBand) continue;
+        const sl = judgeArcUnion(runMap, [a, b], unit, pg.objs.length + pg.segs.length + 1000 + slurs.length);
+        if (!sl || dotUnder(sl) || !flat(sl)) continue;
+        slurs.push(sl);
+        runArcs.add(sl);
+        break;
+      }
+    }
+  }
   mergeArcPieces(slurs, unit.space);
   extendArcEnds(slurs, nl, (y) => gridYs.some((ly) => Math.abs(ly - y) <= unit.lineThick), unit.space);
   // 续过谱线之后再并一次：跨谱表的大弧下截续过右手第一线才够到上截（宁静 p1 m9–12 钢琴 F2→F4 那几条）
@@ -4311,6 +4661,9 @@ export async function recognizeRasterPage(
       .reduce<StaffNote | undefined>((x, m) => (!x || m.sym.px > x.sym.px ? m : x), undefined);
     if (prev) a.to = prev;
   }
+  { const D = (globalThis as any).process?.env?.SLDBG?.split(",").map(Number); if (D) for (const sl of slurs) if (sl.rx > D[0] && sl.lx < D[2] && Math.max(sl.ly, sl.ry) > D[1] && Math.min(sl.ly, sl.ry) < D[3]) console.log("SL", runArcs.has(sl), sl.lx, sl.ly, sl.rx, sl.ry, sl.above, sl.from?.sym.box, sl.to?.sym.box); }
+  // 按游程补出来的弧两端都要挂上音（同一个音不算）：挂不全的多是线上残留的别的墨
+  for (let i = slurs.length - 1; i >= 0; i--) if (runArcs.has(slurs[i]) && (!slurs[i].from || !slurs[i].to || slurs[i].from === slurs[i].to)) slurs.splice(i, 1);
   reconnectSlurs(pg, slurs);
   attachEdgeSlurStarts(slurs, notes, unit.space, new Set(index > 1 ? (pg.systems[0]?.staves ?? []) : []));
   const chordTies = tieChords(slurs, notes, unit.space);
