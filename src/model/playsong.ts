@@ -2,7 +2,7 @@
 // → 演唱顺序、试听输入、`.jpwabc` 写出端输入。
 //
 // 与 `playdoc.ts`（MusicXML 形状）分工同断句那一对（`pu/phrasesong.ts` / `phrasedoc.ts`），
-// 小节序列与断句共用 `pu/phrasesong.ts::buildMeasures`，行视图取 `pu/slots.ts::docView`。**口径同简谱引擎输入 `jianpuinput.ts::jianpuInputOfDoc`**：
+// 小节序列与断句共用 `pu/phrasesong.ts::buildMeasures`，行视图取 `pu/slots.ts::docView`。**口径同简谱输入模型 `jianpuinput.ts::jianpuInputOfDoc`**：
 //   - 每个有曲行的声部都算一份（歌词段数取各声部最大值），反复与跳转只看第一份；
 //     `forExpanded` 时带歌词的声部排第一、同号歌词顺延（同 `ToScoreOptions.forExpanded`）。
 //     试听输入（`playSourceOfSong`）推完演唱顺序后把声部排回模型顺序、主旋律记进 `PlaySource.lead`；
@@ -10,7 +10,7 @@
 //   - 跳转记号换算同 `applyJumps`；推不出来（抛错）才退回整曲按段数逐遍
 // 另有两条只归 `.jpwabc` 的：
 //   - 文档自带演唱顺序（`Song.playOrder`，`.Repeat` 段）→ 照它排，不推
-//   - `.jpwabc` 没有 `.Repeat` → 不推，整曲按段数逐遍（JP-Word 本来就这么唱）
+//   - `.jpwabc` 没有 `.Repeat`、也没有反复记号 → 不推，整曲按段数逐遍（JP-Word 本来就这么唱）；有 `|: :|` 照它推
 
 import type { Chord, ElementId, Part, PlayPass, ScoreDoc, Song } from "./doc";
 import { writtenOctaveOf } from "./jianpu";
@@ -207,7 +207,9 @@ function playDataOf(doc: ScoreDoc, songIdx: number, { song, voices, parts, jumps
   for (const line of linesOfVoice(song, voices[0]!)) {
     for (const l of line.lyrics) passes = Math.max(passes, l.verseTo);
   }
-  if (doc.sourceFormat === "jpwabc") {
+  // `.jpwabc` 没有 `.Repeat`：谱里没有反复记号就整曲按段数逐遍（JP-Word 本来就这么唱）；
+  // 有 `|: :|` 的照反复记号推（用户定，2026-10-14：020《向主歌唱》的 `.Layout` 时值总长对得上「走反复」）
+  if (doc.sourceFormat === "jpwabc" && !main.some((m) => m.repeatBackward)) {
     pd.measures = playOrderByVerses(main.length, passes);
     pd.isSimpple = true;
     return pd;
@@ -217,7 +219,8 @@ function playDataOf(doc: ScoreDoc, songIdx: number, { song, voices, parts, jumps
   try {
     const order = playOrderOf(parts.map((measures) => ({ measures })), pd);
     pd.isSimpple = order.isSimple;
-    pd.hasRepeat = order.hasRepeat;
+    // `.jpwabc` 读进来按反复记号推的顺序，重读时照样推得出来：不算「有反复」，写出端就不另补 `.Repeat`（往返定点）
+    pd.hasRepeat = order.hasRepeat && doc.sourceFormat !== "jpwabc";
     pd.measures = order.measures;
     if (pd.measures.length > 0) return pd;
   } catch (e) {
@@ -300,11 +303,8 @@ export function jpwInputOfSong(doc: ScoreDoc, songIdx = 0): JpwScoreIn | null {
     if (text) credit.push({ type, text, page: 0 });
   };
   meta.titles.forEach((t, i) => push(t, i === 0 ? "title" : "subtitle"));
-  // 作者条目在排版行视图里是一行（换行换成了空格）；模型的 credit 里还留着原来的换行（`.jpwabc` 的
-  // `WordsByAndMusicBy` 一条多行），写回时照 credit 原文
-  const credits = doc.songs[songIdx]!.credits ?? [];
-  const original = (a: string): string => credits.find((c) => c.text !== a && c.text.replace(/\n/g, " ") === a)?.text ?? a;
-  for (const a of meta.authors) push(original(a), "composer");
+  // 作者条目照原文分行（`.jpwabc` 的 `WordsByAndMusicBy` 一条多行，行视图已取 credit 原文，见 `pu/slots.ts::toMetadata`）
+  for (const a of meta.authors) push(a, "composer");
   for (const t of meta.topRight) push(t, "composer");
   for (const t of meta.topLeft) push(t, "lyricist");
 

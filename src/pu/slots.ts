@@ -1,4 +1,4 @@
-// `ScoreDoc` → **排版行视图**：文本谱排版器、简谱引擎输入（展开档）、双向定位共用的那一份铺排。
+// `ScoreDoc` → **排版行视图**：文本谱排版器、简谱输入模型（展开档）、双向定位共用的那一份铺排。
 //
 // ## 为什么要有这一层
 //
@@ -36,9 +36,9 @@ import type {
   VoiceGroup,
 } from "./ast";
 import { getMeta } from "../model/metakeys";
-import type { Dialect } from "./dialect";
 import { projectForJianpu } from "../model/jianpuproject";
 import { decoKey } from "../model/deconames";
+import { directionMarks } from "../model/directionmarks";
 import { keySpelling, quarterTempos } from "../model/jianpu";
 import { songFifths } from "../model/keyshift";
 import { MusicCommon } from "../score/jppitch";
@@ -168,6 +168,8 @@ interface RowBuild {
   anchors: Anchor[];
   /** 小节 → [首元素下标, 末元素下标（含右小节线）] */
   measureSpan: Map<Measure, { first: number; last: number }>;
+  /** 小节 direction 里的渐强渐弱起止（MusicXML 来源；配成 Mark 见 `directionWedgeMarks`） */
+  wedges: { edge: "start" | "stop"; type?: "crescendo" | "diminuendo"; id: ElementId }[];
 }
 
 function pushInline(row: RowBuild, items: readonly InlineItem[] | undefined, measure: Measure): void {
@@ -197,7 +199,7 @@ function pushInline(row: RowBuild, items: readonly InlineItem[] | undefined, mea
 /** `ranges`：切在小节中间的那几个小节只取 `[from, to)` 这一段元素（见 `SystemRow.ranges`）；
  *  右小节线与小节尾的夹层只归最后一段。 */
 function buildRow(measures: readonly Measure[], ranges?: ReadonlyMap<Measure, readonly [number, number]>): RowBuild {
-  const row: RowBuild = { elements: [], refs: [], indexOf: new Map(), anchors: [], measureSpan: new Map() };
+  const row: RowBuild = { elements: [], refs: [], indexOf: new Map(), anchors: [], measureSpan: new Map(), wedges: [] };
   for (const mea of measures) {
     const first = row.elements.length;
     const [from, to] = ranges?.get(mea) ?? [0, mea.elements.length];
@@ -207,7 +209,10 @@ function buildRow(measures: readonly Measure[], ranges?: ReadonlyMap<Measure, re
     // 它携带的信息已由「前一小节的右线」与房号的 volta mark 承载。
     let pendingGrace: NoteElement[] = [];
     let lastNote: NoteElement | null = null;
-    for (const el of mea.elements.slice(from, to)) {
+    /** 小节元素下标 → 落成的那个符号（方向记号按下标挂，见 `directionmarks.ts`） */
+    const headAt = new Map<number, NoteElement | SustainElement>();
+    for (const [j, el] of mea.elements.entries()) {
+      if (j < from || j >= to) continue;
       if (el.kind === "space") {
         // `y`（无时值占位）与 `x`（不可见休止）都落成**隐藏音符**：
         // `PuDoc` 没有无时值占位，`hidden` 的 0 是最接近的东西。
@@ -236,6 +241,7 @@ function buildRow(measures: readonly Measure[], ranges?: ReadonlyMap<Measure, re
         row.elements.push(n);
         row.refs.push({ id: el.id, space: el, measure: mea });
         if (n.lyricAnchor) row.anchors.push(el);
+        headAt.set(j, n);
         continue;
       }
       const ch = el;
@@ -259,6 +265,7 @@ function buildRow(measures: readonly Measure[], ranges?: ReadonlyMap<Measure, re
       row.elements.push(head);
       row.refs.push({ id: ch.id, chord: ch, measure: mea });
       if (head.lyricAnchor) row.anchors.push(ch);
+      if (head.kind === "note" || head.kind === "sustain") headAt.set(j, head);
       // 增时线展开：`PuDoc` 里它们是独立元素
       for (const su of ch.sustains ?? []) {
         pushInline(row, su.before, mea);
@@ -269,13 +276,39 @@ function buildRow(measures: readonly Measure[], ranges?: ReadonlyMap<Measure, re
         if (s.lyricAnchor) row.anchors.push(su);
       }
     }
+    // 小节里的 direction（MusicXML 来的力度、术语、文字、跳转）挂到对应的符号上；左线上的跳转目标（123 的
+    // `| !segno! 5`）挂到本小节头一个符号上——行视图不出左线（见上）
+    const dm = directionMarks(mea);
+    const heads = [...headAt.entries()].sort((a, b) => a[0] - b[0]);
+    const headFrom = (j: number): NoteElement | SustainElement | undefined => heads.find(([k]) => k >= j)?.[1] ?? heads[heads.length - 1]?.[1];
+    const addOrn = (h: NoteElement | SustainElement | BarlineElement | undefined, o: SourceOrnament): void => {
+      if (h && "ornaments" in h && !h.ornaments.some((x) => x.name === o.name)) h.ornaments.push({ name: o.name, level: o.level, source: ZERO });
+    };
+    // 小节被换行切成几段时每段都会走到这里：只收落在本段 `[from, to)` 里的，否则另一段的记号会挂到本段末尾、挂两遍
+    const inRange = (j: number): boolean => j >= from && j < to;
+    for (const [j, orns] of dm.byElement) if (inRange(j)) for (const o of orns) addOrn(headFrom(j), o);
+    for (const [j, text] of dm.words) {
+      if (!inRange(j)) continue;
+      const h = headFrom(j);
+      if (h?.kind === "note" && h.annotation === undefined) h.annotation = text;
+    }
+    if (from === 0) {
+      for (const b of mea.barlines ?? []) {
+        if (b.location !== "left") continue;
+        for (const o of b.ornaments ?? (b.jump ? [{ name: b.jump, level: 0 }] : [])) addOrn(heads[0]?.[1], o);
+      }
+    }
     // 只有房号、没有线的「右线」是行末补出来挂 ending 的，原文那里没有小节线
     const right = tail ? (mea.barlines ?? []).find((b) => b.location === "right") : undefined;
+    let rightEl: BarlineElement | undefined;
     if (right && right.style !== undefined) {
       pushInline(row, right.before, mea);
-      row.elements.push(puBar(right));
+      rightEl = puBar(right);
+      row.elements.push(rightEl);
       row.refs.push({ barline: right, measure: mea });
     }
+    if (tail) for (const o of dm.barEnd) addOrn(rightEl ?? heads[heads.length - 1]?.[1], o);
+    for (const w of dm.wedges) if (inRange(w.index)) row.wedges.push({ ...w, id: mea.elements[w.index]!.id });
     if (tail) pushInline(row, mea.trailing, mea);
     // 跨度只数有归属的符号与小节线（夹层不算），房号的起止偏移以此为基准（`Ending.startOffset/endOffset`）
     let f = -1;
@@ -415,6 +448,56 @@ function segmentMarks(marks: readonly Mark[], rows: readonly RowBuild[], rowIdx:
   return out;
 }
 
+/**
+ * 跨小节线的两样东西挂到前一小节的右线上（行视图不出左线）：下一小节左线上的反复起点（只供画线，`repeatForwardAfter`），与
+ * 曲中换拍号（123 / MusicXML 记在小节的 `attrs.time` 上）→ 前一小节右线上的临时拍号（文本谱 `"p:3/4"` 的口径，
+ * 原样文档照它在线后印拍号）。文本谱来源的小节线本来就带着（`Barline.time`），不重复。
+ */
+function carryToPrevBarline(measures: readonly Measure[], rows: readonly RowBuild[], songTime?: { beats: number; beatType: number }): void {
+  // 起头的拍号：首小节没写 `attrs.time` 的（123 / ABC 的 `M:` 只记在曲头 `Song.time`）从曲头起比，
+  // 否则曲中第一次换拍号认不出来（单声部全特性 `|] [M:3/4]` 那条线后的 3/4 原先没印）
+  let cur: { beats: number; beatType: number } | undefined = songTime ? { beats: songTime.beats, beatType: songTime.beatType } : undefined;
+  const prevBar = (i: number): BarlineElement | undefined => {
+    const prev = measures[i - 1];
+    for (const row of rows) {
+      const k = row.refs.findIndex((r) => r.barline && r.measure === prev);
+      if (k < 0) continue;
+      const el = row.elements[k];
+      return el?.kind === "barline" ? el : undefined;
+    }
+    return undefined;
+  };
+  measures.forEach((mea, i) => {
+    if (i > 0 && mea.barlines?.some((b) => b.location === "left" && b.repeat === "forward")) {
+      const el = prevBar(i);
+      if (el) el.repeatForwardAfter = true;
+    }
+    const t = mea.attrs?.time;
+    if (!t) return;
+    const changed = cur !== undefined && (t.beats !== cur.beats || t.beatType !== cur.beatType);
+    cur = { beats: t.beats, beatType: t.beatType };
+    if (!changed || i === 0) return;
+    const el = prevBar(i);
+    if (el && !el.temporaryMeter) el.temporaryMeter = { numerator: t.beats, denominator: t.beatType, parenthesized: t.parenthesized ?? false };
+  });
+}
+
+/** 一个声部各行里 direction 的渐强渐弱起止 → `Mark`（同类型后开先收）。 */
+function directionWedgeMarks(rows: readonly RowBuild[]): Mark[] {
+  const out: Mark[] = [];
+  const open: { type: "crescendo" | "diminuendo"; id: ElementId }[] = [];
+  for (const row of rows) {
+    for (const w of row.wedges) {
+      if (w.edge === "start" && w.type) open.push({ type: w.type, id: w.id });
+      else if (w.edge === "stop") {
+        const s = open.pop();
+        if (s) out.push({ type: "wedge", start: s.id, end: w.id, wedgeType: s.type, level: 0 });
+      }
+    }
+  }
+  return out;
+}
+
 const captionOfEnding = (e: NonNullable<Barline["ending"]>): string | undefined =>
   e.captionless ? undefined : (e.text ?? e.numbers.join("."));
 
@@ -514,10 +597,18 @@ function toMetadata(song: Song): Metadata {
   };
   if (song.work.title !== undefined) meta.titles.push(song.work.title);
   meta.titles.push(...song.work.subtitles);
+  // MusicXML 的副标题只在 `<credit>` 里（`credit-type` 为 subtitle），`work` 那边没有
+  if (!song.work.subtitles.length) {
+    for (const c of song.credits ?? []) if (c.type === "subtitle" && c.text.trim() && !meta.titles.includes(c.text.trim())) meta.titles.push(c.text.trim());
+  }
   const scripture = [...getMeta(song, "scripture"), ...getMeta(song, "scripture-ref")].filter((t) => t.trim());
   if (scripture.length) meta.scripture = scripture;
   if (song.work.version !== undefined) meta.version = song.work.version;
-  for (const c of song.identification?.creators ?? []) meta.authors.push(c.text);
+  // `.jpwabc` 的词曲一条写了好几行（`作词：…\n作曲：…`）：作者条为写 123 的 `C:` 拼成了一行，原文的分行在 credits 里，照原文分行
+  for (const c of song.identification?.creators ?? []) {
+    const multi = song.credits?.find((k) => !k.type && k.text.includes("\n") && k.text.replace(/\n/g, " ") === c.text);
+    meta.authors.push(multi?.text ?? c.text);
+  }
   if (song.key) {
     if (song.key.display !== undefined) meta.mode = song.key.display;
     else if (song.key.spelling && song.key.spelling !== "none") meta.mode = song.key.spelling;
@@ -632,7 +723,6 @@ export interface SongView extends PuSong {
 }
 
 export interface DocView {
-  dialect: Dialect;
   doc: ScoreDoc;
   songs: SongView[];
   /** 行里的符号 → 它的 id（高亮、定位用） */
@@ -689,7 +779,7 @@ function rowTuplets(measuresByRow: readonly (readonly Measure[])[], rows: readon
   return out;
 }
 
-function toPuSong(song: Song, index: number, rawLines: readonly string[]): SongView {
+function toPuSong(song: Song, index: number, rawLines: readonly string[], handPages: boolean): SongView {
   const perPart = song.parts.map((p) => splitSystems(p));
   /** 文本谱来源：一组不一定含全部声部，按 `print.system` 对回同一组；其余按行序号 */
   const bySystem = perPart.some((rows) => rows.some((r) => r.system !== undefined));
@@ -699,6 +789,11 @@ function toPuSong(song: Song, index: number, rawLines: readonly string[]): SongV
   };
   // 各声部的全部行先建好——跨行记号要看别的行有没有端点
   const builds = perPart.map((rows) => rows.map((row) => buildRow(row.measures, row.ranges)));
+  perPart.forEach((rows, pi) => carryToPrevBarline(rows.flatMap((r) => r.measures), builds[pi]!, song.time));
+  // MusicXML 来源的渐强渐弱只有 direction（`Mark` 在写出时才投成 direction，读回不还原）：按起止配成 Mark
+  const hasWedgeMarks = song.marks.some((m) => m.type === "wedge");
+  const wedgeMarks = builds.map((rows) => (hasWedgeMarks ? [] : directionWedgeMarks(rows)));
+  const marksOfPart = (pi: number): readonly Mark[] => (wedgeMarks[pi]!.length ? [...song.marks, ...wedgeMarks[pi]!] : song.marks);
   const voltas = perPart.map((rows, pi) => rowVoltas(rows.map((r) => r.measures), builds[pi]!));
   const tuplets = perPart.map((rows, pi) => rowTuplets(rows.map((r) => r.measures), builds[pi]!));
 
@@ -724,18 +819,22 @@ function toPuSong(song: Song, index: number, rawLines: readonly string[]): SongV
       const build = builds[pi]![r]!;
       const sr = perPart[pi]![r]!;
       const p = sr.cont ? undefined : sr.measures[0]?.print;
-      if (bySystem && p?.newPage) newPage = true;
+      // 换页：文本谱的 `[fenye]`、123 / ABC 手写的 `$$`。MusicXML 的 `new-page` 是原排版软件按它那张纸断的，不照搬
+      if ((bySystem || handPages) && p?.newPage) newPage = true;
       if (p?.texts) {
         texts = p.texts;
         textSources = p.textSources ?? [];
       }
+      const segs = segmentMarks(marksOfPart(pi), builds[pi]!, r);
+      // 123/ABC 的解析器同时写了连音标记，按 `timeMod` 补出来的同一段就不再要（否则同一个连音画两遍）
+      const extra = tuplets[pi]![r]!.filter((t) => !segs.some((s) => s.type === "tuplet" && s.start === t.start && s.end === t.end));
       const line: RowView = {
         part,
         measures: perPart[pi]![r]!.measures,
         refs: build.refs,
         voice: voiceOf(pi),
         elements: build.elements,
-        marks: [...segmentMarks(song.marks, builds[pi]!, r), ...voltas[pi]![r]!, ...tuplets[pi]![r]!],
+        marks: [...segs, ...voltas[pi]![r]!, ...extra],
         lyrics: rowLyrics(build, p?.lyricLines),
         raw: p?.source ? (rawLines[p.source.line] ?? "") : "",
         source: p?.source ?? ZERO,
@@ -769,10 +868,9 @@ export function docView(doc: ScoreDoc): DocView {
   // 行的 `raw`：文本谱来源按 `Print.source` 的行号取原文（乐句重排改写原文要它）
   const rawLines = doc.source && doc.sourceFormat === "pu" ? doc.source.split(/\r?\n/) : [];
   const view: DocView = {
-    dialect: (doc.puDialect ?? "shige") as Dialect,
     doc,
     // MusicXML 读进来的先投成简谱形状（长音拆增时线、减时线按 `<type>` 算、和弦补原文）
-    songs: doc.songs.map((s, i) => toPuSong(projectForJianpu(s), i, rawLines)),
+    songs: doc.songs.map((s, i) => toPuSong(projectForJianpu(s), i, rawLines, doc.sourceFormat === "123" || doc.sourceFormat === "abc")),
     idOf: new Map(),
     elementOf: new Map(),
     syllableOwner: new Map(),

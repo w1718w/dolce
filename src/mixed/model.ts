@@ -9,8 +9,15 @@
 import { Fraction } from "../common/fraction";
 import { Point } from "../common/geom";
 import { Font } from "../layout/font";
-import { SlurTieBase, type SlurStyle } from "../layout/pageitem";
-import { MIXED_PUNCT, type CompressMode } from "../common/cjkpunct";
+import { arcClearShift, arcRise, calcSlurPoints, jpArcY, type ArcObstacle, type SlurStyle } from "../engrave/arc";
+import { accidentalRise } from "../engrave/accidental";
+import type { CompressMode } from "../common/cjkpunct";
+import { syllableRun } from "../engrave/syllable";
+import type { HarmonySeg } from "../engrave/chord";
+import type { AccidentalSide, AccidentalStyleKind } from "../engrave/spacing";
+import { STACK_GAP_DEFAULT, stackTop } from "../engrave/stack";
+import { graceBlockTop, mainRow } from "./jprow";
+import { beatGroupIndex, beatGroupSize, pickupOffset } from "../engrave/beatgroup";
 import { MetaData, GlyphCodes } from "../smufl/smufl";
 import type { Chord as DocChord, Direction as DocDirection, Harmony as DocHarmony, Lyric as DocLyric, Mark as DocMark, Note as DocNote, Song } from "../model/doc";
 import { beamCount } from "../model/jianpu";
@@ -112,7 +119,9 @@ export enum Notation {
 
 export class ClefSig {
   sign = GlyphCodes.gClef;
-  line = 0;
+  /** 谱号落在第几线（下起）。缺省是高音谱号的第二线——没写谱号的谱（`.jpwabc`、文本谱转来的）
+   *  落到 `getClef` 的缺省值上，原先给 0，谱号整个往下掉两格（061《坚固保障》混排）。 */
+  line = 2;
 
   /** 顶线（第五线）的 writtenPitch（octave*7+step 序数）。G 谱号顶线 F5=38。 */
   topPitch(): number {
@@ -453,6 +462,8 @@ export class ChordLayout {
   /** 符杠逐层状态（照 `<beam>`，整声部没写时由自动符杠补） */
   beams: BeamVal[] = [];
   notations: NotationItem[] = [];
+  /** 换气记号（`breath-mark`）：画在符头右上、谱表之上（`render.ts` 的 notations 那段） */
+  breath = false;
 
   constructor(measure: PartMeasureLayout, src: DocChord, divisions: number) {
     this.measure = measure;
@@ -968,7 +979,7 @@ export class LyricLayout {
   readonly chord: ChordLayout;
   offset = new Fraction(0);
   font!: Font;
-  /** 标点挤压档（`MixedOptions.lrcHWID` → 半身式）：量宽与绘制共用这一个，绝不能各走各的。 */
+  /** 标点挤压档（`MixedOptions.punctCompress`）：量宽与绘制共用这一个，绝不能各走各的。 */
   compress: CompressMode = "halfwidth";
   extend: Fraction | null = null;
 
@@ -1032,19 +1043,10 @@ export class LyricLayout {
   /** [前导非CJK宽, CJK段宽, 尾随非CJK宽]（Lyric::widthInfo 移植）。
    *  注意：前缀（段落号）不计入，由 drawLrc 单独按固定偏移摆放。 */
   widthInfo(): [number, number, number] {
-    const chars = [...this.text];
-    if (chars.length === 0) return [0, 0, 0];
-    const isCjk = (ch: string) => ch.charCodeAt(0) > 0x80 && !MIXED_PUNCT.includes(ch);
-    let first = 0;
-    let last = chars.length - 1;
-    for (let i = 0; i < chars.length; i++) if (isCjk(chars[i])) { first = i; break; }
-    for (let i = chars.length - 1; i >= 0; i--) if (isCjk(chars[i])) { last = i; break; }
-    // 宽度取**标点挤压后**的笔位（见 common/cjkpunct.ts）：居中的锚点跟着挪，绘制端拿的是同一串坐标。
-    // 档位照 `compress`——歌词走半身式（musicpp 的 `lrcHWID` → 歌词字体开 OpenType `halt`），
-    // 不是 `Font.run()` 缺省的全身式 `clreq`：两派压出来的总宽、居中偏移与逐字落点都不同。
-    const { xs, width } = this.font.run(this.text, this.compress);
-    const at = (i: number): number => (i <= 0 ? 0 : i >= xs.length ? width : xs[i]);
-    return [at(first), at(last + 1) - at(first), width - at(last + 1)];
+    if (this.text.length === 0) return [0, 0, 0];
+    // 三段切分与挤压后的笔位走公共那一份（engrave/syllable.ts），绘制端（drawLrc）拿的是同一串坐标
+    const r = syllableRun(this.text, this.font, this.compress);
+    return [r.lead, r.body, r.tail];
   }
 
   /** 解析后计算 xOffset/width（parser.cpp processLrc 尾部）。 */
@@ -1120,27 +1122,29 @@ export class HarmonyLayout {
   }
 
   /** 纯文本形式（仅用于 calcMixedStaffY 的宽度粗估）。 */
-  asPlainText(): string {
+  asPlainText(side?: AccidentalSide): string {
     const acc = (alter: number): string => (alter === 1 ? "#" : alter === -1 ? "b" : "");
-    let res = this.root.alterLeft ? acc(this.root.alter) + this.root.step : this.root.step + acc(this.root.alter);
+    const left = (sa: HarmonyStepAlter): boolean => (side ? side === "before" : !!sa.alterLeft);
+    let res = left(this.root) ? acc(this.root.alter) + this.root.step : this.root.step + acc(this.root.alter);
     res += harmonyKindSuffix(this.kind, this.kindText);
     for (const d of this.degree) {
       if (d.type === HarmonyDegreeType.Add) res += "add" + d.value;
     }
     if (this.bass) {
-      res += "/" + (this.bass.alterLeft ? acc(this.bass.alter) + this.bass.step : this.bass.step + acc(this.bass.alter));
+      res += "/" + (left(this.bass) ? acc(this.bass.alter) + this.bass.step : this.bass.step + acc(this.bass.alter));
     }
     return res;
   }
 
   /** 富文本分段（Harmony::asText 移植）：升降号用 SMuFL csym 字形，后缀上标。 */
-  asText(): HarmonySeg[] {
+  asText(side?: AccidentalSide): HarmonySeg[] {
     const segs: HarmonySeg[] = [];
     const stepAlter = (sa: HarmonyStepAlter) => {
       const glyph = sa.alter === 1 ? GlyphCodes.csymAccidentalSharp : sa.alter === -1 ? GlyphCodes.csymAccidentalFlat : "";
-      if (glyph && sa.alterLeft) segs.push({ text: glyph, music: true, superscript: 0, dy: 0 });
+      const left = side ? side === "before" : !!sa.alterLeft;
+      if (glyph && left) segs.push({ text: glyph, music: true, superscript: 0, dy: 0 });
       segs.push({ text: sa.step, music: false, superscript: 0, dy: 0 });
-      if (glyph && !sa.alterLeft) segs.push({ text: glyph, music: true, superscript: 0, dy: 0 });
+      if (glyph && !left) segs.push({ text: glyph, music: true, superscript: 0, dy: 0 });
     };
     stepAlter(this.root);
 
@@ -1235,14 +1239,6 @@ export class HarmonyLayout {
   }
 }
 
-/** Harmony 文本分段：music=用 SMuFL 字形；superscript=±1 上/下标；dy=基线偏移。 */
-export interface HarmonySeg {
-  text: string;
-  music: boolean;
-  superscript: number;
-  dy: number;
-}
-
 /** MusicXML kind → 缩写（Harmony::abbrKindText 移植）。 */
 function abbrKindText(kind: string): string {
   switch (kind) {
@@ -1323,6 +1319,8 @@ export interface TextBlockItem {
   superscript: number;
   /** 原程序里这项的字号（换了字体、画的字号跟着换算时记下原值；歌本按字号算行高用它） */
   nominalSize?: number;
+  /** 这项之前额外空出的宽（速度标记「♩ = 120」里「=」两侧的空，见 `engrave/spacing.ts::EQ_PAD_EM`）。 */
+  padBefore?: number;
 }
 
 export class TextBlock {
@@ -1333,10 +1331,14 @@ export class TextBlock {
   title = false;
 
   /** 文字里的换行拆成「项 + 换行项」（TextBlock::add 的 boost::split）：`<words>` 原文带换行就是多行 */
-  add(text: string, font: Font, music = false, nominalSize?: number): void {
+  add(text: string, font: Font, music = false, nominalSize?: number, padBefore?: number): void {
     text.split("\n").forEach((s, i) => {
       if (i > 0) this.data.push({ font, text: "\n", dy: 0, music, superscript: 0 });
-      if (s) this.data.push({ font, text: s, dy: 0, music, superscript: 0, ...(nominalSize !== undefined ? { nominalSize } : {}) });
+      if (s) this.data.push({
+        font, text: s, dy: 0, music, superscript: 0,
+        ...(nominalSize !== undefined ? { nominalSize } : {}),
+        ...(i === 0 && padBefore ? { padBefore } : {}),
+      });
     });
   }
 
@@ -1344,7 +1346,7 @@ export class TextBlock {
     let res = 0;
     for (const it of this.data) {
       if (it.text === "\n") continue;
-      res += it.font.measureText(it.text);
+      res += (it.padBefore ?? 0) + it.font.measureText(it.text);
     }
     return res;
   }
@@ -1520,6 +1522,9 @@ export class BeamGroup {
       pts.push({ x: ch.stemX(), y });
     }
     let slope = BeamGroup.leastSquare(pts);
+    // 横向位置还没排（自动铺排的谱这会儿各符干 x 都一样）时最小二乘是 0/0：按平的算，别让符干长成 NaN
+    //（264《陶我成器》等 `.jpwabc` 混排：挂在符干上的延长记号、简谱层上沿跟着全是 NaN）
+    if (!Number.isFinite(slope)) slope = 0;
     const thres = 0.3;
     if (slope > thres) slope = thres;
     else if (slope < -thres) slope = -thres;
@@ -1693,30 +1698,17 @@ export class PartMeasureLayout {
     const pstf = this.part.staves[stf];
     const t0 = this.measureInfo.offset;
     const ts = pstf.getTime(t0);
-    const expect = new Fraction(ts.beats * 4, ts.beatType);
-    let skip = expect.minus(this.measureInfo.dur);
+    // 拍位判据走公共那一份（engrave/beatgroup.ts，与旧简谱引擎、原样文档同一条）：残节按小节末尾对齐
     const measures = this.part.measures;
-    if (this === measures[measures.length - 1]) {
-      skip = new Fraction(0);
-    } else {
-      const next = measures[this.measureInfo.index + 1];
-      if (fEq(skip, next.measureInfo.dur)) skip = new Fraction(0);
-    }
+    const isLast = this === measures[measures.length - 1];
+    const next = isLast ? undefined : measures[this.measureInfo.index + 1];
+    const skip = pickupOffset((ts.beats * 4) / ts.beatType, this.measureInfo.dur.toFloat(), isLast, next?.measureInfo.dur.toFloat());
+    const beatSize = beatGroupSize(ts.beats, ts.beatType);
 
-    // 起点取不可能的拍号：小节比拍号长时 `skip` 为负，第一拍可能算到 -1
     let prevBeat = -Infinity;
-    let beatSize = new Fraction(1);
-    if (ts.beatType === 4 || ts.beatType === 2) {
-      // quarter/half beat
-    } else if (ts.beatType === 8 && ts.beats % 3 === 0) {
-      beatSize = new Fraction(3, 2);
-    } else {
-      console.warn("processJpBeam: unsupported time", ts.beats, ts.beatType);
-    }
     for (const ch of layer) {
       if (ch.jpBeamCount() < 1) continue;
-      const t = skip.plus(ch.offset);
-      const b = Math.floor(t.div(beatSize).toFloat());
+      const b = beatGroupIndex(ch.offset.toFloat(), skip, beatSize);
       if (prevBeat !== b) {
         const g = new BeamGroup();
         g.jp = true;
@@ -2032,6 +2024,9 @@ export class Tuplet extends SpanOverNotes {
   }
 }
 
+/** 倚音墨迹顶到其上和弦基线的净空（tenths）。 */
+const MIXED_GRACE_CHORD_GAP = 5;
+
 /** 混排里房号在简谱层之上占的高度（tenths）：竖脚 20 + 离简谱层 16 + 横线上方余量 4。 */
 export const MIXED_ENDING_BAND = 40;
 
@@ -2049,6 +2044,8 @@ export class Wedge extends SpanObj {
   crescendo = false;
   staff = 0;
   ypos = 0;
+  /** 原文没给 default-y：自动铺排时由 `autoPlaceWedges` 定到谱表下方（歌词再让开它） */
+  autoY = false;
   dxLeft = 0;
   dxRight = 0;
 }
@@ -2510,6 +2507,13 @@ export class SysStaff {
           if (ch.notations.length) y -= 20;
           if (y < miny) miny = y;
         }
+        // 谱表上方的记号（延长记号、重音…）按**画出来的**字形墨迹顶算：混排时简谱层摞在这个上沿之上，
+        // 只按符干估会让延长记号压到简谱数字上（044《真神妙爱》末音）
+        for (const nota of ch.notations) {
+          if (!nota.above || !Number.isFinite(nota.y)) continue;
+          const bb = eng.meta.getBBox(nota.symbol);
+          if (bb) miny = Math.min(miny, nota.y - bb.bBoxNE[1] * (eng.musicFont.size / 4) - 5);
+        }
       }
     }
     for (const sl of pt.slurs) {
@@ -2517,7 +2521,7 @@ export class SysStaff {
       if (!sl.above) continue;
       if (sys.contains(sl.startTick) && sys.contains(sl.endTick)) {
         const [pl, pr] = slurTiedPos(eng, sl.startChord(), sl.endChord(), true);
-        const [pt0, pt1] = SlurTieBase.calcSlurPoints(
+        const [pt0, pt1] = calcSlurPoints(
           new Point(pl.x, pl.y), new Point(pr.x, pr.y), mixedSlurStyle(true));
         // 曲线紧包围盒上沿（照 CGPathGetPathBoundingBox；控制点不在曲线上，取控制点最小值会偏高）
         const top = cubicMinY(pl.y, pt0.y, pt1.y, pr.y);
@@ -2589,6 +2593,15 @@ export class SysStaff {
         if (tiedMiddle) yy += 15;
         else if (tiedEnd) yy += offset;
         if (yy > dy) dy = yy;
+      }
+      // 倚音整块抬在主音之上（`jprow.ts::graceRow`），这一小节有和弦时和弦行要让开它的墨迹顶
+      //（和弦基线 = 简谱层原点之上 dy + 3，见 placeAboveStaff）。260《感恩的泪》的倚音 6 原先顶着 Bm
+      if (mixed && md.harmonies.length > 0) {
+        for (const ch of md.chords) {
+          if (!ch.grace || ch.rest) continue;
+          const top = graceBlockTop(eng, md, ch);
+          dy = Math.max(dy, -top - 3 + MIXED_GRACE_CHORD_GAP);
+        }
       }
     }
 
@@ -2963,8 +2976,6 @@ export class MixedOptions {
   // Engraver（model.hpp:1049）常量原样照搬
   mixStaffHeight = 30;
   mixStaffDist = 5;
-  octaveDotDist = 6;
-  beamDistJP = 5;
   harmonyYPos = -60;
 
   hideBarNumber = false; // 对齐 musicpp model.hpp:1062（默认显示小节号）
@@ -2987,10 +2998,9 @@ export class MixedOptions {
   };
   barlineDist = 5;
   slurStemDy = 15;
-  /** 歌词字体开 hwid（→ OpenType `halt`，标点占半身）：歌本（`pdflayout/songbook.ts`）开，
-   *  对齐 util/pao.cpp:1002；编辑器视图不开（wasm.cpp:36 同样 false），歌词标点仍按全身式
-   *  上下文挤压（`clreq`）排。 */
-  lrcHWID = false;
+  /** 歌词标点挤压档（engrave/syllable.ts，样式键 `lrc-punct-compress`）。编辑器视图缺省全身式上下文挤压
+   *  （`clreq`，wasm.cpp:36 不开 hwid）；歌本（`pdflayout/songbook.ts`）照 util/pao.cpp:1002 开 hwid → 半身式。 */
+  punctCompress: CompressMode = "clreq";
   chineseHyphen = false;
   /** 只留旋律：读完整条（含弧/延音线配对与方向推断）之后删掉非旋律音，
    *  再按首音重猜符干方向并重排符杠（musicpp Part::removeNoneMelody → guessStemDir）。
@@ -2999,6 +3009,14 @@ export class MixedOptions {
   /** 谱行包围盒里文字的行高按字号算（原排版程序口径，歌本 `pdflayout/songbook.ts` 开）；缺省按字体 ascent−descent */
   textLineHeightBySize = false;
   harmonySize = 9;
+  /** 和弦排成简单文本（一行普通文字，不用 SMuFL 字形、不上标）。样式键 `chord-plain`。 */
+  chordPlain = false;
+  /** 调号、转调、和弦根音/低音的升降号写在字母前还是后；undefined = 各自原来的写法。样式键 `accidental-side`。 */
+  accidentalSide: AccidentalSide | undefined = undefined;
+  /** 简谱层临时记号的样子（`engrave/spacing.ts::AccidentalStyleKind`）。样式键 `accidental-style`。 */
+  accidentalStyle: AccidentalStyleKind = "csym";
+  /** `csym` 临时记号的大小倍数。样式键 `accidental-scale`。混排缺省小一号（用户口径：原先那个比例压过数字）。 */
+  accidentalScale = 0.75;
   /** 谱里没写 `<page-layout>` 时用的纸（pt，编辑器设置里那张）；`heightPt` 为 null 是长图（不分页）。
    *  不给就用 `MixedDefaults`（A4）。写了 `<page-layout>` 的谱（歌本、第三方）照用自己的，
    *  除非 `override`（用户在设置里明确换了纸/方向/边距）：那时连谱里的版面坐标一起不用，按新纸自动铺排。
@@ -3011,22 +3029,13 @@ export class MixedOptions {
    *  谱里的版面坐标不再用（整份自动铺排）；没给就照谱里的 `<scaling>` / `<lyric-font>`。 */
   staffSizeMm: number | null = null;
   lyricPt: number | null = null;
-  jpTopDy = 0;
-  // ── 简谱层附件相对数字的位置。缺省值即原排版程序的常量
-  //    （render.cpp::drawNotesJianPu 875-947、BeamLevelData::drawJianPu:159），单位 tenths；
-  //    `@staff` 里按 sp 写（1sp = 10 tenths，见 style/staff.ts）。
-  /** 高音点首点基线（render.cpp 的 `5-2`），再减 `jpTopDy` */
-  jpOctaveUpY = 3;
-  /** 低音点首点基线 = `mixStaffHeight + beamDistJP × 减时线层数` 再加这个（render.cpp 的 `-2`） */
-  jpOctaveDownDy = -2;
-  /** 第一层减时线基准 y，再按 `(40 − mixStaffHeight) × 0.8` 上提（render.cpp 的 `35 - diff*0.8`） */
-  jpBeamTopY = 35;
-  /** 附点笔位 = 数字左缘 + `(数字 advance/2 + 这个) × 0.75`（render.cpp 的 `width/2+10`，mix 再乘 0.75） */
-  jpDotDx = 10;
-  /** 附点基线 = `字号 × 0.75` 再加这个 */
-  jpDotDy = 0;
+  // ── 简谱层附件相对数字的位置。八度点、减时线走公共那一份（engrave/stack.ts，墨迹到墨迹等距）：
+  /** 叠层的空 ÷ 数字墨迹高。样式键 `stack-gap`。 */
+  stackGap = STACK_GAP_DEFAULT;
   jpGraceScale = 0.6;
   cueSize = 0.8;
+  /** 倚音的缩放（符头、符干、符尾、符杠）。比 cue 音符小一号：照 0.8 画，倚音看着跟正常音符差不多大、挤在主音旁边（常规制谱 0.6~0.65） */
+  graceSize = 0.65;
 
   meta: MetaData;
   musicFont: Font;
@@ -3058,6 +3067,8 @@ export class MixedDefaults {
   topMargin = 85;
   bottomMargin = 85;
   wordFont = new Font("Times New Roman", 20);
+  /** 谱里给了 `<defaults><word-font font-size>`：没写字号的 `<words>` 照它（不然按 16pt） */
+  wordFontGiven = false;
   lyricFont = new Font("Times New Roman", 20);
   musicTextFont = new Font("Bravura Text", 20);
 }
@@ -3082,6 +3093,8 @@ export interface ScoreCredit {
   /** `<credit-words font-family / font-weight>`；没写就是歌词字体 */
   family?: string;
   bold?: boolean;
+  /** `default-y` 是字顶 / 中线 / 底（缺省是基线） */
+  valign?: "top" | "middle" | "bottom";
 }
 
 export class StaffLayout {
@@ -3175,7 +3188,7 @@ export interface Pt2 {
  *     裸对数公式（那几条上下限与扁平长连音线是本项目为简谱加的，五线谱不要）。
  *   - `side` 跟着符干走；简谱层恒为 `above = true`。
  *
- * 唯一与旧副本不同的地方：`SlurTieBase.arcHeight` 有一条 1.2 的下限，而裸公式在
+ * 唯一与旧副本不同的地方：`engrave/arc.ts::arcHeight` 有一条 1.2 的下限，而裸公式在
  * `dist < 10.2` 时算出的弧高比它还小（再短就变负、弧会翻过来开口朝上）。
  * 那是旧副本的缺陷，不是特性。
  */
@@ -3254,41 +3267,33 @@ export function slurTiedPos(
   return [pl, pr];
 }
 
-/** 简谱层 slur/tied 锚点（SpanObj::slurTiedPosForJp）。 */
-export function slurTiedPosForJp(
-  eng: MixedOptions,
-  chl: ChordLayout,
-  chr: ChordLayout,
-  checkTied = false,
-): [Pt2, Pt2] {
-  const refLeft = chl.stemNote();
-  const refRight = chr.stemNote();
-  const pl: Pt2 = { x: refLeft.cx(eng.meta) + chl.measure.xpos(), y: 0 };
-  const pr: Pt2 = { x: refRight.cx(eng.meta) + chr.measure.xpos(), y: 0 };
+/** 简谱层一个弧端点：数字墨心 x（系统坐标）与那一摞的墨迹顶（数字、高音点；`isEnd` 时再算上临时记号——
+ *  起点的临时记号在弧外侧）。口径同另两条简谱路（engrave/arc.ts）。 */
+function jpArcEnd(eng: MixedOptions, ch: ChordLayout, isEnd: boolean): { x: number; top: number } {
+  const x = ch.stemNote().cx(eng.meta) + ch.measure.xpos();
   let dot = 0;
-  let hasTied = false;
-  for (const nt of chl.notes) {
-    if (nt.jpMelody) {
-      const dd = nt.octaveJp();
-      if (dd > dot) dot = dd;
-      if (checkTied && nt.tieBegin) hasTied = true;
-    }
+  let acc: number | null = null;
+  for (const nt of ch.notes) {
+    if (!nt.jpMelody) continue;
+    dot = Math.max(dot, nt.octaveJp());
+    if (isEnd && acc === null) acc = nt.jpAccidental();
   }
-  for (const nt of chr.notes) {
-    if (nt.jpMelody) {
-      const dd = nt.octaveJp();
-      if (dd > dot) dot = dd;
-    }
+  const row = mainRow(eng);
+  let top = stackTop(row.inkTop, dot, row.st);
+  if (acc !== null) {
+    const kind = acc > 0 ? "sharp" : acc < 0 ? "flat" : "natural";
+    top = Math.min(top, row.inkTop - accidentalRise(kind, row.inkBottom - row.inkTop, eng.accidentalScale));
   }
-  pl.y = 4 - dot * 6;
-  pr.y = 4 - dot * 6;
-  if (hasTied) {
-    pl.y -= 5;
-    pr.y -= 5;
-  }
-  pl.y -= eng.jpTopDy;
-  pr.y -= eng.jpTopDy;
-  return [pl, pr];
+  return { x, top };
+}
+
+/** 简谱层 slur/tied 锚点（SpanObj::slurTiedPosForJp）：简谱弧只看起止两个音，往上一道叠层的空（engrave/arc.ts::jpArcY）。
+ *  `chl` 缺省 = 跨系统续过来的后半条（左端由调用方给）。 */
+export function slurTiedPosForJp(eng: MixedOptions, chl: ChordLayout | null, chr: ChordLayout): [Pt2, Pt2] {
+  const r = jpArcEnd(eng, chr, true);
+  const l = chl ? jpArcEnd(eng, chl, false) : r;
+  const y = jpArcY(l.top, r.top, mainRow(eng).st.gap);
+  return [{ x: l.x, y }, { x: r.x, y }];
 }
 
 // ---------------- slur / tie 画在哪（绘制与避让共用） ----------------
@@ -3333,8 +3338,10 @@ export function tiedEnds(
 
   if (nota === Notation.JianPu || nota === Notation.Mixed) {
     above = true;
+    // 简谱弧跨系统**只画后半条**（同另两条简谱路）：起头那一系统不画
+    if (hasNext) return null;
     if (chr.voice > 1 && hasPrev) return null;
-    const [pl, pr] = slurTiedPosForJp(eng, chl, chr);
+    const [pl, pr] = slurTiedPosForJp(eng, hasPrev ? null : chl, chr);
     plx = pl.x; ply = pl.y;
     prx = pr.x; pry = pr.y;
   } else {
@@ -3376,13 +3383,7 @@ export function tiedEnds(
     }
   }
 
-  if (hasPrev) {
-    if (nota === Notation.JianPu) {
-      plx = 0;
-    } else {
-      plx = sys.measures[0].dataPos;
-    }
-  }
+  if (hasPrev) plx = sys.measures[0].dataPos;
   if (hasNext) {
     const last = sys.measures[sys.measures.length - 1];
     prx = last.xpos() + last.dataEnd;
@@ -3419,14 +3420,45 @@ export function slurEnds(
 
   if (nota === Notation.JianPu) {
     above = true; // 简谱层 slur 一律朝上（render.cpp::drawSlur）
-    if (!chr || !chl) return null;
-    const [pl, pr] = slurTiedPosForJp(eng, chl, chr, true);
+    // 简谱弧跨系统**只画后半条**：起头那一系统不画，收尾那一系统从系统开头起弧（`hasPrev` 的左端在下面补）
+    if (!chr) return null;
+    const [pl, pr] = slurTiedPosForJp(eng, chl, chr);
     plx = pl.x; ply = pl.y;
     prx = pr.x; pry = pr.y;
+    // **弧套弧**：套在它里面的延音线与更短的 slur 当障碍，按实际弧线判碰（engrave/arc.ts::arcClearShift），
+    // 碰了才整条抬、高出一道叠层的空（260《感恩的泪》`2⌒2 3 2` 两条弧同一个起点）
+    const x0 = hasPrev ? sys.measures[0].dataPos : plx;
+    const inner: ArcObstacle[] = [];
+    const part = chr.measure.part;
+    const within = (a: Fraction, b: Fraction): boolean => !fLt(a, slur.startTick) && !fGt(b, slur.endTick);
+    // 只认简谱层上真画出来的延音线（同谱表、旋律音，与 `render.ts` 画简谱层延音线同一条件）：
+    // 别的谱表、别的声部的延音线不在这一层，当障碍会把弧无故抬高
+    for (const t of part.tied) {
+      if (!t.startNote || !t.startNote.jpMelody || t.startNote.staff !== slur.startNote.staff || !within(t.startTick, t.endTick)) continue;
+      const te = tiedEnds(sys, eng, t, Notation.JianPu);
+      if (te) inner.push({ x: (te.plx + te.prx) / 2, y: arcExtent(te)[0] });
+    }
+    for (const o of part.slurs) {
+      if (o === slur || !o.startNote || !o.startNote.jpMelody || o.startNote.staff !== slur.startNote.staff || !within(o.startTick, o.endTick)) continue;
+      if (fEq(o.startTick, slur.startTick) && fEq(o.endTick, slur.endTick)) continue;
+      const oe = slurEnds(sys, eng, o, Notation.JianPu);
+      if (oe) inner.push({ x: (oe.plx + oe.prx) / 2, y: arcExtent(oe)[0] });
+    }
+    const shift = arcClearShift(x0, ply, prx, pry, arcRise(prx - x0, mixedSlurStyle(true)), true, inner, mainRow(eng).st.gap);
+    ply += shift;
+    pry += shift;
   } else {
     const [pl, pr] = slurTiedPos(eng, chl, chr, above);
     plx = pl.x; ply = pl.y;
     prx = pr.x; pry = pr.y;
+    // 五线谱弧**看整个跨度**（用户定；简谱弧只看起止）：跨度里的符头、弧那一侧的符干尖都是障碍，
+    // 弧线（抛物线近似）碰了就整条往外挪，留 `STAFF_ARC_GAP`（engrave/arc.ts::arcClearShift）
+    const x0 = hasPrev ? sys.measures[0].dataPos : plx;
+    const x1 = hasNext ? sys.measures[sys.measures.length - 1]!.xpos() + sys.measures[sys.measures.length - 1]!.dataEnd : prx;
+    const obstacles = staffArcObstacles(sys, refCh, slur.startNote.staff, slur.startTick, slur.endTick, above, eng);
+    const shift = arcClearShift(x0, ply, x1, pry, arcRise(x1 - x0, mixedSlurStyle(above)), above, obstacles, STAFF_ARC_GAP);
+    ply += shift;
+    pry += shift;
   }
 
   if (hasPrev) {
@@ -3440,12 +3472,41 @@ export function slurEnds(
   return { plx, ply, prx, pry, above };
 }
 
+/** 五线谱弧离跨度里符头、符干尖留的空（tenths，半个谱线间距）。 */
+const STAFF_ARC_GAP = 5;
+
+/** 五线谱弧跨度里（起止之间、本系统内、同一谱表）弧那一侧的墨迹点：符头外缘，与朝弧那一侧的符干尖。 */
+function staffArcObstacles(sys: Sys, ref: ChordLayout, staff: number, t0: Fraction, t1: Fraction, above: boolean, eng: MixedOptions): ArcObstacle[] {
+  const out: ArcObstacle[] = [];
+  const four = new Fraction(4);
+  const part = ref.measure.part;
+  for (const mif of sys.measures) {
+    const md = part.measures[mif.index];
+    if (!md) continue;
+    for (const ch of md.chords) {
+      if (ch.rest || ch.grace || !ch.notes.length) continue;
+      const t = ch.tick();
+      if (!fGt(t, t0) || !fLt(t, t1)) continue;
+      const xpos = mif.xpos();
+      for (const n of ch.notes) {
+        if (n.staff !== staff || !n.visible) continue;
+        out.push({ x: n.cx(eng.meta) + xpos, y: n.cy() + ch.measure.staffY(n.staff) + (above ? -5 : 5) });
+      }
+      // 符干尖在弧那一侧才挡（朝上的弧挡朝上的符干）
+      if (fLt(ch.noteType, four) && ch.stemUp === above && ch.notes[0]!.staff === staff) {
+        out.push({ x: ch.stemX() + xpos, y: ch.tailY(true) });
+      }
+    }
+  }
+  return out;
+}
+
 /** 弧（连同月牙的厚度）画出来的纵向范围 [顶, 底]：几何与 `render.ts::drawSlurTied` 同一份（`SlurTieBase` + `mixedSlurStyle`）。 */
 export function arcExtent(e: ArcEnds): [number, number] {
   const style = mixedSlurStyle(e.above);
   const pl = new Point(e.plx, e.ply);
   const pr = new Point(e.prx, e.pry);
-  const [p0, p1, cos] = SlurTieBase.calcSlurPoints(pl, pr, style);
+  const [p0, p1, cos] = calcSlurPoints(pl, pr, style);
   const lw = style.thickness / cos / 2; // 回程两个控制点下压的量
   const top = Math.min(cubicMinY(pl.y, p0.y, p1.y, pr.y), cubicMinY(pl.y, p0.y + lw, p1.y + lw, pr.y));
   const bot = Math.max(cubicMaxY(pl.y, p0.y, p1.y, pr.y), cubicMaxY(pl.y, p0.y + lw, p1.y + lw, pr.y));

@@ -6,7 +6,7 @@
 // 产物 `PlayItem[]` 的消费者：试听/MIDI（`timeline.ts`）、展开档（`jianpu/expand.ts::walkPlay`）、断句。
 
 import { Fraction } from "../common/fraction";
-import { StartStopDiscontinue } from "./enums";
+import { BarStyle, StartStopDiscontinue } from "./enums";
 
 // ───────────────────────── 产物 ─────────────────────────
 
@@ -47,6 +47,8 @@ export class PlayItem extends TimePosition {
   skip = 0;
   /** 末小节只取前这么多个和弦（-1 = 整节，`.Repeat` 里写作 `11.1-11.1V1`）。 */
   limit = -1;
+  /** 从这一小节起接在前面同一行末尾、不另起一行（只在最后一遍唱的「阿们」结尾，`lastVerseTail`） */
+  glueFrom = -1;
   clone(): PlayItem {
     const p = new PlayItem();
     p.mid = this.mid;
@@ -55,6 +57,7 @@ export class PlayItem extends TimePosition {
     p.end = this.end;
     p.endOfPass = this.endOfPass;
     p.skip = this.skip;
+    p.glueFrom = this.glueFrom;
     p.limit = this.limit;
     return p;
   }
@@ -83,6 +86,8 @@ export class PlayData {
 
 export interface PlayLyric {
   readonly number: number;
+  /** 字面（行首可能带印刷段号「1.2.」，见 `labelPasses`） */
+  readonly text?: string;
 }
 
 export interface PlayNote {
@@ -109,6 +114,8 @@ export interface PlayMeasure {
   readonly endingLeft: boolean;
   readonly endingNum: ReadonlySet<number> | null;
   readonly endingRight: StartStopDiscontinue | null;
+  /** 小节右边的小节线样式（没写 = 普通细线） */
+  readonly barline?: BarStyle | null;
 }
 
 export interface PlayPart {
@@ -168,10 +175,227 @@ export function playOrderOf(parts: readonly PlayPart[], jumps: PlayJumps): PlayO
   // D.C./D.S. 同理：跳转记号本身就把曲子展开成了多遍（本曲 `D.C. al Fine`＝全曲唱一遍、
   // 回头唱到 Fine 为止，两遍正好配两段词），再按歌词段数整体乘一遍就成了四遍。
   const hasJump = jumps.jumpTo.size > 0;
+  const byVerse = jumpByVerse(parts, jumps);
+  if (byVerse) return { measures: byVerse, isSimple: false, hasRepeat: false };
   const isSimple = rep.result.length === 1;
   if (repeatByVerse && !hasVolta && !hasJump) rep.repeatByLyric();
-  const out = expandVoltaByVerse(parts[0]!, rep.result) ?? rep.result;
+  const out = hasJump ? perVerse(rep.result, rep.getPassCountByLrc(0, measures.length)) : expandVoltaByVerse(parts[0]!, rep.result) ?? rep.result;
+  if (hasJump) labelPasses(parts, out);
+  if (!hasVolta && !hasJump) implicitVoltas(parts, out);
+  if (!hasJump) lastVerseTail(parts, out);
+  if (!hasJump) glueCoda(parts, out);
   return { measures: out, isSimple, hasRepeat: measures.some((m) => m.repeatBackward) };
+}
+
+/** 接到末行的结尾最多几小节（「阿们」一两小节） */
+const CODA_MAX = 2;
+
+/** 曲尾只有末段写了词的那几小节（文本谱《圣哉三一歌》末段后的「(阿们)」）只在最后一遍唱：前几遍唱到它前面为止；
+ *  最后一遍里它接在前面那行末尾（`glueFrom`）。 */
+function lastVerseTail(parts: readonly PlayPart[], items: PlayItem[]): void {
+  const n = parts[0]!.measures.length;
+  const numsOf = (i: number): Set<number> => {
+    const s = new Set<number>();
+    for (const p of parts) for (const v of verseNumbers(p, i, i + 1)) s.add(v);
+    return s;
+  };
+  let last = 0;
+  for (const it of items) last = Math.max(last, it.pass);
+  if (last < 2) return;
+  let t = n;
+  let sung = false;
+  while (t > 0) {
+    const s = numsOf(t - 1);
+    if ([...s].some((v) => v !== last)) break;
+    if (s.has(last)) sung = true;
+    t--;
+  }
+  if (!sung || t === 0 || t === n) return;
+  // 还得是终止线隔开的（`|||`）：只看词的话，末段多写一句的普通结尾也会被截
+  if (parts[0]!.measures[t - 1]!.barline !== BarStyle.LIGHT_HEAVY) return;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i]!;
+    if (it.end <= t) continue;
+    // 从结尾起头的一项：紧接着前一项唱下来的才是「阿们」，跳过一房接上的是二房（爱是不保留 `13-19:2 21-23:2`），不动
+    const short = n - t <= CODA_MAX;
+    if (it.mid >= t) {
+      if (short && items[i - 1]?.end === it.mid) it.glueFrom = it.mid;
+      continue;
+    }
+    // 用户定 2026-10-14：「阿们」接在最后一遍末行的末尾，不单独成行
+    if (it.pass === last) {
+      if (short) it.glueFrom = t;
+    } else it.end = t;
+  }
+}
+
+/** 各遍之后只唱一次的结尾（148《求圣灵教导》、255、494 终止线后的「阿们」，`… 0-16:4 16-17:1`）：
+ *  别的遍都没唱到这几小节、紧接前一项唱下来、前面是终止线（`:|` 也算）——接在前一行末尾，不单独成行（用户定 2026-10-14）。 */
+function glueCoda(parts: readonly PlayPart[], items: PlayItem[]): void {
+  const tail = items[items.length - 1];
+  if (!tail || items.length < 2 || tail.mid === 0 || tail.glueFrom >= 0) return;
+  if (items.some((it) => it !== tail && it.end > tail.mid)) return;
+  if (items[items.length - 2]!.end !== tail.mid) return; // 跳过一房接上的二房不算
+  if (tail.end - tail.mid > CODA_MAX) return; // 反复之后的整段 B 段（111、137、237）不是「阿们」
+  if (parts[0]!.measures[tail.mid - 1]!.barline !== BarStyle.LIGHT_HEAVY) return;
+  tail.glueFrom = tail.mid;
+}
+
+/** 没画房号、按词看出来的一房二房（testdata《爱是不保留》）：`:|` 前末 k 小节只写了第 1 段（第 p 遍不唱），
+ *  `:|` 后紧接的 k 小节只写了第 p 段、没有第 1 段——第 p 遍唱到 `:|` 前 k 小节就跳过去唱后面那 k 小节（二房），
+ *  再往后才回到第 1 遍。曲尾 `:|` 后只写末段的结尾同理。原先第 p 遍照唱一房（没词）、二房按第 1 遍唱（也没词）。 */
+function implicitVoltas(parts: readonly PlayPart[], items: PlayItem[]): void {
+  const n = parts[0]!.measures.length;
+  const nums: Set<number>[] = [];
+  for (let i = 0; i < n; i++) {
+    const s = new Set<number>();
+    for (const p of parts) for (const v of verseNumbers(p, i, i + 1)) s.add(v);
+    nums.push(s);
+  }
+  for (let i = 0; i + 1 < items.length; i++) {
+    const a = items[i]!;
+    const b = items[i + 1]!;
+    const p = a.pass;
+    const e = a.end;
+    if (p < 2 || b.mid !== e || b.pass === p || a.limit !== -1 || b.skip > 0) continue;
+    let k = 0;
+    while (
+      k + 1 < a.end - a.mid && e + k < b.end &&
+      !nums[e - k - 1]!.has(p) && nums[e - k - 1]!.has(1) &&
+      nums[e + k]!.has(p) && !nums[e + k]!.has(1)
+    ) k++;
+    if (k === 0) continue;
+    a.end = e - k;
+    const v = new PlayItem();
+    v.mid = e;
+    v.end = e + k;
+    v.pass = p;
+    if (b.mid + k >= b.end) {
+      v.endOfPass = b.endOfPass;
+      items.splice(i + 1, 1, v);
+    } else {
+      b.mid += k;
+      items.splice(i + 1, 0, v);
+    }
+  }
+}
+
+/** `D.C. al Fine` / `D.S. al Fine` 碰上多段词（用户定 2026-10-14：每段一遍、各自回到 Fine）。
+ *
+ *  谱面 A（到 Fine）+ B（到 D.C./D.S.），B 写了 V 段词、A 段数比它少（096《哈利路亚！感谢主》：副歌在前只一行、
+ *  主歌四段）：A B₁ → 跳回唱 A 到 Fine → B₂ → 跳回 A 到 Fine … → B_V → 跳回 A 到 Fine 收。
+ *  A 的那几遍取 A 自己的词：A 只有一行就每遍都用第 1 段，A 也写了几段就用对应那段（不够的退回第 1 段）。
+ *  每段唱完 Fine 那一遍换页（`endOfPass`）。
+ *  只管最简单的形态：一处 D.C. 或 D.S.、一处 Fine、没有 To Coda、谱里没有 `:|` 与房号；不满足返回 null，交给 `RepeatProcessor`
+ *  （从前 D.C. 只多唱一遍，第 3、4 段整个丢掉；直接按段数整体乘又会把 A 唱成四遍）。 */
+function jumpByVerse(parts: readonly PlayPart[], jumps: PlayJumps): PlayItem[] | null {
+  const measures = parts[0]!.measures;
+  if (measures.some((m) => m.repeatBackward || m.endingNum)) return null;
+  let back: { at: TimePosition; spec: JumpSpec } | null = null;
+  let fine: TimePosition | null = null;
+  for (const [t, v] of jumps.jumpTo) {
+    if (v.kind === PlaySpecKind.ToCoda) return null;
+    if (v.kind === PlaySpecKind.Fine) {
+      if (fine) return null;
+      fine = t;
+    } else {
+      if (back) return null;
+      back = { at: t, spec: v };
+    }
+  }
+  if (!back || !fine) return null;
+  let target = new TimePosition(0, new Fraction(0));
+  if (back.spec.kind === PlaySpecKind.DalSegno) {
+    const seg = jumps.segno.get(back.spec.value as string);
+    if (!seg) return null;
+    target = seg;
+  }
+  const fineMid = fine.mid;
+  const backMid = back.at.mid;
+  if (!(target.mid <= fineMid && fineMid < backMid)) return null;
+  const versesOf = (beg: number, end: number): number => Math.max(0, ...parts.map((p) => verseCount(p, beg, end)));
+  const b = versesOf(fineMid + 1, backMid + 1);
+  const a = versesOf(target.mid, fineMid + 1);
+  const v = Math.max(a, b);
+  if (v <= 1) return null;
+  const out: PlayItem[] = [];
+  const push = (mid: number, end: number, pass: number): PlayItem => {
+    const p = new PlayItem();
+    p.mid = mid;
+    p.end = end;
+    p.pass = pass;
+    out.push(p);
+    return p;
+  };
+  if (a < b) {
+    // A 的词比 B 少（副歌在前）：下一段接在 Fine 后面，不再从头唱 A
+    push(0, backMid + 1, 1);
+    for (let k = 1; k <= v; k++) {
+      const p = push(target.mid, fineMid + 1, k <= a ? k : 1);
+      p.offset = target.offset;
+      if (k < v) {
+        p.endOfPass = true;
+        push(fineMid + 1, backMid + 1, k + 1);
+      }
+    }
+    return out;
+  }
+  // A 也写了各段的词（236《同享主餐》、250《主，差遣我》）：每段从曲首唱到 D.C./D.S.、跳回唱到 Fine，下一段再从曲首起
+  for (let k = 1; k <= v; k++) {
+    push(0, backMid + 1, k);
+    const p = push(target.mid, fineMid + 1, k);
+    p.offset = target.offset;
+    if (k < v) p.endOfPass = true;
+  }
+  return out;
+}
+
+/** 有跳转、又有反复的谱：`RepeatProcessor` 推出的一遍里遍号只用来挑房，段数比它多（094《哈利路亚，祂已复活》三段、
+ *  一房里的 D.S. 只回 segno 再唱一次）时，整套按段数逐段各唱一遍，遍号换成段号（2019 年成品 PPT 就是这样唱的）。 */
+function perVerse(items: readonly PlayItem[], verses: number): PlayItem[] {
+  let maxPass = 0;
+  for (const it of items) maxPass = Math.max(maxPass, it.pass);
+  if (verses <= maxPass) return [...items];
+  const out: PlayItem[] = [];
+  for (let k = 1; k <= verses; k++) {
+    items.forEach((it, i) => {
+      const c = it.clone();
+      c.pass = k;
+      c.endOfPass = i === items.length - 1 && k < verses;
+      out.push(c);
+    });
+  }
+  return out;
+}
+
+/** 歌词行首印着几个段号（018《伟大的主》副歌第 1 行是「1.2.伟大的主」）：这一行唱那几遍，后面的行依次往后挪
+ *  （第 2 行唱第 3 遍——D.S. 回来那一遍）。按这张表把遍号换成该唱的那一行；没有这种段号时不动。 */
+function labelPasses(parts: readonly PlayPart[], items: PlayItem[]): void {
+  const labels = new Map<number, number[]>();
+  for (const part of parts) {
+    for (const m of part.measures) {
+      for (const ent of m.entries) {
+        if (!isPlayChord(ent)) continue;
+        for (const n of ent.notes) {
+          for (const l of n.lyrics) {
+            if (labels.has(l.number)) continue;
+            const hit = /^\s*(\d+(?:\s*[.,，、]\s*\d+)+)\s*[.,，、]/.exec(l.text ?? "");
+            if (hit) labels.set(l.number, (hit[1]!.match(/\d+/g) ?? []).map(Number));
+          }
+        }
+      }
+    }
+  }
+  if (![...labels.values()].some((ps) => ps.length > 1)) return;
+  const lineOf = new Map<number, number>();
+  let next = 1;
+  const lines = Math.max(0, ...parts.map((p) => verseCount(p, 0, p.measures.length)));
+  for (let line = 1; line <= lines; line++) {
+    const ps = labels.get(line) ?? [next];
+    for (const p of ps) lineOf.set(p, line);
+    next = Math.max(next, ...ps) + 1;
+  }
+  for (const it of items) it.pass = lineOf.get(it.pass) ?? it.pass;
 }
 
 /** 不推、按段数整曲逐遍（没有反复信息时的退路）。`passes` 为 0 时返回空表。 */
@@ -208,6 +432,10 @@ export function playOrderFromSpec(repeat: { readonly items: readonly RepeatSpecI
 
 /** 歌词段号的种数（原 `Part.getVerseCount`）。 */
 function verseCount(part: PlayPart, beg: number, end: number): number {
+  return verseNumbers(part, beg, end).size;
+}
+
+function verseNumbers(part: PlayPart, beg: number, end: number): Set<number> {
   const num = new Set<number>();
   part.measures.forEach((m, idx) => {
     if (idx < beg || idx >= end) return;
@@ -216,7 +444,7 @@ function verseCount(part: PlayPart, beg: number, end: number): number {
       for (const n of ent.notes) for (const l of n.lyrics) num.add(l.number);
     }
   });
-  return num.size;
+  return num;
 }
 
 /** 「一房只有第 1 段 + 歌词段数多于房数」的赞美诗谱（如《我心等候祢》）补救展开。
@@ -343,6 +571,13 @@ class RepeatProcessor {
       if (this.inJump && v.kind === PlaySpecKind.ToCoda) tocoda = v.value as string;
       if (this.inJump && v.kind === PlaySpecKind.Fine) res = true;
     }
+    // 同一房里 D.S. 与 D.C. 都写了（064《啊！圣善夜》一二房 `:|` 上两个都有）：各管一遍——下一遍的词在 segno 之前
+    // 就有就回曲首（D.C.），只从 segno 起才有就回 segno（D.S.，第 3 段词只从 segno 写起）
+    if (seg !== null && dacapo) {
+      const t = this.jumps.segno.get(seg) ?? new TimePosition(parseInt(seg, 10) - 1, new Fraction(0));
+      if (this.getPassCountByLrc(0, t.mid) > m.pass) seg = null;
+      else dacapo = false;
+    }
     let newItem = false;
     if (this.result.length === 0) {
       newItem = true;
@@ -358,9 +593,17 @@ class RepeatProcessor {
       cur.end = mid + 1;
       this.result.push(cur);
     }
+    // 一房里写在 `:|` 上的 D.S.（094《哈利路亚，祂已复活》）：不是跳转，是这次反复回到 segno 而不是曲首
+    if (seg !== null && mea.repeatBackward && this.inEnding) {
+      const t = this.jumps.segno.get(seg) ?? new TimePosition(parseInt(seg, 10) - 1, new Fraction(0));
+      this.loopStart = t.mid;
+      seg = null;
+    }
     if (seg !== null) {
       let t = this.jumps.segno.get(seg);
       if (t === undefined) t = new TimePosition(parseInt(seg, 10) - 1, new Fraction(0));
+      // 跳回 segno 是新的一遍（同 D.C.）：018《伟大的主》D.S. 回来唱副歌第 2 行
+      m.pass++;
       this.doJump(m, t);
     }
     if (tocoda !== null) {
@@ -419,10 +662,18 @@ class RepeatProcessor {
     if (this.inJump) return;
     this.endingActive = false;
     this.inEnding = false;
-    if (resetPass) {
+    // 收房之后的小节只写了当前这一遍的词、没有第 1 段（064 三房之后的结尾只写第 3 段）：遍号不归 1
+    if (resetPass && !this.tailKeepsPass(m)) {
       m.pass = 1;
       this.passCount = -1;
     }
+  }
+
+  private tailKeepsPass(m: TimePosition): boolean {
+    if (m.pass <= 1) return false;
+    const nums = new Set<number>();
+    for (const p of this.parts) for (const n of verseNumbers(p, m.mid + 1, p.measures.length)) nums.add(n);
+    return !nums.has(1) && nums.has(m.pass);
   }
 
   private onForward(mid: number, pass: number): void {

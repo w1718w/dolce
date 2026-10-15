@@ -647,7 +647,7 @@ PP-OCR 的字典繁简同收，字形只差一角的一对常读错边——76�
 - 收益：76 歌词 99.1 → 100，1776《在天上我有一位阿爸》99.4 → 100（另一处同类误判），其余 36 首一字不变。
 
 **减时线的连断（文本谱的 `~` / `^`）**：一条减时线连到哪儿，本项目的排版端是按**拍组**算的
-（`layout/original/place.ts::beatGroups`，认拍号，复拍子三个八分一组），不写记号也排得对；但**诗歌本 app
+（`layout/jianpu/place/voice.ts::beatGroups`，认拍号，复拍子三个八分一组），不写记号也排得对；但**诗歌本 app
 那边要照谱本的写法把记号写出来**，故写出端（`model/topu.ts`）照它的范式生成。两种情形：
 
 - **复拍子**（分母 8、分子是 3 的倍数：3/8 6/8 9/8 12/8），一组 = 三个八分 = 1.5 个四分拍：
@@ -1955,7 +1955,7 @@ rec 全被按在一个弱核上、按歌词条数累积的形状。
 node scripts/omr-cli.mjs a.jpg b.jpg 谱子目录/ -o 出目录/
 ```
 
-或者把 `dist-cli/omr.js` 当库 `import` 进常驻服务（`recognizeImage`），只加载一次模型。
+或者把 `out/cli/omr.js` 当库 `import` 进常驻服务（`recognizeImage`），只加载一次模型。
 
 ### 命令
 
@@ -1989,7 +1989,7 @@ execFile 不走 shell 找不到裸 `npm`，Git Bash 里也一样）与 tar，体
 `--options zip:compression=deflate`，否则 `-a` 默认 store、85M 的包原样存成 85M；GNU tar 不认
 zip 格式，那种环境才回退到 `zip`。
 
-产物 `dist-pkg/dolce-omr-<版本>-<os>-<cpu>[-musl].{tar.gz|zip}`（Windows 出 zip），
+产物 `out/pkg/dolce-omr-<版本>-<os>-<cpu>[-musl].{tar.gz|zip}`（Windows 出 zip），
 内含 `omr.js` + 共享 chunk + `omr-cli.mjs`（Windows 另附 `omr-cli.cmd`）+ `models/` + `node_modules/`。
 
 | 目标 | 目录 | 压缩包 |
@@ -2057,7 +2057,7 @@ zip 格式，那种环境才回退到 `zip`。
 同一个坑在**桌面安装包**上也踩了一次：干净的 Windows 上装完 NSIS 包，一开就弹
 「由于找不到 MSVCP140_1.dll，无法继续执行代码」。原因是 `ort` 静态链进来的 ONNX Runtime 是
 微软用 `/MD` 编的，`dolce.exe` 于是**自己**导入 `MSVCP140*`/`VCRUNTIME140*`。（CLI 包那套只
-管 `dist-pkg`，跟桌面包是两条打包路径，别指望其中一条覆盖另一条。）
+管 `out/pkg`，跟桌面包是两条打包路径，别指望其中一条覆盖另一条。）
 
 做法与 CLI 包同源，都用 `vcredist.mjs` 抠 DLL，只是投放方式换成 Tauri 的资源机制：
 

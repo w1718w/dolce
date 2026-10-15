@@ -32,6 +32,7 @@ import type {
   Measure,
   NoteType,
   Part,
+  PartGroup,
   PlayPass,
   ScoreDoc,
   Song,
@@ -105,7 +106,8 @@ interface PartBuild {
   openTuplets: OpenMark[];
   /** `srcs`：欠着的这些记号在原文里的位置（`AttachedSource`，只给编辑用），随记号一起落到元素上 */
   pending: { chord?: string; annotations: string[]; decos: string[]; srcs: AttachedSource[] };
-  openEnding: number[][];
+  /** 开着的房号：房号与起头那一小节的序号 */
+  openEnding: Array<{ nums: number[]; measureNo: number }>;
   /** 当前歌词块；`afterLyrics` 表示上一块已经跟过 `w` 行，下一条音乐行开新块 */
   block?: LyricBlock;
   afterLyrics: boolean;
@@ -116,8 +118,10 @@ interface PartBuild {
   clef?: Clef;
   /** 123 的后置 `~` 还没配到下一个音：起点和弦与 `~` 的位置。存在声部级，`~` 可以跨 `$` 行 */
   arcNext: { from: ElementId; source: SourceSpan } | null;
-  /** 开着的渐强渐弱（Muse 的 `(<` … `<)`），起点同弧一样由 `attach` 回填 */
+  /** 开着的渐强渐弱（Muse 的 `(<` … `<)`、ABC 的 `!crescendo(!` … `!crescendo)!`），起点同弧一样由 `attach` 回填 */
   openWedges: OpenMark[];
+  /** ABC 装饰写的渐强渐弱收尾（`!crescendo)!`）：装饰写在**收尾那个音前面**，等下一个元素挂上才落成 Mark */
+  wedgeCloseNext: { type: "crescendo" | "diminuendo"; source: SourceSpan }[];
   /** 行内 `[L:…]` 改过的默认音长：**只管这个声部**（ABC §7：声部里的行内字段只作用于该声部），
    *  交错或分块写的别的声部仍用头部的 `L:` */
   len?: DefaultLen;
@@ -338,8 +342,8 @@ export function parseLyricLine(
       push(l);
       continue;
     }
-    // 左引号：领起**后**一个字，所以先吃住、挂到下一个音节前缀
-    if (PU_LYRIC_QUOTES.includes(ch) && isOpenQuote(ch)) {
+    // 左引号、开括号：领起**后**一个字，所以先吃住、挂到下一个音节前缀
+    if (isOpenQuote(ch)) {
       const next = body[i + 1];
       if (next !== undefined && isCjk(next)) {
         let text = ch + next;
@@ -351,6 +355,8 @@ export function parseLyricLine(
         push(l);
         continue;
       }
+      // 后面不是汉字：引号照旧不占位；括号不能丢（往返要稳），攒着挂到下一个音节前面
+      if (!PU_LYRIC_QUOTES.includes(ch)) prefix += ch;
       i++;
       continue;
     }
@@ -409,6 +415,8 @@ interface OpenMark {
   /** 三连音还差几个音符收尾（ABC §4.13：`(3` 作用于随后 3 个音符，不需要显式收尾）。
    *  123 的多连音由 `)` 收（`ParseDialect.tupletClose`），不用它 */
   remaining?: number;
+  /** 渐强渐弱是 ABC 装饰写的（`!crescendo(!`），配不上对时报 ABC 的写法而不是 Muse 的 `(<` */
+  abcDeco?: boolean;
   /** `(` 在原文里的位置（见 `Mark.openSource`） */
   openSource?: SourceSpan;
   /** 渐强渐弱（`type === "wedge"`） */
@@ -468,6 +476,16 @@ function buildMusicLine(
   let beamGroup = 0;
   let sawSpaceSinceLastNote = true;
 
+  /** 收一条渐强渐弱：配同类型最近开的那条，收在 `end` 上 */
+  const closeWedge = (type: "crescendo" | "diminuendo", end: ElementId | undefined, source: SourceSpan, abc = false): void => {
+    const k = pb.openWedges.map((o) => o.wedgeType).lastIndexOf(type);
+    const open = k >= 0 ? pb.openWedges.splice(k, 1)[0]! : undefined;
+    if (open?.start && end !== undefined) {
+      marks.push({ type: "wedge", start: open.start, end, wedgeType: type, ...(open.openSource ? { openSource: open.openSource } : {}), closeSource: source });
+    } else {
+      report(ctx, "unmatched-wedge", tr(abc ? "diag.abc.wedge" : "diag.jcx.wedge"), source);
+    }
+  };
   const attach = (el: Element): void => {
     if (pending.chord !== undefined) {
       el.harmony = { root: { step: "C", alter: 0 }, kind: "", text: pending.chord };
@@ -520,6 +538,10 @@ function buildMusicLine(
     for (const o of openSlurs) if (!o.start) o.start = el.id;
     for (const o of openTuplets) if (!o.start) o.start = el.id;
     for (const o of pb.openWedges) if (!o.start) o.start = el.id;
+    if (pb.wedgeCloseNext.length && !(el.kind === "chord" && el.grace)) {
+      for (const w of pb.wedgeCloseNext) closeWedge(w.type, el.id, w.source, true);
+      pb.wedgeCloseNext = [];
+    }
     // 123：组内**所有**占时值的元素（音符、`0`、`x`、`X`）都按比例折算；嵌套的比例相乘
     if (ctx.d.tupletClose === "paren" && el.kind === "chord" && !el.grace && openTuplets.length) {
       let actual = 1;
@@ -559,10 +581,10 @@ function buildMusicLine(
         } else {
           ch.notes.push(ctx.d.note(t));
         }
-        if ((t.beams ?? 0) > 0) {
-          ch.beams = Array.from({ length: t.beams! }, () => "continue" as const);
-          if (ctx.d.spaceBeams) ch.beamGroup = beamGroup;
-        }
+        if ((t.beams ?? 0) > 0) ch.beams = Array.from({ length: t.beams! }, () => "continue" as const);
+        // ABC 的空白分组：音长写在 `L:` 里、token 不带减时线条数，所以不能只给带 `beams` 的音记——
+        // 以前八分音符一个组号都没有，五线谱层全成了单独的符尾
+        if (ctx.d.spaceBeams && !rest) ch.beamGroup = beamGroup;
         applyTieAndBroken(ch);
         attach(ch);
         cur.sustainHost = ch;
@@ -759,6 +781,15 @@ function buildMusicLine(
         // 跳转记号不是音符上的装饰，而是挂在小节线上的（`Barline.ornaments`）。
         // 写在线**之后**（小节还一个元素都没有）的是**左线**上的记号——segno/coda 这类跳转目标；
         // 写在线之前的攒着，等下面 `case "barline"` 把它挂到那条右线上。
+        // ABC 的渐强渐弱 `!crescendo(!` / `!<(!` … `!crescendo)!` / `!<)!`（渐弱 `diminuendo` / `>`）：
+        // 起点同弧一样由下一个元素回填；收尾的装饰写在收尾那个音**前面**，也等下一个元素
+        const wedge = /^(crescendo|<|diminuendo|decrescendo|>)([()])$/.exec(deco);
+        if (wedge) {
+          const type = wedge[1] === "crescendo" || wedge[1] === "<" ? "crescendo" : "diminuendo";
+          if (wedge[2] === "(") pb.openWedges.push({ type: "wedge", start: 0, level: 0, wedgeType: type, openSource: t.source, abcDeco: true });
+          else pb.wedgeCloseNext.push({ type, source: t.source });
+          break;
+        }
         const jump = jumpOrnamentName(deco);
         if (jump && pb.measure.elements.length === 0) {
           const bls = (pb.measure.barlines ??= []);
@@ -773,17 +804,22 @@ function buildMusicLine(
       }
 
       case "grace": {
-        const ch: Chord = {
-          kind: "chord",
-          id: ctx.ids.next(),
-          notes: (t.notes ?? []).map((g) => ctx.d.note(g)),
-          duration: { divisions: 0, dots: 0, type: graceType(t.notes?.[0]) },
-          grace: { ...(t.acciaccatura ? { slash: true } : {}), ...(t.graceAfter ? { after: true } : {}) },
-          voice: pb.voice,
-          staff: 1,
-          source: t.source,
-        };
-        pb.measure.elements.push(ch);
+        // 花括号里的几个音是**一串**倚音（ABC §4.12 `{gab}`），一个音一个 grace 元素——
+        // 与 MusicXML、文本谱的导入同一口径；从前塞进一个和弦，五线谱就把 `{2_ 3_}` 画成了两音同时的和弦倚音
+        // `{[CE]}`（ABC）里方括号那一组是同时发声的和弦倚音，收进一个元素
+        for (const g of t.notes ?? []) {
+          const ch: Chord = {
+            kind: "chord",
+            id: ctx.ids.next(),
+            notes: g.kind === "chordGroup" ? (g.notes ?? []).map((x) => ctx.d.note(x)) : [ctx.d.note(g)],
+            duration: { divisions: 0, dots: 0, type: graceType(g) },
+            grace: { ...(t.acciaccatura ? { slash: true } : {}), ...(t.graceAfter ? { after: true } : {}) },
+            voice: pb.voice,
+            staff: 1,
+            source: t.source,
+          };
+          pb.measure.elements.push(ch);
+        }
         break;
       }
 
@@ -879,13 +915,7 @@ function buildMusicLine(
           pb.openWedges.push({ type: "wedge", start: 0, level: 0, wedgeType: type, openSource: t.source });
           break;
         }
-        const k = pb.openWedges.map((o) => o.wedgeType).lastIndexOf(type);
-        const open = k >= 0 ? pb.openWedges.splice(k, 1)[0]! : undefined;
-        if (open?.start && cur.last) {
-          marks.push({ type: "wedge", start: open.start, end: cur.last.id, wedgeType: type, ...(open.openSource ? { openSource: open.openSource } : {}), closeSource: t.source });
-        } else {
-          report(ctx, "unmatched-wedge", tr("diag.jcx.wedge"), t.source);
-        }
+        closeWedge(type, cur.last?.id, t.source);
         break;
       }
 
@@ -922,7 +952,7 @@ function buildMusicLine(
         const existingLeft = (pb.measure.barlines ?? []).find((b) => b.location === "left");
         if (existingLeft) existingLeft.ending = ending;
         else (pb.measure.barlines ??= []).push({ location: "left", ending, source: t.source });
-        openEnding.push(nums);
+        openEnding.push({ nums, measureNo: pb.measureNo });
         break;
       }
 
@@ -952,8 +982,18 @@ function buildMusicLine(
         // 结束类小节线收掉开着的房号
         const isEndingStop = ["light-light", "light-heavy", "heavy-light"].includes(bl.style ?? "");
         if (isEndingStop && openEnding.length) {
-          const nums = openEnding.pop()!;
+          const nums = openEnding.pop()!.nums;
           bl.ending = { numbers: nums, type: "stop", text: nums.join(",") };
+        } else if (openEnding.length) {
+          // 没封口的后一房（前一小节以 `:|` 收、这一房在本小节起头）碰不到结束线：只罩这一小节、右端敞口（用户定，2026-10-14：
+          // 从 MusicXML 转来的二房 `[2 … | Gm …` 原先一路延到曲末，020《向主歌唱》）
+          const top = openEnding[openEnding.length - 1]!;
+          const prev = pb.part.measures[pb.part.measures.length - 1];
+          const afterRepeat = !!prev?.barlines?.some((x) => x.location === "right" && x.repeat === "backward");
+          if (top.measureNo === pb.measureNo && afterRepeat) {
+            openEnding.pop();
+            bl.ending = { numbers: top.nums, type: "discontinue", text: top.nums.join(",") };
+          }
         }
         (pb.measure.barlines ??= []).push(bl);
         pb.inlineBreak = null; // `$` 之后先到的是小节线：小节末换行，小节级那一份就够了
@@ -1051,7 +1091,7 @@ function buildMusicLine(
 /**
  * 123/ABC 的房号约定：**一组房的最后一房不封口**。ABC 本身没有区分封口与否的写法（ABC §4.9/§4.10：房号止于
  * 双线、反复线或下一房的开始），读入时结束类小节线一律收成 `stop`；这里把「后面不再紧跟一房」的那个 `stop`
- * 改记 `discontinue`。排版器（简谱引擎、原样文档布局、五线谱）只照模型里的值画，不再各自判断；
+ * 改记 `discontinue`。排版器（旧简谱引擎、原样文档布局、五线谱）只照模型里的值画，不再各自判断；
  * MusicXML、文本谱照各自原文。
  */
 function markLastEndings(part: Part): void {
@@ -1153,6 +1193,7 @@ export interface ParseOptions {
  *  （ABC 2.1 §4.12：花括号里照普通音符写长度，单位另定）：123 每个 `_` 减半（`{2_}` 十六分），
  *  ABC 按 num/den（`{d/}` 十六分、`{d2}` 四分）；什么都不写就是八分。 */
 function graceType(g: Token | undefined): NoteType {
+  if (g?.kind === "chordGroup" && g.num === undefined) g = g.notes?.[0];
   const ratio = (g?.num ?? 1) / (g?.den ?? 1) / 2 ** (g?.beams ?? 0);
   const k = Math.round(Math.log2(ratio));
   return (["64th", "32nd", "16th", "eighth", "quarter", "half"] as const)[Math.max(0, Math.min(5, k + 3))]!;
@@ -1274,8 +1315,11 @@ export function parseAbcFamily(
         report(ctx, "orphan-arc-next", "`~` 后面没有音符", b.arcNext.source);
         b.arcNext = null;
       }
-      for (const w of b.openWedges) report(ctx, "unmatched-wedge", tr("diag.jcx.wedge"), w.openSource!);
+      for (const w of b.openWedges) report(ctx, "unmatched-wedge", tr(w.abcDeco ? "diag.abc.wedge" : "diag.jcx.wedge"), w.openSource!);
       b.openWedges.length = 0;
+      // 写在最后、后面再没有音符可挂的收尾装饰（`!crescendo)!`）
+      for (const w of b.wedgeCloseNext) report(ctx, "unmatched-wedge", tr("diag.abc.wedge"), w.source);
+      b.wedgeCloseNext = [];
       closeMeasure(ctx, b);
       markLastEndings(b.part);
       if (b.block && b.block.end === undefined) b.block.end = slotCount(b, ctx.d.lyricSlotRule);
@@ -1308,6 +1352,17 @@ export function parseAbcFamily(
     ctx.breakAfter.clear();
     song.marks = marks;
     if (rawPlay.length) song.playOrder = resolvePlayOrder(song, rawPlay);
+    // `%%score [1 2]` / `{1 2}`（ABC §11.1）：声部分组的括号。原文仍留在 `style.raw` 里（写回照原样），
+    // 这里只把最外层的 `[…]`（bracket）`{…}`（brace）落成 `partGroups`，五线谱、原样档据此画括号
+    const sc = song.style?.raw?.find((r) => r.key === "score");
+    if (sc) {
+      const groups = scorePartGroups(sc.value, (id) => {
+        // 123/ABC 的 `V:` 是数字；Muse 的音轨名按首次出现编号（`voiceIds`）
+        const n = voiceIds.get(id) ?? (/^\d+$/.test(id) ? Number(id) : undefined);
+        return n !== undefined && song!.parts.some((p) => p.id === `P${n}`) ? `P${n}` : null;
+      });
+      if (groups.length) song.partGroups = groups;
+    }
     doc.songs.push(song);
     song = null;
     pb = null;
@@ -1335,6 +1390,7 @@ export function parseAbcFamily(
     inlineBreak: null,
     arcNext: null,
     openWedges: [],
+    wedgeCloseNext: [],
   });
   /** `V:n` 切到声部 n：没有就新开，有就**续写**（不收尾它开着的小节）。四声部谱靠这个分开，否则会被拼成一串小节。 */
   const startPart = (voice: number): PartBuild => {
@@ -1674,4 +1730,16 @@ function applyInstruction(
       (song.style ??= {}).raw = [...(song.style.raw ?? []), { key: name, value: ins.value }];
       break;
   }
+}
+
+/** `%%score` 的值 → 声部分组：只认最外层的 `[…]`（bracket）与 `{…}`（brace），组内是 `V:` 号（括号 `( )` 当作同组）。 */
+function scorePartGroups(value: string, partOf: (voiceId: string) => string | null): PartGroup[] {
+  const out: PartGroup[] = [];
+  const re = /([[{])([^\]}]*)[\]}]/g;
+  for (let m = re.exec(value); m; m = re.exec(value)) {
+    const parts = (m[2]!.match(/[^\s()|]+/g) ?? []).map(partOf).filter((p): p is string => p !== null);
+    if (parts.length < 2) continue;
+    out.push({ number: String(out.length + 1), symbol: m[1] === "{" ? "brace" : "bracket", parts });
+  }
+  return out;
 }

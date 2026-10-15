@@ -31,6 +31,7 @@ import { applyPageMetaToDefaults } from "./pagemeta";
 import { decoKey } from "./deconames";
 import { applyBreaks } from "./breaks";
 import { songFifths } from "./keyshift";
+import { distinctNumbers } from "./phrasedoc";
 
 
 /** 记号原名 → `<articulations>` 元素名（`&xx` 与 123 的 `!xx!` 同名）。 */
@@ -729,7 +730,8 @@ function projectPart(
     if (m.attrs?.time) time = m.attrs.time;
     /** 各元素的减时线条数（投影前的占位），自动分组用 */
     const levels = new Map<Element, number>();
-    for (const el of m.elements) levels.set(el, el.beams?.length ?? 0);
+    // 没写减时线条数的（ABC：音长在 `L:` 里）按音符类型给层数
+    for (const el of m.elements) levels.set(el, el.beams?.length ?? (el.kind === "chord" && !el.grace ? GRACE_BEAM_LEVELS[el.duration.type ?? ""] ?? 0 : 0));
     if (m.attrs?.key) {
       if (m.attrs.key.fifths === 0 && m.attrs.key.spelling) {
         const f = MusicCommon.keyNameToFifth(m.attrs.key.spelling);
@@ -868,7 +870,9 @@ function autoBeams(
   let curBeat = -1;
   let curVoice = 0;
   for (const it of items) {
-    const b = Math.floor((it.start + shift) / beat + 1e-9);
+    // ABC 的空白分组（`Chord.beamGroup`）说了算：同组连杠、跨拍也连；没有才按拍分
+    const bg = it.el.kind === "chord" ? it.el.beamGroup : undefined;
+    const b = bg !== undefined ? 1e6 + bg : Math.floor((it.start + shift) / beat + 1e-9);
     if (it.level > 0 && it.dur <= beat) {
       if (b !== curBeat || it.voice !== curVoice) groups.push([]);
       groups[groups.length - 1]!.push(it);
@@ -903,12 +907,43 @@ function autoBeams(
       }
     }
   }
+  // **倚音另成一组**：同一声部里紧挨着的几颗倚音连一条符杠（`{2_ 3_}5` 是一组两颗十六分，
+  // 各画各的符尾的话小旗子挤在一起、戳到主音符头上）。层数按各自的时值（八分一层、十六分两层…）。
+  const graceLevel = (el: Element): number =>
+    el.kind === "chord" ? GRACE_BEAM_LEVELS[el.duration.type ?? "eighth"] ?? 0 : 0;
+  let run: Chord[] = [];
+  const flush = (): void => {
+    if (run.length >= 2) {
+      const lv = run.map(graceLevel);
+      const maxLevel = Math.max(...lv);
+      for (let level = 1; level <= maxLevel; level++) {
+        run.forEach((ch, k) => {
+          if (lv[k]! < level) return;
+          const prevOn = k > 0 && lv[k - 1]! >= level;
+          const nextOn = k + 1 < run.length && lv[k + 1]! >= level;
+          const v: BeamVal = prevOn && nextOn ? "continue" : prevOn ? "end" : nextOn ? "begin" : k > 0 ? "backward hook" : "forward hook";
+          out.set(ch, [...(out.get(ch) ?? []), v]);
+        });
+      }
+    }
+    run = [];
+  };
+  for (const el of m.elements) {
+    if (el.kind === "chord" && el.grace && !el.rest && graceLevel(el) > 0) {
+      if (run.length && (run[run.length - 1]!.voice || 1) !== (el.voice || 1)) flush();
+      run.push(el);
+    } else flush();
+  }
+  flush();
   for (const el of m.elements) {
     const b = out.get(el);
     if (b) el.beams = b;
     else delete el.beams;
   }
 }
+
+/** 音符类型 → 符杠层数（`autoBeams` 给倚音成杠、给没写减时线条数的 ABC 音符用）。 */
+const GRACE_BEAM_LEVELS: Partial<Record<string, number>> = { eighth: 1, "16th": 2, "32nd": 3, "64th": 4 };
 
 /** 拆开的小节：符杠不能跨过切点。段末的音 begin/continue → 收尾，段首的 continue/end → 起头；只剩自己一个的去掉。 */
 function closeBeams(m: Measure): void {
@@ -975,7 +1010,9 @@ function directionOf(o: SourceOrnament): Direction | null {
 /** 段号区间（文本谱 `C1-2:`、`.jpwabc` 的 `W1-6:`）展开成逐段的 `<lyric>`；空字不写。副歌行（`refrain`）写一条 chorus。 */
 function lyricsOf(lyrics: readonly Lyric[] | undefined): Lyric[] {
   const out: Lyric[] = [];
-  for (const l of lyrics ?? []) {
+  // 同一个音底下段号重复的（文本谱同一段曲下两行 `C1:`，其实是第 1、2 段）依次挪到下一个空号，
+  // 不挪的话五线谱 / 混排两行词叠在同一高度（文本谱专有.pu 首行）。先挪后丢空字，各音的行号才对得齐
+  for (const l of distinctNumbers(lyrics ?? [])) {
     if (!l.text) continue;
     if (l.refrain || l.numberTo === undefined) {
       out.push(l);

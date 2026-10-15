@@ -6,8 +6,8 @@
 import { zipSync, type Zippable } from "fflate";
 import * as opentype from "opentype.js";
 import { asset } from "../common/asset";
-import { BeamLine } from "../layout/entry";
 import {
+  BeamLine,
   GraphicLine,
   GraphicPath,
   Group,
@@ -18,6 +18,7 @@ import {
   TextFrame,
   type PathSeg,
 } from "../layout/pageitem";
+import { STACK_GAP_DEFAULT } from "../engrave/stack";
 import { walkPageItem, type ItemVisitor } from "../layout/walk";
 
 
@@ -121,20 +122,21 @@ const TRAIL_PUNCT: Record<string, string> = {
   "\uff09": ")", "\u300d": "\uff63", "\u300f": "\uff63",
 };
 
+/** 目标字体里数字「1」的墨迹高（em）。附点离数字的那道空按它乘 `stack-gap` 算。 */
+const TARGET_DIGIT_INK = 0.7725;
+
 /** 附点的横向落点（圆的**左缘**，绝对坐标，口径同 `JpOctaveDot.x`）。
  *
- * 排版把附点摆在「数字**墨迹**右缘 → 条目右缘」的正中（`layout.ts::addAugDots` 的口径），
- * 可那两头都是拿 PingFang 量的：PingFang 的 "1" 又窄又靠左、`·` 的 advance 又比 YaHei 宽
- * 一倍，换成 YaHei 渲染后 "1." 只剩 3.1pt 而 "5." 有 6.6pt，一眼看得出不匀。
- * .pptx 这一端索性照 2019 年那批成品来：**离数字墨迹右缘固定 0.165 em**，各数字一样宽
- * （成品里量到 28pt 上 4.7pt）；多个附点之间按目标字体 `.` 的 advance 排。
+ * 规则与排版同一份（engrave/augdot.ts：第一个点离数字墨迹右缘一道空、点与点之间一道空），
+ * 只是数字墨迹右缘与墨迹高换成**目标字体**（YaHei）的——排版量的是 PingFang，"1" 又窄又靠左，
+ * 照搬过来 "1." 与 "5." 的点离数字远近不一。
  */
-const TARGET_AUG_GAP = 0.165;
-function augDotX(num: JpNumber, index: number): number {
+function augDotX(num: JpNumber, index: number, r: number, stackGap: number): number {
   const size = num.font.size * num.matrix.scaleY;
   const { cx, half } = numberSpan(num);
   const inkRight = cx - half + TARGET_DIGIT_INK_RIGHT * size;
-  return inkRight + TARGET_AUG_GAP * size + TARGET_ADVANCE["."] * size * index;
+  const gap = stackGap * TARGET_DIGIT_INK * size;
+  return inkRight + gap + index * (2 * r + gap);
 }
 
 let bravuraFont: opentype.Font | null = null;
@@ -173,7 +175,7 @@ function glyphSegs(font: opentype.Font, ch: string, size: number): { segs: PathS
 // 遍历骨架与另外三路共用（layout/walk.ts），但**坐标不走矩阵累积**：这里用
 // `item.pos(null)` 拿到叶子相对页根的绝对位置，所以 visitor 不需要携带任何东西（M = void）。
 // 与那三路一样，叶子的子级不再往下走。
-function shapeVisitor(font: opentype.Font, out: Shape[]): ItemVisitor<void> {
+function shapeVisitor(font: opentype.Font, out: Shape[], stackGap: number): ItemVisitor<void> {
   return {
     descend: () => undefined,
     descendChildren: (item) =>
@@ -185,8 +187,8 @@ function shapeVisitor(font: opentype.Font, out: Shape[]): ItemVisitor<void> {
       // 减时线：排版给的两端是**排版字体**的数字 advance 边缘，可 .pptx 里画出来的
       // 数字是目标字体的宽度（见 TARGET_ADVANCE）。按目标宽度把两端接回数字盒，
       // 否则 "1" 底下那道线短一截、还整体偏左。
-      if (item instanceof BeamLine && item.left?.number && item.right?.number) {
-        const l = numberSpan(item.left.number), r = numberSpan(item.right.number);
+      if (item instanceof BeamLine && item.leftNum && item.rightNum) {
+        const l = numberSpan(item.leftNum), r = numberSpan(item.rightNum);
         x0 = l.cx - l.half;
         x1 = r.cx + r.half;
       }
@@ -200,7 +202,7 @@ function shapeVisitor(font: opentype.Font, out: Shape[]): ItemVisitor<void> {
     path: (item) => {
       const pp = item.pos(null);
       const x = item instanceof JpOctaveDot && item.aug
-        ? augDotX(item.aug.num, item.aug.index)
+        ? augDotX(item.aug.num, item.aug.index, item.radius * item.matrix.scaleY, stackGap)
         : pp.x;
       out.push({
         kind: "geom", x, y: pp.y, w: Math.max(item.width, 0.01), h: Math.max(item.height, 0.01),
@@ -212,7 +214,7 @@ function shapeVisitor(font: opentype.Font, out: Shape[]): ItemVisitor<void> {
     },
     text: (item) => {
       // SMuFL **转曲**：PPT 里不能指望装了 Bravura，字形拆成 custGeom 路径
-      if (item instanceof SmuflText) {
+      if (item instanceof SmuflText || item.classes.has("smufl")) {
         const pp = item.pos(null);
         const size = item.font.size * item.matrix.scaleY;
         const scale = size / font.unitsPerEm;
@@ -283,8 +285,8 @@ function shapeVisitor(font: opentype.Font, out: Shape[]): ItemVisitor<void> {
   };
 }
 
-function collectShapes(item: PageItem, font: opentype.Font, out: Shape[]): void {
-  walkPageItem(item, undefined, shapeVisitor(font, out));
+function collectShapes(item: PageItem, font: opentype.Font, out: Shape[], stackGap: number): void {
+  walkPageItem(item, undefined, shapeVisitor(font, out, stackGap));
 }
 
 // ---------------- OOXML shape builders ----------------
@@ -401,21 +403,23 @@ function buildDeck(slides: string[], wEmu: number, hEmu: number): Zippable {
   return z;
 }
 
-/** buildPptx 只用到页面树与页面尺寸，简谱与文本谱两种排版器都满足。 */
+/** buildPptx 只用到页面树与页面尺寸，与哪个引擎排的无关（`ScorePainter.pptxSource`：旧简谱引擎或简谱引擎那一份）。 */
 export interface PptxSource {
-  layout: { pages: Group[] };
+  pages: readonly Group[];
+  /** 附点离数字的那道空（engrave/stack.ts）；没有就取缺省。 */
+  stackGap?: number;
   pageWidth: number;
   pageHeight: number;
 }
 
-export async function buildPptx(painter: PptxSource, bgColor = 0xffffffff): Promise<Uint8Array> {
+export async function buildPptx(src: PptxSource, bgColor = 0xffffffff): Promise<Uint8Array> {
   const font = await loadBravura();
-  const slides = painter.layout.pages.map((pg) => {
+  const slides = src.pages.map((pg) => {
     const shapes: Shape[] = [];
-    collectShapes(pg, font, shapes);
+    collectShapes(pg, font, shapes, src.stackGap ?? STACK_GAP_DEFAULT);
     return slideXml(shapes, bgColor);
   });
-  const deck = buildDeck(slides, EMU(painter.pageWidth), EMU(painter.pageHeight));
+  const deck = buildDeck(slides, EMU(src.pageWidth), EMU(src.pageHeight));
   return zipSync(deck);
 }
 

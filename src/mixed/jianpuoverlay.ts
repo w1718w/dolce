@@ -9,9 +9,17 @@ import { Fraction } from "../common/fraction";
 import { Matrix33 } from "../common/geom";
 import { GraphicPath, Group, TextFrame } from "../layout/pageitem";
 import { Font } from "../layout/font";
-import { jpDot, jpTimeSigItems } from "../layout/jpglyph";
+import { textItem } from "../engrave/prims";
+import { jpDot } from "../engrave/dot";
+import { TimeSigGlyph } from "../engrave/timesig";
+import { KeyLabel, keyNameOfFifths } from "../engrave/keysig";
+import { sustainDash } from "../engrave/dash";
+import { AccidentalGlyph } from "../engrave/accidental";
+import { beamY, highDotY, lowDotY, stackBottom } from "../engrave/stack";
+import { graceRow, mainRow, melodyNote } from "./jprow";
+import { graceHook } from "../engrave/grace";
+import { augDotCenter } from "../engrave/augdot";
 import {
-  accidentalSym,
   ChordLayout,
   PartMeasureLayout,
   MeasureLayout,
@@ -20,9 +28,8 @@ import {
   PartStaff,
   Sys,
   SysStaff,
-  smuflWidth,
 } from "./model";
-import { addLine, addSmufl, addSmuflScaled, chordGroup, translated } from "./prims";
+import { addLine, chordGroup, translated } from "./prims";
 
 const BLACK = 0xff000000;
 
@@ -60,9 +67,9 @@ export function drawJianpuOverlay(grp: Group, sys: Sys, st: SysStaff, m: Measure
 
   for (const ch of md.chords) {
     for (const n of ch.notes) {
-      const col = chordGroup(ch.src.id); // 带元素 id：播放线、点选按它认（`prims.ts::STAFF_CHORD`）
+      const col = chordGroup(ch.src.id); // 带身份标签：播放线、点选按它认（`prims.ts::chordGroup`）
       const alt = accidentalOf(ch, n, ps.subIndex);
-      if (alt !== null) drawAccidental(eng, col, n, alt);
+      if (alt !== null) drawAccidental(eng, col, md, ch, n, alt);
       drawColumn(eng, col, md, ch, n, ps.subIndex);
       if (col.children.length) grpJp.add(col);
     }
@@ -72,21 +79,20 @@ export function drawJianpuOverlay(grp: Group, sys: Sys, st: SysStaff, m: Measure
 
 /** 这个音在简谱层要印的临时记号：语义层按旋律延续算好的（`Degree.accidental`），不照搬 MusicXML 的 <accidental>。 */
 function accidentalOf(ch: ChordLayout, n: NoteLayout, subStaff: number): number | null {
-  if (ch.rest || n.staff !== subStaff || !n.visible || !n.jpMelody || n.x < 0) return null;
+  // 与 `drawColumn` 同一组条件：不画数字的音（slash、cue）也不印升降号
+  if (ch.rest || ch.slash || ch.cue || n.staff !== subStaff || !n.visible || !n.jpMelody || n.x < 0) return null;
   return n.jpAccidental();
 }
 
-/** 临时记号：数字左侧的小号 SMuFL 字形。 */
-function drawAccidental(eng: MixedOptions, col: Group, n: NoteLayout, alt: number): void {
-  const sc = 0.75;
-  const sym = accidentalSym(alt, true);
-  const w = smuflWidth(eng.meta, sym);
-  const g = new Group();
-  const mtx = new Matrix33();
-  mtx.setAffine([sc, 0, 0, sc, n.x - w * sc - 2, 20]);
-  g.matrix = mtx;
-  addSmufl(g, sym, 0, 0, eng.musicFont.size);
-  col.add(g);
+/** 临时记号：画法与定位走公共那一份（engrave/accidental.ts：csym 字形、贴数字墨迹盒左缘）。
+ *  数字的落点与 `drawColumn` 同一套（倚音缩小并上移，升降号跟着它的数字走）。 */
+function drawAccidental(eng: MixedOptions, col: Group, md: PartMeasureLayout, ch: ChordLayout, n: NoteLayout, alt: number): void {
+  const font = eng.mixFont;
+  const str = String(n.number());
+  const row = ch.grace ? graceRow(eng, md, ch) : mainRow(eng);
+  const digit = { font, text: str, x: n.cx(eng.meta) - font.measureText(str) / 2, y: row.y, scale: row.scale };
+  const kind = alt > 0 ? "sharp" : alt < 0 ? "flat" : "natural";
+  col.add(new AccidentalGlyph(kind, digit, { music: eng.musicFont, color: BLACK, meta: eng.meta, kind: eng.accidentalStyle, scale: eng.accidentalScale }).item);
 }
 
 /** 一个音的数字、八度点、增时线或附点（render.cpp::drawNotesJianPu）。 */
@@ -96,7 +102,6 @@ function drawColumn(eng: MixedOptions, col: Group, md: PartMeasureLayout, ch: Ch
   if (!n.visible) return;
   if (!n.jpMelody) return;
   if (ch.cue) return;
-  const sc = eng.mixStaffHeight / 40;
   const font = eng.mixFont;
   const mif = md.measureInfo;
 
@@ -123,16 +128,13 @@ function drawColumn(eng: MixedOptions, col: Group, md: PartMeasureLayout, ch: Ch
   const nw = font.measureText(str);
   x -= nw / 2;
 
-  // grace：数字缩小并整体上移（render.cpp:856-869）。
-  const graceSc = ch.grace ? eng.jpGraceScale : 1;
-  const graceDy = ch.grace ? -30 : 0;
-  let ypos = font.size;
-  if (ch.grace) ypos *= 0.1;
-
+  // 数字与它那一摞的落点（倚音缩小、整块抬到主音那一摞之上，见 graceRow）
+  const row = ch.grace ? graceRow(eng, md, ch) : mainRow(eng);
+  const ypos = row.y;
   if (ch.grace) {
     const g = new Group();
     const mtx = new Matrix33();
-    mtx.setAffine([graceSc, 0, 0, graceSc, x, ypos]);
+    mtx.setAffine([row.scale, 0, 0, row.scale, x, ypos]);
     g.matrix = mtx;
     g.add(textAt(str, font, 0, 0));
     col.add(g);
@@ -140,38 +142,15 @@ function drawColumn(eng: MixedOptions, col: Group, md: PartMeasureLayout, ch: Ch
     col.add(textAt(str, font, x, ypos));
   }
 
-  // octave dots
+  // 八度点：**实心矢量圆**，落点走公共那一份（engrave/stack.ts：墨迹到墨迹等距，低音点挂在减时线之下），
+  // 横向对准数字的墨迹中心
   const oct = n.octaveJp();
   if (oct !== 0) {
-    // **位置一律照 render.cpp:875-903**：高音点 `5-2`；低音点从谱高起算、每多一层减时线加
-    // 一个 `beamDistJP`（注意原实现这里**不乘** sc），再 −2；逐点步距 `octaveDotDist*sc`。
-    // 早先改成「按减时线墨迹底往下均分」的自算口径，与成品差一档，红蓝对照里整排点都错开。
-    let octY: number;
-    if (oct > 0) {
-      octY = eng.jpOctaveUpY - eng.jpTopDy;
-    } else {
-      octY = eng.mixStaffHeight + eng.beamDistJP * ch.jpBeamCount() + eng.jpOctaveDownDy;
-    }
-    const step = eng.octaveDotDist * sc;
-    // 八度点是**实心矢量圆**，不是字体里的 `.` 字形（三条简谱路统一，见 jpglyph.ts）。
-    // 圆按中心定位，而原实现给的是 `.` 的**笔位**（基线），所以要把圆心挪到该字形的墨心上。
-    const db = font.charBound(".");
-    const r = (db.bottom - db.top) / 2;
-    const inkDx = (db.left + db.right) / 2 - font.measureText(".") / 2;
-    const inkDy = (db.top + db.bottom) / 2;
+    const db = font.charBound(str);
+    const cx0 = x + ((db.left + db.right) / 2) * row.scale;
     for (let i = 0; i < Math.abs(oct); i++) {
-      const cx0 = x + nw / 2 + inkDx;
-      const cy0 = octY + i * step * graceSc + graceDy + inkDy;
-      if (ch.grace) {
-        const g = new Group();
-        const mtx = new Matrix33();
-        mtx.setAffine([graceSc, 0, 0, graceSc, cx0, cy0]);
-        g.matrix = mtx;
-        g.add(jpDot(0, 0, r, BLACK));
-        col.add(g);
-      } else {
-        col.add(jpDot(cx0, cy0, r, BLACK));
-      }
+      const cy0 = oct > 0 ? highDotY(row.inkTop, i, row.st) : lowDotY(row.inkBottom, ch.jpBeamCount(), i, row.st);
+      col.add(jpDot(cx0, cy0, row.st.dotRadius, BLACK));
     }
   }
 
@@ -183,37 +162,27 @@ function drawColumn(eng: MixedOptions, col: Group, md: PartMeasureLayout, ch: Ch
     let cnt = ch.dur.toInt();
     if (measureRest) cnt = mif.dur.numerator;
     const dx = cnt > 0 ? (endPos - x) / cnt : 0;
-    for (let c = 1; c < cnt; c++) col.add(textAt(ch.rest ? "0" : "-", font, x + dx * c, ypos));
+    // 增时线走公共那一份（engrave/dash.ts）：墨心对准该拍「数字」的墨心、纵向落在数字墨迹中线上
+    const dig = font.charBound(str);
+    const midY = ypos + (dig.top + dig.bottom) / 2;
+    for (let c = 1; c < cnt; c++) {
+      if (ch.rest) col.add(textAt("0", font, x + dx * c, ypos));
+      else col.add(sustainDash(x + dx * c + nw / 2, midY, { font, color: BLACK }));
+    }
   } else {
-    // 附点：**实心矢量圆**（与八度点、谱面那一路统一，见 jpglyph.ts / layout.ts::addAugDots），
-    // 位置照 render.cpp:938-947——笔位 `x + (数字 advance/2 + 10) * 0.75`、基线 `字号 * 0.75`；
-    // 圆心再挪到 `.` 字形的墨心上（原实现画的是字形，我们画圆）。多个附点按原实现叠在同一处，
-    // 这里按 advance 顺排（成品无双附点，不影响）。
-    const db = font.charBound(".");
-    const r = (db.bottom - db.top) / 2;
-    const inkDx = (db.left + db.right) / 2;
-    const inkDy = (db.top + db.bottom) / 2;
-    const adv = font.measureText(".");
-    const px = x + (nw / 2 + eng.jpDotDx) * 0.75;
+    // 附点：**实心矢量圆**，落点走公共那一份（engrave/augdot.ts：与数字墨迹中心等高，离数字墨迹右缘一道空）
+    const digitInk = font.charBound(str).offset(x, ypos);
     for (let d = 0; d < ch.dot; d++) {
-      col.add(jpDot(px + d * adv + inkDx, font.size * 0.75 + eng.jpDotDy + inkDy, r, BLACK));
+      const p = augDotCenter(digitInk, d, row.st.dotRadius, row.st.gap);
+      col.add(jpDot(p.cx, p.cy, row.st.dotRadius, BLACK));
     }
   }
 }
 
-function textAt(text: string, font: Font, x: number, y: number): TextFrame {
-  const t = new TextFrame();
-  t.text = text;
-  t.font = font;
-  t.color = BLACK;
-  t.x = x;
-  t.y = y;
-  return t;
-}
+const textAt = (text: string, font: Font, x: number, y: number): TextFrame => textItem(text, font, BLACK, x, y);
 
 /** 减时线（render.cpp::BeamLevelData::drawJianPu）：跨音的，各柱画完再画。 */
 function drawJpBeams(eng: MixedOptions, container: Group, md: PartMeasureLayout): void {
-  const sc = eng.mixStaffHeight / 40;
   const font = eng.mixFont;
   const meta = eng.meta;
 
@@ -249,40 +218,43 @@ function drawJpBeams(eng: MixedOptions, container: Group, md: PartMeasureLayout)
         const graceSc = grace ? eng.jpGraceScale : 1;
         const numL = ntL.number();
         const numR = ntR.number();
-        // 端点 = 数字中心 ±数字宽/2（grace 整体按 jpGraceScale 缩放，render.cpp:146-160）。
-        const lx = ntL.x + (first.noteheadWidth(meta) / 2 - font.measureText(numL) / 2) * graceSc;
-        const rx = ntR.x + (last.noteheadWidth(meta) / 2 + font.measureText(numR) / 2) * graceSc;
-        // 纵向照 render.cpp:159：`level*beamDistJP*sc + 35 − (40 − mixStaffHeight)*0.8`。
-        // 早先按「数字墨迹底 + font.size/9」自算，谱高 30 时比成品高 1.5 tenths。
-        let y = lev * eng.beamDistJP * sc + eng.jpBeamTopY - (40 - eng.mixStaffHeight) * 0.8;
+        // 端点 = 数字的笔位左缘到右缘（与 drawColumn 画数字同一个笔位：拍位中心 − 数字宽/2，倚音从那儿起整体缩放）
+        const lx = ntL.x + first.noteheadWidth(meta) / 2 - font.measureText(numL) / 2;
+        const rx = ntR.x + last.noteheadWidth(meta) / 2 - font.measureText(numR) / 2 + font.measureText(numR) * graceSc;
+        // 纵向走公共那一份（engrave/stack.ts：数字墨迹底 →空→ 第 1 层 →空→ 第 2 层…）
+        const row = grace ? graceRow(eng, md, first) : mainRow(eng);
+        const y = beamY(row.inkBottom, lev + 1, row.st);
 
-        if (grace) {
-          // grace 减时线上移并加尾钩（render.cpp:165-186）。
-          y -= 29;
-          const cx = (rx + lx) / 2;
-          const hook = new GraphicPath();
-          hook.fill = false;
-          hook.stroke = true;
-          hook.strokeColor = BLACK;
-          hook.strokeWidth = 1;
-          hook.moveTo(cx, y);
-          hook.lineTo(cx, y + 5);
-          hook.cubicTo(cx, y + 10, cx, y + 10, cx + 10, y + 10);
-          hook.lineTo(cx + 10, y + 10);
-          const oct = ntL.octaveJp();
-          if (oct < 0 && ntL === ntR) {
-            const g = translated(0, 10);
-            g.add(hook);
-            container.add(g);
-          } else {
-            container.add(hook);
-          }
-        }
-
-        addLine(container, lx, y, rx, y, eng.lineWidths.jpBeam);
+        addLine(container, lx, y, rx, y, row.st.beamWidth);
       }
     }
+    if (grp.chords[0]!.grace) drawGraceHook(eng, container, md, grp.chords);
   }
+}
+
+/** 倚音的尾钩：一串只画一个，挂在离主音最近的那个倚音下面（前倚音是最后一个、后倚音是第一个），
+ *  弯向主音——形状与简谱引擎同一笔（engrave/grace.ts::graceHook）。有低音点就从最低那个点下面再让一道空起笔，
+ *  否则从最下一条减时线垂下来。 */
+function drawGraceHook(eng: MixedOptions, container: Group, md: PartMeasureLayout, chords: ChordLayout[]): void {
+  const after = chords[0]!.src.grace?.after === true;
+  const ch = after ? chords[0]! : chords[chords.length - 1]!;
+  const nt = melodyNote(ch);
+  const font = eng.mixFont;
+  const num = nt.number();
+  const mid = nt.x + ch.noteheadWidth(eng.meta) / 2 - font.measureText(num) / 2 + (font.measureText(num) * eng.jpGraceScale) / 2;
+  const row = graceRow(eng, md, ch);
+  const beams = ch.jpBeamCount();
+  const low = Math.max(0, -nt.octaveJp());
+  const from = low > 0 ? stackBottom(row.inkBottom, beams, low, row.st) + row.st.gap : beamY(row.inkBottom, beams, row.st);
+  const h = graceHook(mid, from, row.inkBottom - row.inkTop, after ? -1 : 1);
+  const hook = new GraphicPath();
+  hook.fill = false;
+  hook.stroke = true;
+  hook.strokeColor = BLACK;
+  hook.strokeWidth = row.st.beamWidth;
+  hook.moveTo(h.m[0], h.m[1]);
+  hook.cubicTo(...h.c);
+  container.add(hook);
 }
 
 /** Draw time signature for jp/mixed staff（render.cpp::drawTime Mixed branch）。 */
@@ -330,13 +302,13 @@ function drawJpTimeSignature(
     return;
   }
 
-  // 拍号走公共那一份（jpglyph.ts::jpTimeSigItems）：两个数字**横向居中**于分数线，
+  // 拍号走公共那一份（engrave/timesig.ts::TimeSigGlyph）：两个数字**横向居中**于分数线，
   // 一切长度按**小节线高度**的比例。原先这里两个数字都贴 x=0 左对齐、纵向按 musicpp
   // 的 staff space 常量（`sc*(20−dy)` / `sc*(40+dy)`）给，与谱面、文本谱三处口径各不相同。
   //
   // 基准高度取这条谱表的高（简谱层的小节线就是这么高），基线取谱表底——
-  // jpTimeSigItems 里的 y 都是相对基线的，谱表顶 y=0 故基线在 staffHeight。
-  const r = jpTimeSigItems(time.beats, time.beatType, {
+  // TimeSigGlyph 里的 y 都是相对基线的，谱表顶 y=0 故基线在 staffHeight。
+  const r = new TimeSigGlyph(time.beats, time.beatType, {
     height: staffHeight,
     centerY: staffHeight / 2 - staffHeight,
     ruleWidth: 1.5,
@@ -346,7 +318,7 @@ function drawJpTimeSignature(
     // 即 0.75 H（谱面那一路是 0.5625 H）。居中与「长度按 H 的比例」照统一那份走，
     // 只有字号与下面三档间距各留各的。
     digitRatio: 0.75,
-    // 竖向不必给：`jpTimeSigItems` 按「减时线与音符」那一格排（TIME_SIG_GAP_EM ×
+    // 竖向不必给：`TimeSigGlyph` 按「减时线与音符」那一格排（TIME_SIG_GAP_EM ×
     // 拍值字号，墨迹到墨迹），字号一改自己跟着走。
     //
     // 分数线长度得给：默认那个 0.28125 H 是按谱面档的数字（0.5625 H）反算的，
@@ -371,20 +343,6 @@ function drawJpKey(
   st: SysStaff,
 ): void {
   const key = ps.getKey(mif.offset);
-  const cur = key.fifths;
-  const names = "CGDAEBFC";
-
-  let name = mif.index !== 0 ? "转" : "";
-  name += "1=";
-  let keyName: string;
-  let acc = 0;
-  if (cur >= 0) {
-    keyName = names[cur] ?? "C";
-    if (cur >= 6) acc = 1;
-  } else {
-    keyName = names[7 + cur] ?? "C";
-    if (cur < -1) acc = -1;
-  }
 
   let x = (mif.keyPos ?? 0) - mif.sibKeyOffset;
   if (mif.keyOffestJP !== null) x += mif.keyOffestJP;
@@ -401,49 +359,19 @@ function drawJpKey(
 
   // 混排谱表上的简谱以 mixFont（按 mixStaffHeight 缩小）排号，转调记号同步用 mixFont，
   // 否则 jianpuFont(30) 比谱面数字(22.5)明显偏大。render.cpp drawKey 用 jianpuFont 是因其
-  // 混排谱高为 40；此处随谱高等比缩放，r 即 mixStaffHeight/40。
+  // 混排谱高为 40；此处随谱高等比缩放。
+  // 画法走公共那一份（engrave/keysig.ts）：升降号是 csym 字形（render.cpp::drawKey 的
+  // accidentalSym(acc, true)），写在音名之前并抬高。
   const jpFont = eng.jpKeyJianpuFont ? eng.jianpuFont : eng.mixFont;
-  const r = jpFont.size / eng.jianpuFont.size;
-  if (acc !== 0) {
-    const grp = new Group();
-    const str1 = new TextFrame();
-    str1.text = name;
-    str1.font = jpFont;
-    str1.color = 0xff000000;
-    grp.add(str1);
-    let w = jpFont.measureText(name) + 7 * r;
-
-    // render.cpp::drawKey 走 accidentalSym(acc, true)：这是 Bravura Text/和弦用的
-    // csym 字形，不是五线谱上的普通 accidentalFlat/Sharp。两者同字号的墨迹差约 1/5；
-    // 《求主藉异象激动我》的 `1=♭B` 因此曾比 musicpp 成品明显小一号、也低一截。
-    const accSym = accidentalSym(acc, true);
-    const sc = jpFont.size / 40;
-    addSmuflScaled(grp, accSym, w, -10 * r, eng.musicFont.size, sc, sc);
-    w += 12 * r;
-
-    const str2 = new TextFrame();
-    str2.text = keyName;
-    str2.font = jpFont;
-    str2.color = 0xff000000;
-    str2.x = w;
-    grp.add(str2);
-    w += jpFont.measureText(keyName);
-
-    if (center) x -= w / 2;
-    const m = new Matrix33();
-    m.setAffine([1, 0, 0, 1, x, y]);
-    grp.matrix = m;
-    container.add(grp);
-  } else {
-    name += keyName;
-    const ff = new Font(eng.wordFont, jpFont.size * 0.75);
-    const t = new TextFrame();
-    t.text = name;
-    t.font = ff;
-    t.color = 0xff000000;
-    if (center) x -= ff.measureText(name) / 2;
-    t.x = x;
-    t.y = y;
-    container.add(t);
-  }
+  const k = new KeyLabel("1", keyNameOfFifths(key.fifths), {
+    font: jpFont,
+    music: eng.musicFont,
+    color: 0xff000000,
+    prefix: mif.index !== 0 ? "转" : "",
+    side: eng.accidentalSide,
+  });
+  if (center) x -= k.width / 2;
+  const grp = translated(x, y);
+  for (const it of k.items) grp.add(it);
+  container.add(grp);
 }

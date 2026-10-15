@@ -1,58 +1,35 @@
-// 唯一的排版器 `ScorePainter`：按请求排版（简谱原样 / 展开、原样文档、五线谱 / 混排），持有提交后的结果、
-// 页面渲染（DOM 映射）、点选与播放高亮索引。排页算法在各自模块（`jianpupages.ts`、`original/compose.ts`、
+// 唯一的排版器 `ScorePainter`：按请求排版（简谱原样 / 展开、五线谱 / 混排），持有提交后的结果、
+// 页面渲染（DOM 映射）、点选与播放高亮索引。排页算法在各自模块（`original/compose/`、
 // `mixed/staffpages.ts`），SVG 出口在 `render.ts`，这里只管请求版本、结果提交与交互状态。
 // 设计与迁移记录见 docs/实现/PuPainter退役.md。
 //
 // 点选 / 高亮部分移植自 mp/layout/draw.kt。
 
-import { Rect } from "../common/geom";
-import { Group, Lyric, PageItem, Tie, findByClass } from "./pageitem";
-import { Barline, NoteEntry } from "./entry";
-import { Layout } from "./layout";
-import { emptyScore, type JScore } from "./input";
+import type { PlayItem } from "../score/playorder";
+import { Group, PageItem, TextFrame } from "./pageitem";
 import type { ElementId, ScoreDoc } from "../model/doc";
 import { headerPartsOf, mixedVisitor, renderPageSvg, type HeaderPart } from "./render";
-import { layoutExpandedPages, layoutOriginalPages } from "./jianpupages";
-import { fromPt, pageGeometry, type LayoutHit, type LayoutPage, type LayoutResult, type PaintTarget } from "./result";
+import { pageGeometry, type LayoutResult } from "./result";
 import { MetaData } from "../smufl/smufl";
-import { applyJianpuStyle, jianpuFontSize } from "../style/jianpu";
+import { jianpuStyleOf } from "../style/jianpu";
 import type { StyleSheet } from "../style/sheet";
 import { applyStaffStyle } from "../style/staff";
-import { computeStyleForPaper, THEMES } from "../style/themes";
+import { computeStyleForPaper, LONG_IMAGE_WIDTH, THEMES } from "../style/themes";
+import { pageMargins, resolvePaper } from "../style/paper";
+import type { Region } from "../style/ss";
 import { MixedOptions, type StaffLayout, type Sys } from "../mixed/model";
 import { layoutStaff } from "../mixed/layout";
 import { layoutStaffPages, PAGE_HEIGHT_FALLBACK } from "../mixed/staffpages";
-import { isStaffLeaf, STAFF_CHORD, STAFF_SYSTEM, staffLeafKey, type StaffChordData, type StaffLeafData, type StaffSystemData } from "../mixed/prims";
-import { layoutOriginalDocument, type OriginalDocumentLayout } from "./original/compose";
-import type { PlacedPage } from "./original/place";
-import type { JianpuGrid } from "./original/metrics";
-import { jianpuUserOptionsOf } from "../style/original";
+import type { StaffSystemData } from "../mixed/prims";
+import { layoutJianpu, type JianpuLayout } from "./jianpu/compose";
+import { clearSongBreaks } from "../model/breaks";
+import type { PlacedPage } from "./jianpu/place";
+import type { JianpuGrid } from "./jianpu/metrics";
+import { ScoreIndex, type Hit } from "./scoreindex";
+import { Playhead, spanIn, svgBox } from "./playhead";
+import type { IdentityKind } from "./identity";
 
 // ---------------------------------------------------------------- 请求与资源
-
-/** 简谱引擎的排版设置（原样 / 展开 / 成书 / 帮助示例 / 量宽共用）。 */
-export interface JianpuConfig {
-  /** 已计算样式表，按它灌 `LayoutOptions`（`style/jianpu.ts::applyJianpuStyle`）；null = 引擎缺省（帮助示例）。 */
-  readonly style: StyleSheet | null;
-  /** `style` 为 null 时的字号。 */
-  readonly fontSize?: number;
-  /** 覆盖墨色（帮助示例画在压暗的纸上）。 */
-  readonly ink?: number;
-  /** 覆盖多段歌词叠排行距（自然量宽要 > 0：不展开反复，一遍就够量）。 */
-  readonly lyricStack?: number;
-}
-
-/** 简谱引擎这一路的请求。原样 / 展开的输入由调用方投影好（文档级原样投影见退役计划 P3）。 */
-export interface JianpuPaintRequest extends JianpuConfig {
-  readonly view: "original" | "expanded";
-  readonly score: JScore;
-  /** `.jpwabc` 的 `.Layout` 分页描述（其他格式没有）。 */
-  readonly breakDesc: string | null;
-  /** 原样档的纸（排版单位 = pt）。展开档取 `style.page`。 */
-  readonly page?: { w: number; h: number };
-  /** 只排版面、不加标题页也不叠标题块（帮助示例的谱行片段）。 */
-  readonly snippet?: boolean;
-}
 
 /** 五线谱 / 混排的请求（`doc` 须是 MusicXML 形状，见 `mixed/layout.ts`）。 */
 export interface StaffPaintRequest {
@@ -67,17 +44,28 @@ export interface StaffPaintRequest {
   readonly jianpuPart?: number;
 }
 
-/** 原样文档这一路（文本谱与多声部 123/ABC、MusicXML 的原样档）：整份 `ScoreDoc` 按源行排，印刷原版观感。 */
-export interface DocumentPaintRequest {
-  readonly view: "original";
+/** 原样文档这一路（文本谱与多声部 123/ABC、MusicXML 的原样档）：整份 `ScoreDoc` 按源行排，印刷原版观感。
+ *  `expanded`：展开档（反复逐遍展开、一遍一页、投影片纸），开发开关下才发（子计划 5）。 */
+export interface JianpuPaintRequest {
+  readonly view: "original" | "expanded";
   readonly doc: ScoreDoc;
-  /** computed 样式表（`engine: "original"` 那份）：面板字号、纸 / 长图、前景色。null = 版式原样。 */
+  /** computed 样式表（原样档那份，与旧简谱引擎同一份）。null = print 主题出厂。 */
   readonly style: StyleSheet | null;
+  /** 照文档里的换行排，不按窄纸重新断行（断点已由调用方写进文档时用）。 */
+  readonly noReflow?: boolean;
+  /** 展开档：`.jpwabc` 的 `.Layout` 分页描述（其他格式没有） */
+  readonly breakDesc?: string | null;
+  /** 原样档的纸（pt），不给按样式表的纸。`snippet` 时只取宽、高随内容 */
+  readonly page?: { w: number; h: number };
+  /** 只排谱行、不放页眉页脚（帮助页的谱例片段） */
+  readonly snippet?: boolean;
+  /** 覆盖墨色（帮助页的谱例画在压暗的纸上） */
+  readonly ink?: number;
 }
 
-export type PaintRequest = JianpuPaintRequest | DocumentPaintRequest | StaffPaintRequest;
+export type PaintRequest = JianpuPaintRequest | StaffPaintRequest;
 /** 同步入口收的请求（排版不等资源的两路）。 */
-export type SyncPaintRequest = JianpuPaintRequest | DocumentPaintRequest;
+export type SyncPaintRequest = JianpuPaintRequest;
 export type LoadOutcome = "committed" | "superseded";
 
 export interface PreparedResources {
@@ -120,26 +108,28 @@ export class PaintResources {
   }
 }
 
-/** 按设置新造一份简谱引擎（选项是单向覆写的，每次排版都要一份干净的）。 */
-export function jianpuLayoutOf(cfg: JianpuConfig, res: PreparedResources): Layout {
-  const layout = new Layout(cfg.style ? jianpuFontSize(cfg.style) : cfg.fontSize ?? 28);
-  const opt = layout.options;
-  if (res.smuflMeta) opt.smuflMeta = res.smuflMeta;
-  if (cfg.style) applyJianpuStyle(opt, cfg.style);
-  if (cfg.ink !== undefined) opt.color = cfg.ink;
-  if (cfg.lyricStack !== undefined) opt.lyricStack = cfg.lyricStack;
-  return layout;
-}
-
-/** 自然量宽：整首排成一条（分行之前）量每个和弦的横向区间，不分页、不产 DOM。
- *  直接复用 `Layout.measureNatural`，`spans` 的键就是输入的 `JChord`。 */
-export function measureJianpu(
-  score: JScore,
-  width: number,
-  cfg: JianpuConfig,
-  res: PreparedResources,
-): ReturnType<Layout["measureNatural"]> {
-  return jianpuLayoutOf(cfg, res).measureNatural(score, width);
+/** 自然量宽（简谱引擎，乐句重排用）：清掉换行、整首不折，量第 `song` 首旋律声部每个音（键为元素 id）的自然横向区间与版心宽。
+ *  `slide`：按展开档的画法量（数字共基线、增时线「-」字）。不改 `doc`。 */
+export function measureDocument(
+  doc: ScoreDoc, sheet: StyleSheet, width: number, slide = false, song = 0,
+): { width: number; spans: Map<string | number, { x0: number; x1: number }> } {
+  const one = doc.songs[song];
+  if (!one) return { width: 0, spans: new Map() };
+  // 只量断句的那条旋律：带歌词的声部（同断句输入的 `forExpanded`），没有就第一个。
+  // 文本谱不清换行（歌词挂在每行源头，并成一行就丢了），逐行接着量（`naturalSpans`）
+  const lead = one.parts.find((p) => p.measures.some((m) => m.elements.some((e) => e.kind === "chord" && (e.lyrics?.length ?? 0) > 0))) ?? one.parts[0];
+  if (!lead) return { width: 0, spans: new Map() };
+  const clone = structuredClone({ ...doc, songs: [{ ...one, parts: [lead] }] });
+  if (doc.sourceFormat !== "pu") for (const song of clone.songs) clearSongBreaks(song);
+  const r = layoutJianpu(clone, {
+    style: jianpuStyleOf(sheet),
+    page: { width, height: width, continuous: true },
+    userMargins: pageMargins(sheet.page) !== undefined,
+    foot: null,
+    measure: true,
+    ...(slide ? { book: true } : {}),
+  });
+  return r.spans ?? { width: 0, spans: new Map() };
 }
 
 // ---------------------------------------------------------------- 排版器
@@ -152,9 +142,8 @@ interface StaffState {
 }
 
 const isStaffRequest = (r: PaintRequest): r is StaffPaintRequest => r.view === "staff" || r.view === "mixed";
-const isDocumentRequest = (r: PaintRequest): r is DocumentPaintRequest => r.view === "original" && "doc" in r;
 
-/** 可视化编辑选中挂在音符上的子项的角色（两路页面树的类名不同，映射见 `partClass`）。 */
+/** 可视化编辑选中挂在音符上的子项的角色（就是身份标签的 kind，见 `identity.ts`）。 */
 export type VisualPartRole = "aug-dot" | "harmony" | "deco" | "annotation";
 
 const defaultStaffStyle = (): StyleSheet => computeStyleForPaper([THEMES.staff], { engine: "staff" });
@@ -167,10 +156,6 @@ export function staffOptionsOf(meta: MetaData, style?: StyleSheet): MixedOptions
 }
 
 export class ScorePainter {
-  /** 最近一次提交的简谱引擎（成书、PPTX、脚本读它的页面树与选项）。五线谱结果提交时保留不动。 */
-  layout: Layout = new Layout(28);
-  /** 最近一次提交的简谱引擎输入（标题、导出 PPTX 用）。五线谱结果提交时保留不动。 */
-  score: JScore = emptyScore();
   /** 最近一次提交的简谱档；还没排过简谱为 null。 */
   jianpuView: "original" | "expanded" | null = null;
   pageWidth = 0;
@@ -179,39 +164,33 @@ export class ScorePainter {
   result: LayoutResult | null = null;
   /** PageItem -> rendered <g>, populated each renderPage (for DOM picking). */
   nodeMap = new WeakMap<PageItem, SVGGElement>();
-  /** 元素 id → 它的音符格（每遍/每段各一个），试听高亮与起播点用。 */
-  private chordItem = new Map<ElementId, { page: number; item: PageItem; verse: number }[]>();
-  /** `${相邻音符 id}:${before|after}` → 那条小节线的图元（小节线没有自己的 id，见 `Barline.ownerEdge`）。 */
-  private barlineItem = new Map<string, { page: number; item: PageItem }>();
-  /** `${起点 id}:${终点 id}` → 那条圆滑线/延音线的图元（弧也没有自己的 id，见 `Tie.startId`）。 */
-  private slurItem = new Map<string, { page: number; item: PageItem }>();
-  /** 五线谱 / 混排：元素 id → 画它的和弦组（五线谱层在前、简谱叠层在后）与所在系统组。见 `mixed/prims.ts::STAFF_CHORD`。 */
-  private staffChords = new Map<ElementId, { page: number; item: PageItem; system: PageItem | null }[]>();
+  /** 身份索引（按图元上的身份标签收，见 `scoreindex.ts`）：试听高亮、点选、可视化编辑查它。简谱、五线谱 / 混排同一份。 */
+  private index: ScoreIndex = ScoreIndex.empty();
   /** 试听的竖直播放线（各视图同一种，当前在哪页的 svg 里就挂在哪页）。 */
-  private playhead: SVGRectElement | null = null;
-  /** 原样文档：音符格 → 所在谱组，谱组 → 它的音符与歌词格及量好的竖向范围（`originalSpan` 现建，换了排版结果就作废）。 */
-  private originalSystems: {
-    layout: OriginalDocumentLayout;
-    of: Map<PageItem, PageItem>;
-    members: Map<PageItem, PageItem[]>;
-    spans: Map<PageItem, { y0: number; y1: number }>;
-  } | null = null;
-  /** 五线谱 / 混排：渲染出来的和弦组 `<g>` → 元素 id（点选按事件冒泡认）。 */
-  private staffElId = new WeakMap<Element, ElementId>();
-  /** 五线谱 / 混排：带身份的叶子（歌词字、弧、小节线，见 `mixed/prims.ts::StaffLeafData`），按 `staffLeafKey` 收。 */
-  private staffLeaves = new Map<string, { page: number; item: PageItem }[]>();
-  /** 叶子画出的 SVG 元素（`mixedVisitor` 的 `leafMap`）。 */
+  private playhead = new Playhead();
+  /** 五线谱 / 混排的叶子（歌词字、小节线、页眉字）画出的 SVG 元素（`mixedVisitor` 的 `leafMap`；简谱每个图元都有 `<g>`，在 `nodeMap`）。 */
   private leafMap = new WeakMap<PageItem, SVGGraphicsElement>();
-  /** 画出来的叶子元素 → 它的身份（点选按事件目标认）。 */
-  private staffLeafOf = new WeakMap<Element, StaffLeafData>();
-  /** 逐页高度。空 = 各页同高（`pageHeight`）；连续长纸那一档按内容逐页给。 */
-  private pageHeights: number[] = [];
+  /** 渲染出来的带身份元素 → 图元（点选按事件目标往上认）。 */
+  private itemOfEl = new WeakMap<Element, PageItem>();
   private staff: StaffState | null = null;
-  /** 原样文档这一路提交的结果（页面、定位结构与 note / syllable 身份索引）。与 staff 互斥。 */
-  private original: OriginalDocumentLayout | null = null;
+  /** 简谱这一路提交的结果（页面、定位结构与 note / syllable 身份索引）。与 staff 互斥。 */
+  private original: JianpuLayout | null = null;
   private version = 0;
 
   constructor(readonly resources: PaintResources = PaintResources.shared()) {}
+
+  /** 简谱展开档：各首实际走的演唱顺序（`page-check` 的 P5 按它数遍数）；别的结果为 null */
+  get expandPlans(): ReadonlyArray<readonly PlayItem[] | null> | null {
+    return this.original?.plans ?? null;
+  }
+
+  /** 导出 PPTX 用的页面（`editor/pptx.ts::buildPptx`）：简谱排的那一份；还没排过简谱时为空。 */
+  get pptxSource(): { pages: readonly Group[]; stackGap: number; pageWidth: number; pageHeight: number } {
+    return {
+      pages: this.original?.pages ?? [], stackGap: this.original?.metrics.style.vertical.stackGap ?? 0,
+      pageWidth: this.pageWidth, pageHeight: this.pageHeight,
+    };
+  }
 
   /** 当前结果是哪一路画的。 */
   get renderer(): "jianpu" | "staff" | null {
@@ -231,7 +210,7 @@ export class ScorePainter {
         if (v !== this.version) return "superseded";
         commit = this._staffCommit(request, meta);
       } else {
-        commit = this._syncCommit(request, res);
+        commit = this._jianpuCommit(request);
       }
     } catch (e) {
       if (v !== this.version) return "superseded";
@@ -244,80 +223,38 @@ export class ScorePainter {
 
   /** 资源已就绪时同步排版并提交（编辑器预览的简谱路与原样文档、成书、帮助、量断行）。也作废在途的异步请求。 */
   loadSync(request: SyncPaintRequest): void {
-    const res = this.resources.ready();
-    if (!res) throw new Error("排版资源还没准备好");
+    if (!this.resources.ready()) throw new Error("排版资源还没准备好");
     ++this.version;
-    this._syncCommit(request, res)();
-  }
-
-  private _syncCommit(request: SyncPaintRequest, res: PreparedResources): () => void {
-    return isDocumentRequest(request) ? this._documentCommit(request) : this._jianpuCommit(request, res);
+    this._jianpuCommit(request)();
   }
 
   /** 让未完成的请求作废，放掉持有的 DOM 引用。 */
   dispose(): void {
     ++this.version;
     this.nodeMap = new WeakMap();
-    this.chordItem.clear();
+    this.index = ScoreIndex.empty();
     this.original = null;
   }
 
-  /** 简谱引擎这一路：在局部变量里排完，返回提交动作。 */
-  private _jianpuCommit(req: JianpuPaintRequest, res: PreparedResources): () => void {
-    const layout = jianpuLayoutOf(req, res);
-    let w: number;
-    let h: number;
-    let pageHeights: number[] = [];
-    if (req.view === "expanded") {
-      w = req.style?.page.size?.[0] ?? 960;
-      h = req.style?.page.size?.[1] ?? 540;
-      layoutExpandedPages(layout, req.score, w, h, req.breakDesc);
-    } else {
-      w = req.page?.w ?? 0;
-      h = req.page?.h ?? 0;
-      if (req.snippet) {
-        layout.fromScore(req.score, req.breakDesc, w, h);
-        layout.pages[0]?.update();
-      } else {
-        pageHeights = layoutOriginalPages(layout, req.score, w, h, req.breakDesc);
-      }
-    }
-    const pages: LayoutPage[] = layout.pages.map((root, i) => ({
-      root,
-      geometry: pageGeometry(w, pageHeights[i] ?? h, 1),
-      renderer: "jianpu",
-      songIndexes: [0],
-    }));
-    const result: LayoutResult = {
-      title: req.score.title,
-      pages,
-      hits: [],
-      diagnostics: [],
-      staffPlacements: [],
-      jianpuLineStarts: [...layout.lineStarts],
-    };
-    return () => {
-      this.layout = layout;
-      this.score = req.score;
-      this.jianpuView = req.view;
-      this.pageWidth = w;
-      this.pageHeight = h;
-      this.pageHeights = pageHeights;
-      this.staff = null;
-      this.original = null;
-      this.result = result;
-      this.nodeMap = new WeakMap();
-      this.playhead = null;
-      this.buildChordIndex();
-    };
-  }
-
-  /** 原样文档这一路：整份文档排好（不等资源，`Font` 同步量字），返回提交动作。
-   *  简谱引擎的 `layout` / `score` 保留不动（标题等取用）；`jianpuView` 记成原样档，PPTX 因此不会拿旧引擎页复用。 */
-  private _documentCommit(req: DocumentPaintRequest): () => void {
-    const r = layoutOriginalDocument(req.doc, {
-      user: req.style ? jianpuUserOptionsOf(req.style) : null,
-      ink: req.style?.page.ink ?? null,
+  /** 简谱这一路（原样 / 展开档）：整份文档排好（不等资源，`Font` 同步量字），返回提交动作。 */
+  private _jianpuCommit(req: JianpuPaintRequest): () => void {
+    const sheet = req.style ?? computeStyleForPaper([THEMES.print], { mode: "original", engine: "jianpu" });
+    const paper = resolvePaper(sheet.page);
+    // 展开档：投影片纸（展开档样式的 `page.size`）
+    const slide = req.view === "expanded" ? { width: sheet.page.size?.[0] ?? 960, height: sheet.page.size?.[1] ?? 540, continuous: false } : null;
+    const r = layoutJianpu(req.doc, {
+      style: jianpuStyleOf(sheet),
+      // 长图：宽与旧简谱引擎的长图同一张（500 首那张纸的宽），高由内容定
+      page: slide ?? (req.page
+        ? { width: req.page.w, height: req.snippet ? req.page.w : req.page.h, continuous: !!req.snippet }
+        : paper ? { width: paper.w, height: paper.h, continuous: false } : { width: LONG_IMAGE_WIDTH, height: LONG_IMAGE_WIDTH, continuous: true }),
+      userMargins: pageMargins(sheet.page) !== undefined,
+      foot: (sheet.template?.regions?.["song-foot"] as Region | undefined) ?? null,
+      noReflow: req.noReflow,
+      expanded: req.view === "expanded",
+      breakDesc: req.breakDesc ?? null,
+      ...(req.snippet ? { snippet: true } : {}),
+      ...(req.ink !== undefined ? { ink: req.ink } : {}),
     });
     const result: LayoutResult = {
       title: r.view.songs[0]?.metadata.titles[0] ?? "",
@@ -327,22 +264,21 @@ export class ScorePainter {
         renderer: "jianpu",
         songIndexes: [r.placed.pages[i]?.song ?? 0],
       })),
-      hits: [],
       diagnostics: [],
       staffPlacements: [],
-      jianpuLineStarts: null,
+      jianpuLineStarts: r.lineStarts,
     };
     return () => {
       this.original = r;
       this.staff = null;
-      this.jianpuView = "original";
+      this.jianpuView = req.view;
       this.pageWidth = r.width;
       this.pageHeight = r.height;
-      this.pageHeights = [];
       this.result = result;
       this.nodeMap = new WeakMap();
-      this.chordItem.clear();
-      this.playhead = null;
+      this.leafMap = new WeakMap();
+      this.playhead.reset();
+      this.index = ScoreIndex.build(r.pages);
     };
   }
 
@@ -359,7 +295,6 @@ export class ScorePainter {
     const result: LayoutResult = {
       title: score.title,
       pages: pages.map((root) => ({ root, geometry: pageGeometry(wT, hT, score.scaling), renderer: "staff", songIndexes: [0] })),
-      hits: [],
       diagnostics: [],
       staffPlacements: [{ songIndex: 0, score, systems: placed }],
       jianpuLineStarts: null,
@@ -369,83 +304,19 @@ export class ScorePainter {
       this.original = null;
       this.result = result;
       this.nodeMap = new WeakMap();
-      this.chordItem.clear();
-      this.playhead = null;
-      this.buildStaffIndex(pages);
+      this.leafMap = new WeakMap();
+      this.playhead.reset();
+      this.index = ScoreIndex.build(pages);
     };
-  }
-
-  /** 五线谱各页页面树里的和弦组，按元素 id 收起来，连同它所在的系统组。 */
-  private buildStaffIndex(pages: readonly Group[]): void {
-    this.staffChords.clear();
-    this.staffLeaves.clear();
-    this.leafMap = new WeakMap();
-    const walk = (item: PageItem, page: number, system: PageItem | null): void => {
-      if (isStaffLeaf(item.data)) {
-        const key = staffLeafKey(item.data);
-        const list = this.staffLeaves.get(key) ?? [];
-        list.push({ page, item });
-        this.staffLeaves.set(key, list);
-      }
-      if (item.classes.has(STAFF_SYSTEM)) system = item;
-      if (item.classes.has(STAFF_CHORD)) {
-        const id = (item.data as StaffChordData).chordId;
-        const list = this.staffChords.get(id) ?? [];
-        list.push({ page, item, system });
-        this.staffChords.set(id, list);
-        return;
-      }
-      for (const c of item.children) walk(c, page, system);
-    };
-    pages.forEach((pg, i) => walk(pg, i, null));
-  }
-
-  /**
-   * 竖直播放线（同 Sibelius / MuseScore / Dorico）：横向取音 `noteEl` 的包围盒，纵向取 `span`（`noteEl` 所在 svg 的用户坐标）。
-   * 缺哪样都撤掉。
-   */
-  private movePlayhead(noteEl?: SVGGraphicsElement, span?: { y0: number; y1: number } | null): void {
-    const svg = noteEl?.ownerSVGElement;
-    const box = noteEl && span ? svgBox(noteEl) : null;
-    if (!noteEl || !svg || !span || !box) {
-      this.playhead?.remove();
-      return;
-    }
-    const pad = 4;
-    const x0 = box.x0 - pad;
-    const x1 = box.x1 + pad;
-    const y0 = span.y0 - pad * 2;
-    const y1 = span.y1 + pad * 2;
-    let rect = this.playhead;
-    if (!rect) {
-      rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      rect.setAttribute("class", "playhead");
-      rect.setAttribute("rx", "3");
-      this.playhead = rect;
-    }
-    rect.setAttribute("x", x0.toFixed(1));
-    rect.setAttribute("y", y0.toFixed(1));
-    rect.setAttribute("width", Math.max(8, x1 - x0).toFixed(1));
-    rect.setAttribute("height", Math.max(8, y1 - y0).toFixed(1));
-    if (rect.ownerSVGElement !== svg) svg.appendChild(rect);
   }
 
   /** 当前结果的曲名（导出文件名取首行）。 */
   get title(): string {
-    return this.result?.title ?? this.score.title;
-  }
-
-  /** 当前结果是不是原样文档这一路排的（按源行排，没有几何拾取；面板按它摆原样档的设置）。 */
-  get isDocumentLayout(): boolean {
-    return this.original !== null;
+    return this.result?.title ?? "";
   }
 
   /** 原样文档这一路音符数字的字号（pt），面板「基础字号」显示它；别的路为 null。 */
-  get documentDigitFontSize(): number | null {
-    return this.original?.digitFontSize ?? null;
-  }
-
-  /** 原样文档这一路定稿的度量（方言版式 + 谱内指令 + 面板那层；样式快照脚本核对用）；别的路为 null。 */
+  /** 原样文档这一路定稿的栅格与尺子（样式快照脚本核对用）；别的路为 null。 */
   get documentMetrics(): JianpuGrid | null {
     return this.original?.metrics ?? null;
   }
@@ -477,52 +348,14 @@ export class ScorePainter {
     return this.result?.staffPlacements[0] ?? null;
   }
 
-  /** 逐页走一遍页面树，把每个和弦的元素 id 对到它的音符格上，顺带认下各条小节线挨着哪个音符。
-   *
-   *  树序就是读谱顺序，所以「挨着的音符」在这一趟里天然认得出，跨小节、跨行、跨页都对得上
-   *  （`editor/sync.ts::addPartExtras` 借 id 的口径也是这个）。 */
-  private buildChordIndex(): void {
-    this.chordItem.clear();
-    this.barlineItem.clear();
-    this.slurItem.clear();
-    let lastNoteId: ElementId | null = null;
-    /** 还等着后面那个音符来认领的小节线（`‖:` 画在小节第一个音符之前） */
-    let pendingBefore: { page: number; item: PageItem }[] = [];
-    const walk = (item: PageItem, page: number): void => {
-      if (item.data instanceof NoteEntry) {
-        const id = item.data.chord?.id;
-        if (id !== null && id !== undefined) {
-          const list = this.chordItem.get(id) ?? [];
-          list.push({ page, item, verse: item.data.verse });
-          this.chordItem.set(id, list);
-          lastNoteId = id;
-          for (const b of pendingBefore) this.barlineItem.set(`${id}:before`, b);
-          pendingBefore = [];
-        }
-      } else if (item.data instanceof Barline) {
-        if (item.data.ownerEdge === "before") pendingBefore.push({ page, item });
-        else if (lastNoteId !== null) this.barlineItem.set(`${lastNoteId}:after`, { page, item });
-      } else if (item instanceof Tie && item.startId !== null && item.endId !== null) {
-        // 弧本身就是一个 Group（多连音那种没有起止音符，`startId` 为 null，不收）
-        this.slurItem.set(`${item.startId}:${item.endId}`, { page, item });
-      }
-      for (const c of item.children) walk(c, page);
-    };
-    this.layout.pages.forEach((pg, i) => walk(pg, i));
+  /** 元素 `id` 的音符格：简谱两条路按第 `pass` 遍（找不到那一遍取第一个），五线谱 / 混排取五线谱层那一组。 */
+  private noteHit(id: ElementId, pass = 0, occ = 0): Hit | null {
+    return this.index.note(id, pass, occ);
   }
 
-  /** 某个和弦在第几遍的音符格（找不到那一遍就取第一个）。 */
-  private hitFor(id: ElementId, pass: number): { page: number; item: PageItem } | null {
-    const list = this.chordItem.get(id);
-    if (!list || list.length === 0) return null;
-    return list.find((h) => h.verse === pass) ?? list[0];
-  }
-
-  /** 元素 `id` 的音符格：简谱引擎按第 `pass` 遍（找不到那一遍取第一个），原样文档一个元素只画一次。 */
-  private noteHit(id: ElementId, pass = 0): { page: number; item: PageItem } | null {
-    if (this.staff) return this.staffChords.get(id)?.[0] ?? null;
-    if (this.original) return this.original.noteItems.get(id) ?? null;
-    return this.hitFor(id, pass);
+  /** 图元画出来的 SVG 元素：组在 `nodeMap`，五线谱 / 混排的叶子在 `leafMap`。 */
+  private svgOf(item: PageItem): SVGGraphicsElement | undefined {
+    return this.nodeMap.get(item) ?? this.leafMap.get(item);
   }
 
   private elsOf(items: readonly PageItem[]): SVGGElement[] {
@@ -532,122 +365,81 @@ export class ScorePainter {
     });
   }
 
-  /** 原样文档：音符格所在谱组（`compose.ts` 里带 `system` 类的 Group，多声部是连谱号括起的整组）的竖向范围，
-   *  取组里各音符格与歌词格的墨迹并集（svg 用户坐标）。不取组本身的包围盒：组里有落在原点的空图元；
-   *  这一路的 `<g>` 也不写 class、各层还带着平移——按页面树找组、按实际画出的元素量最稳。每组量一次缓存。 */
-  private originalSpan(item: PageItem): { y0: number; y1: number } | null {
-    const layout = this.original;
-    if (!layout) return null;
-    let cache = this.originalSystems;
-    if (cache?.layout !== layout) {
-      const of = new Map<PageItem, PageItem>();
-      const walk = (it: PageItem, sys: PageItem | undefined): void => {
-        if (it.classes.has("system")) sys = it;
-        if (sys) of.set(it, sys);
-        for (const c of it.children) walk(c, sys);
-      };
-      for (const pg of layout.pages) walk(pg, undefined);
-      const members = new Map<PageItem, PageItem[]>();
-      for (const { item: it } of [...layout.noteItems.values(), ...layout.syllableItems.values()]) {
-        const sys = of.get(it);
-        if (!sys) continue;
-        const list = members.get(sys) ?? [];
-        list.push(it);
-        members.set(sys, list);
-      }
-      cache = this.originalSystems = { layout, of, members, spans: new Map() };
-    }
-    const sys = cache.of.get(item);
-    if (!sys) return null;
-    let span = cache.spans.get(sys);
-    if (!span) {
-      let y0 = Infinity;
-      let y1 = -Infinity;
-      for (const it of cache.members.get(sys) ?? []) {
-        const el = this.nodeMap.get(it);
-        const b = el ? svgBox(el) : null;
-        if (!b || b.y1 - b.y0 <= 0) continue;
-        y0 = Math.min(y0, b.y0);
-        y1 = Math.max(y1, b.y1);
-      }
-      if (!(y1 > y0)) return null;
-      span = { y0, y1 };
-      cache.spans.set(sys, span);
-    }
-    return span;
-  }
-
-  /** 试听光标挪到元素 `id` 第 `pass` 遍的音（null = 撤掉）。返回所在页。
-   *  各视图统一放竖直播放线（`movePlayhead`），不给音符着色；播放器跟各声部起音走，多声部时
-   *  女高休止、别的声部在唱也照走。这一视图里没画的音（展开档只排带歌词的那个声部）不挪，留在上一处。
-   *  纵向：五线谱 / 混排取谱表带；简谱引擎取音符所在谱行（按遍次取音符格）；原样文档取它所在的谱组
-   *  （`g.system`，多声部是连谱号括起的整组）。 */
-  highlight(id: ElementId | null, pass = 0): number | null {
-    if (id === null) {
-      this.movePlayhead();
-      return null;
-    }
-    if (this.staff) {
-      const hit = this.staffChords.get(id)?.[0];
-      if (!hit?.system) return null;
-      const sysEl = this.nodeMap.get(hit.system);
-      const band = hit.system.data as StaffSystemData;
-      this.movePlayhead(this.nodeMap.get(hit.item), sysEl ? spanIn(sysEl, band.top, band.bottom) : null);
-      return hit.page;
-    }
-    const hit = this.noteHit(id, pass);
-    const el = hit ? this.nodeMap.get(hit.item) : undefined;
-    if (!hit || !el) return null;
-    let span: { y0: number; y1: number } | null = null;
-    if (this.original) {
-      span = this.originalSpan(hit.item);
-    } else if (hit.item.data instanceof NoteEntry) {
-      const lineEl = this.nodeMap.get(hit.item.data.line.group);
-      span = lineEl ? svgBox(lineEl) : null;
-    }
-    this.movePlayhead(el, span ?? svgBox(el));
-    return hit.page;
-  }
-
-
-  /** 五线谱 / 混排：点中的元素（事件目标）落在哪个和弦组里 → 元素 id；不在和弦上为 null。 */
-  staffChordAt(target: Element | null): ElementId | null {
-    if (!this.staff) return null;
-    for (let el = target; el && !(el instanceof SVGSVGElement); el = el.parentElement) {
-      const id = this.staffElId.get(el);
-      if (id !== undefined) return id;
-    }
-    return null;
-  }
-
-  /** 五线谱 / 混排：元素 `id` 画出来的各个和弦组（五线谱层、简谱叠层各一个）。 */
-  staffChordEls(id: ElementId): SVGGElement[] {
-    return (this.staffChords.get(id) ?? []).flatMap((h) => {
-      const el = this.nodeMap.get(h.item);
-      return el ? [el] : [];
-    });
-  }
-
-  /** 五线谱 / 混排：某个叶子身份（歌词字、弧、小节线）画出来的各个元素；没画出来为空。 */
-  staffLeafEls(d: StaffLeafData): SVGGraphicsElement[] {
-    return (this.staffLeaves.get(staffLeafKey(d)) ?? []).flatMap((h) => {
-      const el = this.leafMap.get(h.item);
+  /** 各段画出来、仍挂在文档里的元素（叶子也算）。 */
+  private shownEls(hits: readonly Hit[]): SVGGraphicsElement[] {
+    return hits.flatMap((h) => {
+      const el = this.svgOf(h.item);
       return el?.isConnected ? [el] : [];
     });
   }
 
-  /** 五线谱 / 混排：事件目标是不是一个带身份的叶子（歌词字、弧、小节线）。 */
-  staffLeafAt(target: Element | null): StaffLeafData | null {
-    return target ? this.staffLeafOf.get(target) ?? null : null;
+  private elOf(hit: Hit | null): SVGGElement | null {
+    return hit ? this.nodeMap.get(hit.item) ?? null : null;
+  }
+
+  /** 试听光标挪到元素 `id` 第 `pass` 遍的音（null = 撤掉）。返回所在页。
+   *  各视图统一放竖直播放线（`playhead.ts`），不给音符着色；播放器跟各声部起音走，多声部时
+   *  女高休止、别的声部在唱也照走。这一视图里没画的音（展开档只排带歌词的那个声部）不挪，留在上一处。
+   *  纵向：五线谱 / 混排取谱表带；简谱两条路取音符所在那一行（`system` 标签，多声部是连谱号括起的整组）。 */
+  highlight(id: ElementId | null, pass = 0, occ = 0): number | null {
+    if (id === null) {
+      this.playhead.move();
+      return null;
+    }
+    if (this.staff) {
+      const hit = this.index.note(id);
+      const sys = hit ? this.index.systemOf(hit.item)?.system : undefined;
+      if (!hit || !sys) return null;
+      const sysEl = this.nodeMap.get(sys);
+      const band = sys.data as StaffSystemData;
+      this.playhead.move(this.nodeMap.get(hit.item), sysEl ? spanIn(sysEl, band.top, band.bottom) : null);
+      return hit.page;
+    }
+    const hit = this.index.note(id, pass, occ);
+    const el = hit ? this.nodeMap.get(hit.item) : undefined;
+    if (!hit || !el) return null;
+    const span = this.playhead.systemSpan(this.index, hit.item, (it) => this.nodeMap.get(it));
+    this.playhead.move(el, span ?? svgBox(el));
+    return hit.page;
+  }
+
+  /** 点中的元素（事件目标）落在哪个音符格 / 和弦组里 → 元素 id；不在音符上为 null。 */
+  noteAt(target: Element | null): ElementId | null {
+    for (let el = target; el && !(el instanceof SVGSVGElement); el = el.parentElement) {
+      const ident = this.itemOfEl.get(el)?.ident;
+      if (ident?.kind === "note" && ident.id !== undefined) return ident.id;
+    }
+    return null;
+  }
+
+  /** 元素 `id` 画出来的各个音符格（混排里五线谱层、简谱叠层各一个；简谱展开档每遍一个）。 */
+  noteEls(id: ElementId): SVGGElement[] {
+    return this.elsOf(this.index.notes(id).map((h) => h.item));
+  }
+
+  /** 五线谱 / 混排：第 `measure` 小节（全曲下标）`edge` 那一侧的小节线各段；没画出来为空。 */
+  measureBarlineEls(measure: number, edge: "before" | "after"): SVGGraphicsElement[] {
+    return this.shownEls(this.index.measureBarlines(measure, edge));
+  }
+
+  /** 从 `start` 连到 `end` 的那条弧画出来的各段（跨系统时两截）。 */
+  slurEls(start: ElementId, end: ElementId): SVGGraphicsElement[] {
+    return this.shownEls(this.index.slurParts(start, end));
+  }
+
+  /** 五线谱 / 混排：和弦 `id` 第 `verse` 段（源段号）的那个字；没画出来为空。 */
+  lyricEls(id: ElementId, verse: number): SVGGraphicsElement[] {
+    const hit = this.index.syllable(id, verse);
+    return hit ? this.shownEls([hit]) : [];
   }
 
   /** 五线谱 / 混排：和弦 `id` 所在系统的谱表带（混排连同简谱层），换成它所在页面 SVG 的用户坐标：光标竖线照这一带的高度画。 */
   staffBand(id: ElementId): { svg: SVGSVGElement; y: number; h: number } | null {
-    const hit = this.staffChords.get(id)?.[0];
-    const sys = hit?.system;
+    const hit = this.index.note(id);
+    const sys = hit ? this.index.systemOf(hit.item)?.system : undefined;
     const g = sys ? this.nodeMap.get(sys) : undefined;
     const svg = g?.ownerSVGElement;
-    if (!sys || !g || !svg) return null;
+    if (!sys || !g || !svg || !this.staff) return null;
     const d = sys.data as StaffSystemData;
     const m = svg.getScreenCTM()?.inverse().multiply(g.getScreenCTM() ?? new DOMMatrix());
     if (!m) return null;
@@ -658,120 +450,59 @@ export class ScorePainter {
 
   /** 元素 `id` 第一次出现在第几页（光标同步翻页用）；没画出来为 null。 */
   pageOf(id: ElementId): number | null {
-    return this.noteHit(id)?.page ?? null;
+    return this.index.pageOf(id);
   }
 
   /** 元素 `id` 第 `pass` 遍那个音的 `<g>`（点选、滚动到可见用）；没画出来为 null。 */
-  entryEl(id: ElementId, pass = 0): SVGGElement | null {
-    const hit = this.noteHit(id, pass);
-    return hit ? this.nodeMap.get(hit.item) ?? null : null;
+  entryEl(id: ElementId, pass = 0, occ = 0): SVGGElement | null {
+    return this.elOf(this.noteHit(id, pass, occ));
   }
 
   /** 挨着元素 `id` 的那条小节线的 `<g>`（`edge` 是它在音符的哪一侧）；没画出来为 null。
-   *  小节线没有自己的 id，两路都按「相邻音符 + 侧」认（见 `Barline.ownerEdge`）。 */
+   *  小节线没有自己的 id，按「相邻音符 + 侧」认（身份标签的 `edge`，见 `identity.ts`）。 */
   barlineEl(id: ElementId, edge: "before" | "after"): SVGGElement | null {
-    const hit = this.original
-      ? this.original.barlineItems.get(`${id}:${edge}`)
-      : this.barlineItem.get(`${id}:${edge}`);
-    return hit ? this.nodeMap.get(hit.item) ?? null : null;
+    return this.elOf(this.index.barline(id, edge));
   }
 
   /** 从 `start` 连到 `end` 的那条圆滑线/延音线的 `<g>`；没画出来（跨行时另一端不在本行）为 null。 */
   slurEl(start: ElementId, end: ElementId): SVGGElement | null {
-    const hit = this.original
-      ? this.original.slurItems.get(`${start}:${end}`)
-      : this.slurItem.get(`${start}:${end}`);
-    return hit ? this.nodeMap.get(hit.item) ?? null : null;
+    return this.elOf(this.index.slur(start, end));
   }
 
   /** 宿主音符 `hostId` 的第 `ord` 条增时线（0 起）的 `<g>`；没画出来为 null。
-   *
-   *  两路的认法不同：原样文档按增时线自己的 id（`ownId`，行视图里它就带着）；简谱引擎的输入
-   *  把增时线压成了计数（`JChord.beats`）不带 id，但排版时每条增时线各是一个音符格、按树序
-   *  跟在音符格后面，所以按序号数——第 0 个是音符本身。 */
+   *  增时线有自己 id 的（行视图里它就带着，`ownId`）按 id 认；没有的（`.jpwabc` 的 `-` 写在音符 token 里）
+   *  按跟在音符格后面的序数认——第 0 个是音符本身。 */
   sustainEl(hostId: ElementId, ord: number, ownId?: ElementId, pass = 0): SVGGElement | null {
-    if (this.original) {
-      const hit = ownId === undefined ? undefined : this.original.noteItems.get(ownId);
-      return hit ? this.nodeMap.get(hit.item) ?? null : null;
-    }
-    return this.sustainCellEls(hostId, pass)[ord] ?? null;
+    return this.elOf(this.index.sustain(hostId, ord, ownId, pass));
   }
 
-  /** 元素 `id` 的各条增时线格的 `<g>`（简谱引擎：跟在音符格后面的那几个「-」格，按序）。
+  /** 元素 `id` 的各条增时线格的 `<g>`（跟在音符格后面的那几个「-」格，按序）。
    *
    *  `.jpwabc` 的增时线写在音符 token 里、模型里没有它自己的对象，可视化编辑只能按这几个格
    *  认出「点中的是第几条」，再去选 token 里那一串 `-`（见 `NoteParts.sustains`）。 */
   sustainCellEls(id: ElementId, pass = 0): SVGGElement[] {
-    if (this.original) return [];
-    const list = this.chordItem.get(id);
-    if (!list || list.length === 0) return [];
-    const same = list.filter((h) => h.verse === pass);
-    return (same.length > 0 ? same : list).slice(1).flatMap((h) => {
-      const el = this.nodeMap.get(h.item);
-      return el ? [el] : [];
-    });
+    return this.elsOf(this.index.sustainCells(id, pass).map((h) => h.item));
   }
 
-  /** 元素 `id` 第 `verse` 段（行内 0 起）歌词的那个字的 `<g>`；`verseNo` 是源段号（缺省 = verse + 1）。
-   *  原样文档一段一个音节；简谱引擎的音符格把各段歌词收在同一个 `<g>` 里，按段号取这一段自己的那个字，
-   *  取不到（格里没有歌词图元）就退回整个音符格。 */
-  lyricEl(id: ElementId, verse = 0, verseNo?: number): SVGGElement | null {
-    if (this.original) {
-      const hit = this.original.syllableItems.get(`${id}:${verse}`);
-      return hit ? this.nodeMap.get(hit.item) ?? null : null;
-    }
-    const ls = this.cellLyrics(id, verse);
-    const one = ls.find((l) => l.verse === (verseNo ?? verse + 1)) ?? (ls.length === 1 ? ls[0] : undefined);
-    return one ? one.el : this.entryEl(id, verse);
-  }
-
-  /** 收在元素 `id` 音符格里的各段歌词 `<g>`（只亮音符时要把它们摘出来）。原样文档的歌词不在格里，为空。 */
-  cellLyricEls(id: ElementId): SVGGElement[] {
-    return this.original ? [] : this.cellLyrics(id, 0).map((l) => l.el);
-  }
-
-  /** 元素 `id` 第 `pass` 遍那个音符格里各段歌词的 `<g>` 与段号（`Lyric.verse`）。 */
-  private cellLyrics(id: ElementId, pass: number): { el: SVGGElement; verse: number }[] {
-    const hit = this.hitFor(id, pass);
-    if (!hit) return [];
-    return findByClass(hit.item, "lyric").flatMap((it) => {
-      const el = this.nodeMap.get(it);
-      return el ? [{ el, verse: it instanceof Lyric ? it.verse : 0 }] : [];
-    });
-  }
-
-  /** 两路页面树给子项的类名：原样文档画和弦名 `chord`、`&xx` 记号 `ornament`、注记 `annotation`；
-   *  简谱引擎是和弦名 `chord-group`、装饰 `artic`，注记没有独立图元。附点两路都是 `aug-dot`。 */
-  private partClass(role: VisualPartRole): string | null {
-    const doc = this.original !== null;
-    switch (role) {
-      case "aug-dot": return "aug-dot";
-      case "harmony": return doc ? "chord" : "chord-group";
-      case "deco": return doc ? "ornament" : "artic";
-      case "annotation": return doc ? "annotation" : null;
-    }
+  /** 元素 `id` 第 `verse` 段（行内 0 起）歌词的那个字的 `<g>`（一段一个音节）。 */
+  lyricEl(id: ElementId, verse = 0): SVGGElement | null {
+    return this.elOf(this.index.syllable(id, verse));
   }
 
   /** 元素 `id` 音符格里某角色子项的 `<g>`，按页面树顺序（可视化编辑选中附点与挂在音符上的记号）。 */
   partEls(id: ElementId, role: VisualPartRole, pass = 0): SVGGElement[] {
-    const cls = this.partClass(role);
-    const hit = cls ? this.noteHit(id, pass) : null;
-    return hit && cls ? this.elsOf(findByClass(hit.item, cls)) : [];
+    const kind: IdentityKind = role;
+    return this.elsOf(this.index.parts(id, kind, pass).map((h) => h.item));
   }
 
   /** 页眉里画出来的东西（标题、署名、调号拍号）：`<g>`、所画的字、是不是调号拍号。可视化编辑按字对回原文字段。 */
   headerParts(): HeaderPart[] {
     if (this.staff) {
-      // 五线谱 / 混排：标题块各行（`StaffLeafData` 的 credit），按字认
-      const out: HeaderPart[] = [];
-      for (const hits of this.staffLeaves.values()) {
-        for (const h of hits) {
-          const d = h.item.data;
-          const el = this.leafMap.get(h.item);
-          if (isStaffLeaf(d) && d.staffRole === "credit" && el?.isConnected) out.push({ el, text: d.text, role: "text" });
-        }
-      }
-      return out;
+      // 五线谱 / 混排：标题块各行（`header` 标签），按所画的字认
+      return this.index.headers().flatMap((h) => {
+        const el = this.leafMap.get(h.item);
+        return el?.isConnected && h.item instanceof TextFrame ? [{ el, text: h.item.text, role: "text" as const }] : [];
+      });
     }
     return headerPartsOf(this.result?.pages.map((p) => p.root) ?? [], this.nodeMap);
   }
@@ -785,34 +516,24 @@ export class ScorePainter {
       if (!page) throw new Error(`ScorePainter: 没有第 ${pageIndex + 1} 页`);
       const { w, h } = page.geometry.viewBox;
       const svg = renderPageSvg(page.root, w, h, { cls: "score-page mixed-page", visitor: mixedVisitor(this.nodeMap, this.leafMap) });
-      for (const [id, hits] of this.staffChords) {
-        for (const h of hits) {
-          const el = h.page === pageIndex ? this.nodeMap.get(h.item) : undefined;
-          if (el) this.staffElId.set(el, id);
-        }
-      }
-      for (const hits of this.staffLeaves.values()) {
-        for (const h of hits) {
-          const el = h.page === pageIndex ? this.leafMap.get(h.item) : undefined;
-          if (el && isStaffLeaf(h.item.data)) this.staffLeafOf.set(el, h.item.data);
-        }
-      }
+      this.mapRendered(pageIndex);
       return svg;
     }
     const page = this.result?.pages[pageIndex];
     if (!page) throw new Error(`ScorePainter: 没有第 ${pageIndex + 1} 页`);
     const { w, h } = page.geometry.viewBox;
-    return renderPageSvg(page.root, w, h, this.nodeMap);
+    const svg = renderPageSvg(page.root, w, h, this.nodeMap);
+    this.mapRendered(pageIndex);
+    return svg;
   }
 
-  /** Walk up from a picked item to its enclosing "entry" group (else the item). */
-  entryGroupOf(item: PageItem): PageItem {
-    let cur: PageItem | null = item;
-    while (cur) {
-      if (cur.classes.has("entry")) return cur;
-      cur = cur.parent;
+  /** 这一页带身份的图元：画出来的元素反查回图元（`noteAt` 按它认点选）。 */
+  private mapRendered(pageIndex: number): void {
+    for (const h of this.index.all) {
+      if (h.page !== pageIndex) continue;
+      const el = this.svgOf(h.item);
+      if (el) this.itemOfEl.set(el, h.item);
     }
-    return item;
   }
 
   get pageCount(): number {
@@ -823,114 +544,6 @@ export class ScorePainter {
   pageSize(index: number): { w: number; h: number } {
     const g = this.result?.pages[index]?.geometry ?? this.result?.pages[0]?.geometry;
     if (g) return { ...g.sizePt };
-    return { w: this.pageWidth, h: this.pageHeights[index] ?? this.pageHeight };
+    return { w: this.pageWidth, h: this.pageHeight };
   }
-
-  // ---------------- picking (Phase 3) ----------------
-
-  private calcDist(x: number, y: number, inn: Rect): number {
-    let dx = 0;
-    if (x < inn.left) dx = inn.left - x;
-    else if (x > inn.right) dx = x - inn.right;
-    let dy = 0;
-    if (y < inn.top) dy = inn.top - y;
-    else if (y > inn.bottom) dy = y - inn.bottom;
-    return dx + dy;
-  }
-
-  pick(root: PageItem, x: number, y: number): [PageItem | null, number] {
-    let bnd = root.bound;
-    bnd = bnd.offset(root.x, root.y);
-    const edge = 5;
-    const dist = this.calcDist(x, y, bnd);
-    if (root.children.length === 0) {
-      let outer = new Rect(bnd.left, bnd.top, bnd.right, bnd.bottom);
-      const dx = Math.min(bnd.width - edge * 2, 0) / 2;
-      const dy = Math.min(bnd.height - edge * 2, 0) / 2;
-      outer = outer.inset(dx, dy);
-      return outer.contains(x, y) ? [root, dist] : [null, dist];
-    }
-    let outer = new Rect(bnd.left, bnd.top, bnd.right, bnd.bottom);
-    outer = outer.inset(-edge, -edge);
-    if (outer.contains(x, y)) {
-      const xx = x - bnd.left;
-      const yy = y - bnd.top;
-      const items: PageItem[] = [];
-      let minDist = Number.MAX_VALUE;
-      let best: PageItem | null = null;
-      let small: PageItem | null = null;
-      for (const ch of root.children) {
-        const [p, pd] = this.pick(ch, xx, yy);
-        if (p !== null) {
-          if (pd < minDist) {
-            best = p;
-            minDist = pd;
-            items.length = 0;
-            items.push(p);
-          }
-          if (pd === minDist) items.push(p);
-          if (ch.bound.width < edge || ch.bound.height < edge) small = ch;
-        }
-      }
-      if (small !== null) return [small, 0];
-      let area = Number.MAX_VALUE;
-      for (const it of items) {
-        const a = it.bound.width * it.bound.height;
-        if (a < area) {
-          best = it;
-          area = a;
-        }
-      }
-      return [best, minDist];
-    }
-    return [null, Number.MAX_VALUE];
-  }
-
-  /** 页面 pt 坐标处的图元（简谱引擎这一路；五线谱与原样文档没有几何拾取，后者靠事件冒泡找 `<g>`）。
-   *  `target` 是它所在音符格的元素，页眉等为 null。 */
-  pickPage(page: number, pointPt: { x: number; y: number }): LayoutHit | null {
-    const lp = this.result?.pages[page];
-    if (!lp || lp.renderer !== "jianpu" || this.original) return null;
-    const pos = fromPt(lp.geometry, pointPt.x, pointPt.y);
-    const [item] = this.pick(lp.root, pos.x, pos.y);
-    if (!item) return null;
-    const entry = this.entryGroupOf(item).data;
-    const id = entry instanceof NoteEntry ? entry.chord?.id : undefined;
-    const target: PaintTarget | null = entry instanceof NoteEntry && id !== null && id !== undefined
-      ? { kind: "element", songIndex: 0, id, occurrence: entry.verse }
-      : null;
-    return { target, pageIndex: page, item, boundsPt: absBounds(item, lp.geometry.ptPerUnit), layer: "jianpu" };
-  }
-}
-
-/** 图元在页上的包围盒（pt）：沿父链累加各级 x/y 偏移（简谱这一路的页面树不带旋转缩放）。 */
-function absBounds(item: PageItem, ptPerUnit: number): { x: number; y: number; w: number; h: number } {
-  let x = item.bound.left;
-  let y = item.bound.top;
-  for (let cur: PageItem | null = item; cur; cur = cur.parent) {
-    x += cur.x;
-    y += cur.y;
-  }
-  return { x: x * ptPerUnit, y: y * ptPerUnit, w: item.bound.width * ptPerUnit, h: item.bound.height * ptPerUnit };
-}
-
-/** 元素包围盒换到它所在 svg 的用户坐标（`getBBox` 是元素自己的坐标系，各层平移、缩放都要算进去）。 */
-function svgBox(el: SVGGraphicsElement): { x0: number; x1: number; y0: number; y1: number } | null {
-  const svgCtm = el.ownerSVGElement?.getScreenCTM();
-  const ctm = el.getScreenCTM();
-  if (!svgCtm || !ctm) return null;
-  const m = svgCtm.inverse().multiply(ctm);
-  const b = el.getBBox();
-  const xs = [m.a * b.x + m.c * b.y + m.e, m.a * (b.x + b.width) + m.c * (b.y + b.height) + m.e];
-  const ys = [m.b * b.x + m.d * b.y + m.f, m.b * (b.x + b.width) + m.d * (b.y + b.height) + m.f];
-  return { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
-}
-
-/** `el` 坐标系里的竖向范围 [top, bottom] → 它所在 svg 的用户坐标。 */
-function spanIn(el: SVGGraphicsElement, top: number, bottom: number): { y0: number; y1: number } | null {
-  const svgCtm = el.ownerSVGElement?.getScreenCTM();
-  const ctm = el.getScreenCTM();
-  if (!svgCtm || !ctm) return null;
-  const m = svgCtm.inverse().multiply(ctm);
-  return { y0: m.d * top + m.f, y1: m.d * bottom + m.f };
 }

@@ -644,8 +644,8 @@ button:focus-visible, select:focus-visible {
 /* 双向定位 — 代码区光标所在的音符/歌词（见 editor/sync.ts）。
    与「选中」同一种蓝（选中色只有一种）；一律走 CSS 类、不重渲染。
    试听不给音符着色，用竖直播放线（rect.playhead），两者不打架。 */
-.score-page g.cursor-at [fill]:not([fill="none"]):not(.cursor-off *) { fill: #1565ff; }
-.score-page g.cursor-at [stroke]:not(.cursor-off *) { stroke: #1565ff; }
+.score-page g.cursor-at [fill]:not([fill="none"]) { fill: #1565ff; }
+.score-page g.cursor-at [stroke] { stroke: #1565ff; }
 
 /* 可视化编辑（editor/visual/）：谱面叠加层与代码区的两种光标。
    插入 = 竖线（闪烁），编辑 = 方块；换行符 ↵ / 换页符 ⤓ 可点选。 */
@@ -719,7 +719,7 @@ button:focus-visible, select:focus-visible {
 .beat-check-button.active { color: #e03131; }
 .format-marks-button.active { color: #1565ff; }
 
-/* 试听的竖直播放线（painter.ts::movePlayhead，简谱 / 五线谱 / 混排同一种）：纵贯整行，点击穿过它落到音符上 */
+/* 试听的竖直播放线（layout/playhead.ts，简谱 / 五线谱 / 混排同一种）：纵贯整行，点击穿过它落到音符上 */
 .score-page rect.playhead, .mixed-page rect.playhead { fill: rgba(232, 89, 12, 0.16); stroke: rgba(232, 89, 12, 0.7); stroke-width: 1.5; pointer-events: none; }
 .mixed-page g.staff-chord { cursor: pointer; }
 

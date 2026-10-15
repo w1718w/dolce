@@ -66,7 +66,7 @@ export interface OmrHost {
   reload(text: string): void;
   /**
    * 五线谱识别产物落地：与打开 `.musicxml` 同一个模式（无代码区），默认进**混排视图**。
-   * 不走 `importOmrDoc`：五线谱的和弦、多声部、slur 在 `.jpwabc` 与简谱引擎里装不下。
+   * 不走 `importOmrDoc`：五线谱的和弦、多声部、slur 在 `.jpwabc` 与旧简谱引擎里装不下。
    * 返回 false 表示简谱那一侧转不出来（不影响混排预览）。
    */
   adoptStaffXml(xml: string): boolean;
@@ -1287,7 +1287,7 @@ export class OmrController implements FormatSource {
   }
 
   /**
-   * 播到某个元素：同五线谱（`painter.ts::movePlayhead`），放一条竖直播放线——横向取这个音的识别框，
+   * 播到某个元素：同五线谱（`layout/playhead.ts`），放一条竖直播放线——横向取这个音的识别框，
    * 纵向贯穿它所在的系统（多声部是连谱号括起的几行，连同夹在中间的歌词带；单声部就是这一行）。null = 撤掉。
    * 这份谱里对不上框的音（没有 meta 的格式）不挪，留在上一处。
    */

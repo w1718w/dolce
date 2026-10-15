@@ -339,7 +339,8 @@ function readVoice(sec: VoiceSectionLike, fifths: number, time: { beats: number;
 
 type VoiceSectionLike = Section & { voiceData: JpwToken[] };
 
-/** 歌词落点：按源文小节数，小节中间的换行也让小节序号加一。
+/** 歌词落点：按源文小节线数小节，**小节中间的换行不算**（JP-Word 原生的 013 有福的确据：行末 `(5. 5.)` 与下行
+ *  `3_ 2_ 1_ |` 是一个 9/8 小节，副歌 `W1-3@9,3` 照这样数才落在副歌第一个音上；按换行再加一就早一小节、压进主歌）。
  *  没有音的小节不算：曲首 `|:|` 词法成 `|:` `|` 两根线，`readVoice` 为收它们开出一个空小节，
  *  数进去的话 `W1@1,2` 就落空、词整体早一格（`J14.你们要专心` 第一个字挂到了休止上）。 */
 function assignLyrics(measures: readonly SrcMeasure[], f: JpwFile): void {
@@ -351,13 +352,6 @@ function assignLyrics(measures: readonly SrcMeasure[], f: JpwFile): void {
       mid++;
       let nid = 0;
       for (const ent of m.entries) {
-        if (ent.kind === "break") {
-          if (ent !== m.entries[m.entries.length - 1]) {
-            mid++;
-            nid = 0;
-          }
-          continue;
-        }
         if (ent.kind !== "note") continue;
         nid++;
         if (mid < seg.measure) continue;
@@ -593,7 +587,7 @@ export function jpwToScoreDoc(f: JpwFile): ScoreDoc {
   if (rows?.length) {
     const play = convertRepeat(rows, song.parts[0]);
     if (play.length) song.playOrder = play;
-  }
+  } else inferEndings(song.parts[0]!);
   doc.songs.push(song);
   return doc;
 }
@@ -606,4 +600,37 @@ function substringAfter(s: string, delim: string): string {
 function substringBefore(s: string, delim: string): string {
   const i = s.indexOf(delim);
   return i < 0 ? s : s.substring(0, i);
+}
+
+/**
+ * JP-Word 不写房号：`:|` 那一小节与紧跟着的一小节**节奏逐音相同**时，前者是一房、后者是二房
+ * （009《荣耀归与至高神》`3-- 0 :|1-- 0`、020《向主歌唱》`6,. 0 3,_ :|6,. 0 3_`；`.Layout` 的时值总长按「第二遍跳过一房」记）。
+ * 只看节奏相同、第一个音的第 1 段词也相同的一小节（等长但节奏不同的是照常往下唱）。有 `.Repeat` 的照它，不推。
+ */
+function inferEndings(part: Part): void {
+  const ms = part.measures;
+  const firstWord = (m: Measure): string => {
+    const c = m.elements.find((e): e is Chord => e.kind === "chord" && !e.grace && !e.rest);
+    const l = c?.lyrics?.find((x) => x.number === 1) ?? c?.lyrics?.[0];
+    return (l?.text ?? "").replace(/[\p{P}\s]/gu, "");
+  };
+  const rhythm = (m: Measure): string =>
+    m.elements.filter((e): e is Chord => e.kind === "chord" && !e.grace).map((c) => `${c.rest ? "r" : "n"}${c.duration.divisions}`).join(" ");
+  for (let i = 0; i + 1 < ms.length; i++) {
+    const m = ms[i]!;
+    const back = (m.barlines ?? []).find((b) => b.location === "right" && b.repeat === "backward");
+    if (!back || back.alsoForward || (m.barlines ?? []).some((b) => b.ending)) continue;
+    const next = ms[i + 1]!;
+    if ((next.barlines ?? []).some((b) => b.repeat || b.ending)) continue;
+    const r = rhythm(m);
+    if (!r || r !== rhythm(next)) continue;
+    // 两小节第一个音的第 1 段词（去标点）也得相同：`1-- :|1--` 底下是「阿/们」的是结尾的「阿们」，不是房（447《我灵之光》）
+    if (firstWord(m) !== firstWord(next)) continue;
+    m.barlines!.push({ location: "left", ending: { numbers: [1], text: "1.", type: "start" } });
+    back.ending = { numbers: [1], text: "1.", type: "stop" };
+    (next.barlines ??= []).push({ location: "left", ending: { numbers: [2], text: "2.", type: "start" } });
+    const right = next.barlines.find((b) => b.location === "right");
+    if (right) right.ending = { numbers: [2], text: "2.", type: "discontinue" };
+    else next.barlines.push({ location: "right", ending: { numbers: [2], text: "2.", type: "discontinue" } });
+  }
 }

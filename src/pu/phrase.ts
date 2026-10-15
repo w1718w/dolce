@@ -9,21 +9,19 @@
 //      断句直接吃 `ScoreDoc` 拼出的输入（`phrasesong.ts`），桥是它的 `idOf`（和弦 → 元素 id）
 //      再经排版行视图的 `elementOf` 回到行里的元素（元素带原文区间，重排据此切原文）。
 //   2. **多声部对齐**。断点只按主旋律（`parts[0]`）算，但合唱谱四个声部得在**同一拍位**
-//      断行，否则各声部行长不一、`layout.ts::alignVoices` 会把它们拧成一团。
+//      断行，否则各声部行长不一、`layout/jianpu/place/spacing.ts` 同拍位归列时会把它们拧成一团。
 //      对齐按**累计时值**做，不按元素下标——各声部的元素个数本来就不一样。
 //
 // 产出是一份「新的行划分」（`PuNewLine[]`），消费者（`relayout.ts`）据此重排文本。
 // 无 DOM 依赖。
 
 import { Fraction } from "../common/fraction";
-import { chooseLineLayout, fitForInput, pageBreakLines } from "../score/applybreaks";
+import { chooseLineLayout, fitForIds, pageBreakLines } from "../score/applybreaks";
 import { computePhraseBreaks } from "../score/phrase";
 import { chordsOf, type PhraseChord } from "../score/phraseinput";
-import type { JChord, JScore } from "../layout/input";
 import { elementQuarters, linesOfVoice, tupletRatios, voiceNumbers } from "./ast";
 import type { MusicElement, NoteElement, PuSong, ScoreLine, SourceSpan } from "./ast";
 import { phrasePartOfSong } from "./phrasesong";
-import { jianpuInputOfDoc } from "../model/jianpuinput";
 import type { ElementId, ScoreDoc } from "../model/doc";
 import { docView } from "./slots";
 
@@ -102,8 +100,11 @@ function indexAtTick(st: VoiceStream, tick: Fraction): number {
   return st.elements.length;
 }
 
-/** 量行长的尺子：按本函数交给它的那份引擎输入量自然跨度（和弦按元素 id 对回断句输入）。 */
-export type FitMeasure = (score: JScore) => { width: number; spans: ReadonlyMap<JChord, { x0: number; x1: number }> } | null;
+/** 量行长的尺子：量这份文档第 `song` 首各音的自然跨度（键是元素 id，按 id 对回断句输入）。
+ *  `noPairs`：只用来判「放不放得下」、不许两句并一行（原样档：要的是一句一行，见 `App._puPhraseMeasure`）。 */
+export type FitMeasure = (doc: ScoreDoc, song: number) => {
+  width: number; spans: ReadonlyMap<string | number, { x0: number; x1: number }>; noPairs?: boolean;
+} | null;
 
 /**
  * 算出这一首该怎么按乐句分行。
@@ -147,9 +148,8 @@ export function puPhraseLines(
 
   const breaks = computePhraseBreaks(part, { pageLines: PAGE_LINES });
   if (opt.measure) {
-    const score = jianpuInputOfDoc(sdoc, { song: songIdx, forExpanded: true });
-    const measured = score?.parts[0] ? opt.measure(score) : null;
-    if (measured) chooseLineLayout(part, breaks, 0, { fit: fitForInput(measured, input.idOf) });
+    const measured = opt.measure(sdoc, songIdx);
+    if (measured) chooseLineLayout(part, breaks, 0, { fit: fitForIds(measured, input.idOf), allowPairs: !measured.noPairs });
   }
 
   // 断点 → 主旋律元素流下标（「在此元素之前起新行」）。

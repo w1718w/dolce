@@ -39,11 +39,12 @@ import { puToScoreDoc } from "../model/frompu";
 import type { ScoreDoc } from "../model/doc";
 import { PU_LYRIC_PUNCTUATION, PU_LYRIC_QUOTES } from "../common/cjkpunct";
 import { t as tr } from "../i18n";
+import { DYNAMICS } from "./glyph";
 
 /** 音符后可跟的记号名（`&xx`）。不在表里的会报 unknown-command 但仍保留。 */
 const NOTE_COMMANDS = new Set([
   "zkh", "ykh", // 伴奏括弧
-  "ppp", "pp", "p", "mp", "mf", "f", "ff", "fff", "sf", "fp", "sfp", "sfz", // 力度
+  ...Object.keys(DYNAMICS), // 力度（名表在 pu/glyph.ts，与画法同一份）
   "cresc", "dim", "rit", "tempo", "atempo", // 术语
   "yc", "ycy", "bc", "zy", "dy", "hx", // 延长/保持/重音/顿音/呼吸
   "shy", "xhy", "sby", "xby", "cy", "tr", // 滑音/波音/颤音
@@ -601,9 +602,13 @@ export function parseMusicLine(
       }
       const inner = src.slice(i + 1, end);
       const roleMatch = /^\s*(bz|dsb)/i.exec(inner);
+      // 不写 bz/dsb 的 `{…}` 按并排块读：番茄原谱《太阳出来喜洋洋》`{ | 6, - } 2, -` 与 `{dsb 6, - } 2 -` 印得一样
       const role: "accompaniment" | "voice" =
-        roleMatch && roleMatch[1]!.toLowerCase() === "dsb" ? "voice" : "accompaniment";
-      const bodyStart = roleMatch ? roleMatch[0].length : 0;
+        roleMatch && roleMatch[1]!.toLowerCase() === "bz" ? "accompaniment" : "voice";
+      let bodyStart = roleMatch ? roleMatch[0].length : 0;
+      // 层首的 `|` 就是层外前面那条小节线（原谱只印一条），不进层
+      const leadBar = /^\s*\|(?![:|/*])/.exec(inner.slice(bodyStart));
+      if (leadBar && lastAttachable(elements)?.kind === "barline") bodyStart += leadBar[0].length;
       const sub = parseMusicLine(ctx, src.slice(0, end), i + 1 + bodyStart);
       elements.push({
         kind: "inline-layer",

@@ -4,7 +4,7 @@
 //   A 路（relayout --mode=text，文字原位替换）  位置来自原件 PageSpec，样式来自这里
 //   B 路（rebuild，从 musicxml 数据重排）        位置由排版引擎算，样式也来自这里
 //
-// 值一律由 `stats.ts` 从原书 `pdf-layout.json` 统计**中位数**得来（见 scripts/gen-bookstyle.mjs），
+// 值一律由 `stats.ts` 从原书 `out/pdf-layout.json` 统计**中位数**得来（见 scripts/gen-bookstyle.mjs），
 // 不是拍脑袋的常量——「保留原书的字体与间距特征」就落在这里。
 //
 // 单位约定（**改字段前先看这条**）：
@@ -45,16 +45,18 @@ export interface BookMetrics {
   bracketFootEm?: number;
 
   // —— 纵向栅格（减时线，见 docs/实现/简谱纵向栅格.md）——
-  divLineGapEm: number; // 音符墨迹下缘 → 第一条减时线（inventory 的 divLine）
-  divLineStepEm: number; // 相邻减时线间距
 
   // —— 反复 ——
   repeatDotDiam: number; // pt
 
   // —— 上下带 ——
   chordToNoteEm: number; // 和弦 baseline → 音符墨迹上缘
-  /** 和弦排成纯文本（原书就是一行普通文字，没有 SMuFL 字形）。见 LayoutOptions.chordPlainText。 */
+  /** 和弦排成纯文本（原书就是一行普通文字，没有 SMuFL 字形）。见 `JianpuStyle.look.chordPlain`。 */
   chordPlain?: boolean;
+  /** 升降号写在字母前/后（见 `JianpuStyle.look.accidentalSide`）。 */
+  accidentalSide?: "before" | "after";
+  /** 临时记号的样子；不给 = `classic`（照原书）。见 `JianpuStyle.look.accidentalStyle`。 */
+  accidentalStyle?: "csym" | "classic";
   lyricToLyricEm: number; // 相邻歌词行 baseline 差
 
   // —— 线与弧 ——
@@ -63,7 +65,7 @@ export interface BookMetrics {
   // 不是原书的描边宽（0.19pt 上下），所以一律存 `*Em`（× 字号）。
   /** 弧的**凸起高度**（× 音符字号）。引擎的弧高公式是按 fontSize≈28 的绝对像素调的，
    *  换成成书的小字号后按比例缩会扁成一条线，所以这里给一个明确的物理目标，
-   *  由 style/book.ts::applyBookPreset 反算缩放系数。 */
+   *  由 style/book.ts::bookJianpuStyle 反算缩放系数。 */
   slurArcEm: number;
   /** 弧顶的**上限**与**下限**，× 音符字号（与 `slurArcEm` 同口径）。
    *  对数公式两头都失控：长跨度一路长高去顶和弦，短跨度塌成一条直线。
@@ -86,9 +88,11 @@ export interface BookMetrics {
   barlineWidthEm: number; // × 歌词字号
   finalBarlineWidthEm: number; // × 歌词字号
 
-  /** 统一层距（em）：高音点上距 / 低音点下距 / 减时线首层距三者的均值，校准 LayoutOptions.jpStackGap。
-   *  三者差得多时 stats 报 ⚠（见 bookstyle 报告）。 */
+  /** 弧 / 上方带离叠层顶的空（em），原书量的（高音点上距 / 低音点下距 / 减时线首层距三者的均值）。
+   *  → `JianpuStyle.vertical.slurGap`。样式键 `slur-gap`。 */
   stackGapEm: number;
+  /** 叠层（八度点、减时线）的空 ÷ 数字墨迹高；不给 = 各引擎同一个缺省。样式键 `stack-gap`。 */
+  stackGap?: number;
 }
 
 export interface PageMargin {
@@ -303,8 +307,6 @@ export function defaultBookStyle(): BookStyle {
       lyricGapEm: 0.1,
       bracketWidth: 0,
       bracketFootEm: 0,
-      divLineGapEm: 0.17,
-      divLineStepEm: 0.17,
       repeatDotDiam: 1.6,
       chordToNoteEm: 1.3,
       chordPlain: true,
@@ -382,7 +384,7 @@ export function validateBookStyle(s: unknown): { style: BookStyle; errors: strin
   if (!(style.page.w > 0 && style.page.h > 0)) errors.push("页面尺寸无效");
   const m = style.metrics;
   for (const [k, v] of Object.entries(m)) {
-    if (typeof v === "boolean") continue; // chordPlain 这类开关
+    if (typeof v === "boolean" || typeof v === "string") continue; // chordPlain、accidentalStyle 这类开关
     if (typeof v !== "number" || !Number.isFinite(v)) errors.push(`metrics.${k} 无效：${v}`);
   }
   return { style, errors };

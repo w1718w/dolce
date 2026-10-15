@@ -2,7 +2,7 @@
 //
 // `phrase.ts` / `applybreaks.ts` 只经这组接口读谱。实现由 `ScoreDoc` 拼：MusicXML 形状 `model/phrasedoc.ts`、
 // 简谱形状 `pu/phrasesong.ts`；断点集合与 `FitMetric.spans` 以拼出的对象为键，`idOf` 把它们换回元素 id
-// （写回简谱引擎输入、回原文都按 id）。字段名与简谱引擎输入（`layout/input.ts`）同一套。
+// （写回简谱输入模型、回原文都按 id）。字段名与简谱输入模型（`layout/input.ts`）同一套。
 
 import type { Fraction } from "../common/fraction";
 import type { BarStyle, StartStopDiscontinue } from "./enums";
@@ -63,7 +63,5 @@ export function chordsOf(m: PhraseMeasure): PhraseChord[] {
   return m.entries.filter(isPhraseChord);
 }
 
-// 段落词（流行/敬拜谱常见的段落方框标记）。`<words>` 也用于表情记号(rit./dolce)，故只认这些词，
-// 免把普通文字当段落；`<rehearsal>` 本就是排练/段落记号，一律收下。
-export const SECTION_WORD_RE =
-  /^(intro|verse|chorus|pre-?chorus|bridge|coda|outro|ending|interlude|solo|refrain|tag|前奏|主歌|副歌|间奏|尾奏|尾声|桥段|插曲)\s*\d*$/i;
+// 段落词表与「这一小节有没有段落标记」在模型层（`model/helpers.ts::sectionMarkOf`），各格式同一个判据。
+export { SECTION_WORD_RE } from "../model/helpers";

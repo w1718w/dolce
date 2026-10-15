@@ -6,7 +6,6 @@
 
 import type { ElementId, ScoreDoc } from "../model/doc";
 import type { MetaData } from "../smufl/smufl";
-import type { JChord } from "../layout/input";
 import { staffOptionsOf } from "../layout/painter";
 import { phraseCuts, type FitMeasure } from "../pu/phrase";
 import { layoutStaff } from "../mixed/layout";
@@ -23,7 +22,6 @@ export interface MixedHost {
   readonly docFormat: DocFormatId;
   readonly layoutMode: App["layoutMode"];
   readonly jpPaper: App["jpPaper"];
-  readonly puPaper: App["puPaper"];
   readonly fontSize: App["fontSize"];
   readonly layoutPage: App["layoutPage"];
   readonly phraseOn: boolean;
@@ -51,7 +49,7 @@ export class MixedSession {
   _srcToMixed = new Map<ElementId, ElementId[]>();
   /** `.musicxml` 五线谱档那份模型是按哪份原文读的（原文变了才重读）。 */
   _mixedXmlText: string | null = null;
-  /** 派生五线谱里各和弦在第几小节（全曲下标）：五线谱上的小节线按小节认（`mixed/prims.ts::StaffLeafData`）。 */
+  /** 派生五线谱里各和弦在第几小节（全曲下标）：五线谱上的小节线按小节认（身份标签的 `measure`，`layout/identity.ts`）。 */
   _mixedMeasureOf = new Map<ElementId, number>();
 
   /**
@@ -67,18 +65,7 @@ export class MixedSession {
       options.page = this.host.staffPage;
       const { width, byId } = staffChordSpans(layoutStaff(bare, options));
       if (byId.size === 0) return null;
-      const measure: FitMeasure = (score) => {
-        const spans = new Map<JChord, { x0: number; x1: number }>();
-        for (const part of score.parts) {
-          for (const m of part.measures) {
-            for (const e of m.entries) {
-              const sp = e.kind === "chord" && e.id !== null ? byId.get(e.id) : undefined;
-              if (sp) spans.set(e as JChord, sp);
-            }
-          }
-        }
-        return { width, spans };
-      };
+      const measure: FitMeasure = () => ({ width, spans: byId });
       const cuts = phraseCuts(doc, 0, { measure });
       if (!cuts) return null;
       return new Set(cuts.flatMap((c) => (c.id === null ? [] : [c.id])));
@@ -93,7 +80,7 @@ export class MixedSession {
     const pg = this.host.layoutPage;
     // 乐句档五线谱自己量宽断句，五线谱的纸与样式也进键
     const staff = this.host.phraseOn ? ["phrase", this.host.staffPaper, JSON.stringify(this.host.staffStyle())] : [];
-    return [this.host.getText(), this.host.layoutMode, this.host.jpPaper, this.host.puPaper, this.host.fontSize, pg.w, pg.h, ...staff].join("\u0000");
+    return [this.host.getText(), this.host.layoutMode, this.host.jpPaper, this.host.fontSize, pg.w, pg.h, ...staff].join("\u0000");
   }
 
   /** 五线谱/混排档的模型备好了没有。`.musicxml` 就是打开时读的那份；文本格式把**当前源文**经

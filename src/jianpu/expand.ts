@@ -31,33 +31,41 @@ export interface MeasureCut {
   limit: number;
   /** 整首最后一小节 */
   final: boolean;
+  /** 接在前一小节同一行、不在它前面换行（`PlayItem.glueFrom`） */
+  glue?: boolean;
 }
 
 export interface PlaySink {
   measure(mid: number, pass: number, cut: MeasureCut): void;
   /** 一遍唱完（`endOfPass`）：展开档据此换页 */
   passEnd(): void;
+  /** 往回跳、但还是同一段词（反复只有一段、D.S./D.C. 回去唱到 Fine）：给了它就只另起一行、不换页 */
+  jumpBack?(): void;
 }
 
 /**
  * 逐遍逐小节回调。换页（`passEnd`）有两处：`endOfPass`，以及**往回跳**（反复、D.C./D.S.）——
- * 那是新的一遍。遍号变了但往前接着唱的（二房之后 pass 归 1 的尾段、跳过一房）不换页，
+ * 那是新的一遍；往回跳还唱同一段词的，sink 给了 `jumpBack` 就只换行（展开档：一页一行的碎页，250《主，差遣我》）。遍号变了但往前接着唱的（二房之后 pass 归 1 的尾段、跳过一房）不换页，
  * 否则前一页常只剩一行半（同一首歌）。同一小节被 limit/skip 切成前后两截的，后一截也是接着唱。
  */
 export function walkPlay(items: readonly PlayItem[], sink: PlaySink): void {
   let lastMid = -1;
+  let lastPass = -1;
   let broke = true; // 刚换过页，不必再换
   items.forEach((it, idx) => {
     if (lastMid >= 0 && !broke && (it.mid < lastMid || (it.mid === lastMid && it.skip === 0))) {
-      sink.passEnd();
+      if (sink.jumpBack && it.pass === lastPass) sink.jumpBack();
+      else sink.passEnd();
     }
     broke = false;
+    lastPass = it.pass;
     for (let mid = it.mid; mid < it.end; mid++) {
       lastMid = mid;
       sink.measure(mid, it.pass, {
         skip: mid === it.mid ? it.skip : 0,
         limit: mid === it.end - 1 ? it.limit : -1,
         final: mid === it.end - 1 && idx === items.length - 1,
+        ...(it.glueFrom >= 0 && mid >= it.glueFrom ? { glue: true } : {}),
       });
     }
     if (it.endOfPass) {

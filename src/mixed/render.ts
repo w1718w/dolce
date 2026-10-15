@@ -1,7 +1,7 @@
 // 混排渲染器。从 musicpp model/render.cpp 移植。
 // 输入：StaffLayout（已排版）；输出：Group（含 GraphicLine/TextFrame）。
 // 单位：tenths（与 StaffLayout 一致）。
-// SMuFL 字形用 TextFrame + font.family="Bravura"（等价 SmuflText，无需 LayoutOptions）。
+// SMuFL 字形用 TextFrame + font.family="Bravura"（等价 SmuflText）。
 
 import { Fraction } from "../common/fraction";
 import { punctClass } from "../common/cjkpunct";
@@ -10,7 +10,9 @@ import { Matrix33, Point } from "../common/geom";
 // layout.ts 里的是**画出来的那条弧**，所以起个别名区分。
 import { GraphicPath, Group, Slur as SlurArc, TextFrame } from "../layout/pageitem";
 import { GlyphCodes } from "../smufl/smufl";
+import { BarStyle } from "../score/enums";
 import {
+  LegerLayout,
   BarGlyph,
   BeamVal,
   ClefSig,
@@ -35,18 +37,25 @@ import {
   mixedSlurStyle,
   fGe,
   fLt,
-  smuflBottom,
-  smuflTop,
   smuflWidth,
   slurEnds,
   tiedEnds,
   harmonyBand,
+  type HarmonyLayout,
+  type StaffLayout,
 } from "./model";
 import { Font } from "../layout/font";
-import { addEndingBracket } from "../layout/ending";
-import { layoutHarmonySegs } from "../layout/harmony";
-import { addLine, addSmufl, addSmuflScaled, chordGroup, STAFF_SYSTEM, translated, type StaffLeafData, type StaffSystemData } from "./prims";
+import { addEndingBracket } from "../engrave/ending";
+import { BarlineGlyph, type BarlineSpec } from "../engrave/barline";
+import { TupletGlyph } from "../engrave/tuplet";
+import { hairpinPath } from "../engrave/hairpin";
+import { chordTextSegs, harmonyWidth, layoutHarmonySegs } from "../engrave/chord";
+import { addLine, addSmufl, addSmuflScaled, chordGroup, STAFF_SYSTEM, translated, type StaffSystemData } from "./prims";
+import type { ItemIdentity } from "../layout/identity";
 import { drawJianpuOverlay } from "./jianpuoverlay";
+
+/** SMuFL breathMarkComma（U+E4CE）。 */
+const BREATH_COMMA = String.fromCharCode(0xe4ce);
 
 function addFilledQuad(
   g: Group,
@@ -98,7 +107,7 @@ export function drawNotesNormal(
 
       let x: number;
       const cue = n.size === 1 || ch.cue || ch.grace;
-      const scale = cue ? eng.cueSize : 1;
+      const scale = ch.grace ? eng.graceSize : cue ? eng.cueSize : 1;
 
       if (ch.measureRest) {
         const mif = md.measureInfo;
@@ -122,6 +131,16 @@ export function drawNotesNormal(
       } else {
         addSmufl(chordGrp(), code, x, y, fs);
       }
+      // 倚音不进 NoteEntry（不参与同拍对齐），加线在这里按它自己的小号符头补画——
+      // 否则 `{5,,}` 这种落到谱表外的倚音悬在半空
+      if (ch.grace && !ch.rest) {
+        const leg = new LegerLayout();
+        leg.addNote(n.line(), x, x + smuflWidth(meta, code) * scale);
+        for (const [ledgerLine, [lx1, lx2]] of leg.ranges) {
+          const ly = -ledgerLine * 5;
+          addLine(chordGrp(), lx1 - 3 * scale, ly, lx2 + 3 * scale, ly, eng.lineWidths.leger);
+        }
+      }
     }
 
     // stem and flag (skip rests, whole notes, half notes with beams)
@@ -139,11 +158,26 @@ export function drawNotesNormal(
     if (ch.beams.length === 0) {
       const flagCode = ch.tailSym(ch.stemUp);
       if (flagCode) {
-        const scale = ch.cue ? eng.cueSize : 1;
+        // 符尾与音符头同一个缩放（倚音也是小号，原先只认 cue，倚音的符尾是整号的、垂过音符头）
+        const scale = ch.grace ? eng.graceSize : ch.cue || ch.notes.some((n) => n.size === 1) ? eng.cueSize : 1;
+        // 按 SMuFL 锚点接到符干末端（`stemUpNW` / `stemDownSW`），不是拿字形原点硬对
+        const anc = meta.getAnchor(flagCode);
+        const a = (ch.stemUp ? anc?.stemUpNW : anc?.stemDownSW) ?? [0, 0];
+        const sp = (fs / 4) * scale;
+        const fx = sx - a[0] * sp;
+        const fy = ty + a[1] * sp;
         if (scale !== 1) {
-          addSmuflScaled(chordGrp(), flagCode, sx, ty, fs, scale, scale);
+          addSmuflScaled(chordGrp(), flagCode, fx, fy, fs, scale, scale);
         } else {
-          addSmufl(chordGrp(), flagCode, sx, ty, fs);
+          addSmufl(chordGrp(), flagCode, fx, fy, fs);
+        }
+        // 短倚音（`<grace slash="yes">`）：符尾上那道斜线，两端照 SMuFL 锚点 graceNoteSlashSW/NE（向上）、NW/SE（向下）
+        if (ch.src.grace?.slash) {
+          const p0 = ch.stemUp ? anc?.graceNoteSlashSW : anc?.graceNoteSlashNW;
+          const p1 = ch.stemUp ? anc?.graceNoteSlashNE : anc?.graceNoteSlashSE;
+          if (p0 && p1) {
+            addLine(chordGrp(), fx + p0[0] * sp, fy - p0[1] * sp, fx + p1[0] * sp, fy - p1[1] * sp, eng.lineWidths.stem);
+          }
         }
       }
     }
@@ -153,14 +187,22 @@ export function drawNotesNormal(
 
   // ---- notations (fermata 等) —— render.cpp:328 drawChord 非简谱分支 ----
   for (const ch of md.chords) {
-    if (ch.notations.length === 0 || ch.notes.length === 0) continue;
+    if ((ch.notations.length === 0 && !ch.breath) || ch.notes.length === 0) continue;
     if (ch.notes[0].staff !== subStaff) continue;
     const stemX = ch.stemX();
+    // 换气：SMuFL 逗号（breathMarkComma），符头右边一格、谱表第一线之上半格
+    if (ch.breath) {
+      const left = ch.stemUp && ch.noteType.compareTo(new Fraction(4)) < 0 ? stemX - ch.noteheadWidth(meta) : stemX;
+      addSmufl(container, BREATH_COMMA, left + ch.noteheadWidth(meta) + 8, -5, fs);
+    }
     for (const nota of ch.notations) {
       let x = stemX + nota.dx;
       if (ch.stemUp && ch.noteType.compareTo(new Fraction(4)) < 0) {
         x -= ch.noteheadWidth(meta);
       }
+      // **墨迹中心对符头中心**：照原排版程序是字形原点对符头左缘，窄的顿音点就偏到左边、宽的延长号偏到右边
+      const bb = meta.getBBox(nota.symbol);
+      if (bb) x += ch.noteheadWidth(meta) / 2 - ((bb.bBoxSW[0] + bb.bBoxNE[0]) / 2) * 10;
       addSmufl(container, nota.symbol, x, nota.y, fs);
     }
   }
@@ -320,6 +362,7 @@ export function drawBeams(
   container: Group,
   md: PartMeasureLayout,
   subStaff: number,
+  graceSize: number,
 ): void {
   const stfY = md.staffY(subStaff);
   for (const grp of md.beams) {
@@ -334,7 +377,7 @@ export function drawBeams(
       ch.notes.some((n) => n.staff === subStaff),
     );
     if (relevantChords.length === 0) continue;
-    drawBeamGroup(container, grp.chords, stfY, 0.8);
+    drawBeamGroup(container, grp.chords, stfY, graceSize);
   }
 }
 
@@ -359,10 +402,10 @@ function drawSlurTied(
 ): void {
   const arc = new SlurArc();
   arc.init(new Point(plx, ply), new Point(prx, pry), mixedSlurStyle(above));
-  // 可视化编辑认弧：起止和弦的元素 id（见 `prims.ts::StaffLeafData`）
+  // 可视化编辑认弧：起止和弦的元素 id（身份标签，`layout/identity.ts`）
   const s = obj.startNote?.chord.src.id;
   const e = obj.endNote?.chord.src.id;
-  if (s !== undefined && e !== undefined) arc.data = { staffRole: "slur", start: s, end: e } satisfies StaffLeafData;
+  if (s !== undefined && e !== undefined) arc.ident = { kind: "slur", id: s, end: e };
   container.add(arc);
 }
 
@@ -443,6 +486,7 @@ function drawTuplet(eng: MixedOptions, container: Group, obj: Tuplet): void {
   let pry = 0;
 
   const sign = above ? 1 : -1;
+  let bracket = false;
 
   if (nota === Notation.JianPu) {
     const ntl = chl.notes[0];
@@ -459,43 +503,26 @@ function drawTuplet(eng: MixedOptions, container: Group, obj: Tuplet): void {
     ply = pry = dot > 0 ? -4 : 3;
   } else {
     // determine bracket: use when stem direction matches above or no beams
-    let bracket = true;
+    bracket = true;
     if (obj.bracket !== null) {
       bracket = obj.bracket;
     } else if (above === chl.stemUp) {
       bracket = chl.beams.length === 0;
     }
-
     [ply, pry] = obj.staffEnds();
-
-    const hlen = 10;
-    if (bracket) {
-      const k = prx !== plx ? (pry - ply) / (prx - plx) : 0;
-      const dx = (prx - plx - 20) / 2;
-      const bpath = new GraphicPath();
-      bpath.fill = false;
-      bpath.stroke = true;
-      bpath.strokeColor = 0xff000000;
-      bpath.strokeWidth = 1;
-      bpath.moveTo(plx, ply + sign * hlen);
-      bpath.lineTo(plx, ply);
-      bpath.lineTo(plx + dx, ply + dx * k);
-      bpath.moveTo(prx, pry + sign * hlen);
-      bpath.lineTo(prx, pry);
-      bpath.lineTo(prx - dx, pry - dx * k);
-      container.add(bpath);
-    }
   }
 
-  const cx = (plx + prx) / 2;
-  const cy = (ply + pry) / 2;
-  const numStr = Tuplet.makeNumber(obj.timeModification.denominator);
-  const fsScale = eng.musicFont.size / 40;
-  const numW = TimeSig.width(eng.meta, obj.timeModification.denominator) * fsScale;
-  // 数字垂直居中：cy + 字形高/2（render.cpp:1455-1457 txt->height/2）。
-  const g0 = numStr[0] ?? "";
-  const numH = (smuflTop(eng.meta, g0) - smuflBottom(eng.meta, g0)) * fsScale;
-  addSmufl(container, numStr, cx - numW / 2, cy + numH / 2, eng.musicFont.size);
+  // 画法走公共那一份（engrave/tuplet.ts）：括号（横线 + 竖脚，数字坐在断口里）与旧简谱引擎同一套，
+  // 数字是 SMuFL 的 tuplet 字形、按墨迹居中。
+  const tg = new TupletGlyph(new Point(plx, ply), new Point(prx, pry), obj.timeModification.denominator, {
+    kind: bracket ? "bracket" : "number",
+    color: 0xff000000,
+    music: eng.musicFont,
+    meta: eng.meta,
+    lineWidth: 1,
+    foot: sign * 10,
+  });
+  for (const it of tg.items) container.add(it);
 }
 
 // -----------------------------------------------------------------------
@@ -504,7 +531,9 @@ function drawTuplet(eng: MixedOptions, container: Group, obj: Tuplet): void {
 /** 混排里房号竖脚底离简谱层原点的空（高音点 + 简谱连音弧）。 */
 const MIXED_ENDING_GAP = 16;
 
-function drawEnding(container: Group, obj: Ending, sys: Sys, mixed: boolean): void {
+/** 一个房在本系统里的横向范围与 `yPos`（`yPos − 30` 是房号基线、竖脚底，再往上 20 是括线；null = 缺省位置 0）。
+ *  谱表上方文字避让房号线也用这一份（`staffpages.ts::placeAboveStaff`）。 */
+export function endingPlace(obj: Ending, sys: Sys, mixed: boolean): { left: number; right: number; yPos: number | null; startsHere: boolean; endsHere: boolean } {
   // 房跨系统：起点在前面的系统里，这一段从本系统首小节画起、不画左脚不印房号；终点在后面的系统里，画到本系统末小节、不封口
   const startsHere = sys.contains(obj.startTick);
   const endsHere = sys.contains(obj.endTick);
@@ -521,12 +550,13 @@ function drawEnding(container: Group, obj: Ending, sys: Sys, mixed: boolean): vo
 
   // yPos − 30 是房号数字的基线、再往上 20 是括线
   let yPos: number | null = null;
-  if ((mixed || scr.autoLayout) && sys.staves.length > 0) {
+  // 带坐标的五线谱档也定：和弦行按谱面内容抬高之后（`placeAboveStaff`），缺省位置的房号线会压在和弦上（018）
+  if (sys.staves.length > 0) {
     const eng = scr.options;
     const st = sys.staves[0];
     if (st.hasHarmony) {
-      // 自动铺排的和弦按真实字高（约 18 tenths）：数字基线放到和弦顶上方 4；带坐标的谱照 musicpp
-      yPos = scr.autoLayout ? -(st.harmonyY + 3 + harmonyBand(scr)[0]) + 26 : -st.harmonyY + 12;
+      // 和弦按真实字高（约 18 tenths）：数字基线放到和弦顶上方 4；带坐标的混排照 musicpp
+      yPos = mixed && !scr.autoLayout ? -st.harmonyY + 12 : -(st.harmonyY + 3 + harmonyBand(scr)[0]) + 26;
     } else if (mixed) {
       // 简谱层的原点是 `st.minY − mixStaffDist − mixStaffHeight`（同 `jianpuoverlay.ts::drawJianpuOverlay`）。
       // 原先这里把 `minY` 的符号写反了：谱表越往上伸（minY 越负）房号反而越往下掉，压进简谱层。
@@ -538,6 +568,12 @@ function drawEnding(container: Group, obj: Ending, sys: Sys, mixed: boolean): vo
     }
   }
 
+  return { left, right, yPos, startsHere, endsHere };
+}
+
+function drawEnding(container: Group, obj: Ending, sys: Sys, mixed: boolean): void {
+  const { left, right, yPos, startsHere, endsHere } = endingPlace(obj, sys, mixed);
+  const scr = sys.score;
   const eng = scr.options;
   const y0 = -30.0;
   const vlen = 20.0;
@@ -593,17 +629,8 @@ function drawWedge(container: Group, obj: Wedge, sys: Sys): void {
   const hL = startInSys ? realL : h * BREAK_FRAC;
   const hR = endInSys ? realR : h * BREAK_FRAC;
 
-  const path = new GraphicPath();
-  path.fill = false;
-  path.stroke = true;
-  path.strokeColor = 0xff000000;
-  path.strokeWidth = 1;
-  // 上、下两条边各为独立线段；尖端处两端高度同为 0 自然汇于一点。
-  path.moveTo(xL, ypos + hL);
-  path.lineTo(xR, ypos + hR);
-  path.moveTo(xL, ypos - hL);
-  path.lineTo(xR, ypos - hR);
-  container.add(path);
+  // 画法走公共那一份（engrave/hairpin.ts，与原样文档同一笔）
+  container.add(hairpinPath({ x0: xL, x1: xR, y: ypos, half0: hL, half1: hR, lineWidth: 1, color: 0xff000000 }));
 }
 
 function drawPedalLine(container: Group, obj: PedalLine, sys: Sys): void {
@@ -683,7 +710,7 @@ export function drawLrc(
     t.color = 0xff000000;
     t.x = x + lrc.xOffset;
     t.y = -lrc.y;
-    t.data = { staffRole: "lyric", chordId: lrc.chord.src.id, verse: lrc.src.number } satisfies StaffLeafData;
+    t.ident = { kind: "syllable", id: lrc.chord.src.id, verse: lrc.src.number };
     // 标点挤压：`widthInfo` 量的就是挤压后的宽度，绘制拿同一串笔位（档位同为 `lrc.compress`）。
     if ([...lrc.text].length > 1) {
       const chars = [...lrc.text];
@@ -721,6 +748,14 @@ export function drawLrc(
 // -----------------------------------------------------------------------
 // drawHarmony（render.cpp::drawHarmony, simplified: plain text）
 
+/** 一个和弦符号画出来的宽（同 `drawHarmony` 的字体与分段），谱表上方文字避让用 */
+export function harmonyWidthOf(score: StaffLayout, h: HarmonyLayout): number {
+  const eng = score.options;
+  const fontsz = eng.harmonySize / (score.scaling > 0 ? score.scaling : 0.45);
+  const segs = eng.chordPlain ? chordTextSegs(h.asPlainText(eng.accidentalSide), true, eng.accidentalSide) : h.asText(eng.accidentalSide);
+  return harmonyWidth(segs, new Font(eng.wordFont, fontsz), new Font("Bravura Text", fontsz));
+}
+
 export function drawHarmony(
   eng: MixedOptions,
   container: Group,
@@ -742,12 +777,9 @@ export function drawHarmony(
     if (h.staff !== subStaff) continue;
     const mixedOffsetForRest =
       measureRest && h.offset.compareTo(new Fraction(0)) === 0 ? 15 : 0;
-    const segs = h.asText();
-
-    // 总宽照 musicpp TextBlock::width：上/下标按 0.75 缩放后的 advance。按未缩放算，A(sus4) 这类
-    // 长上标的和弦会整体左偏（KL2020《基督是锚》第 9 小节偏 18 tenths）
-    const width = segs.reduce((w, s) => w + (s.music ? musicFont : wordFont).measureText(s.text) * (s.superscript ? 0.75 : 1), 0);
-    // 分段排版与文本谱共用（src/layout/harmony.ts）
+    const segs = eng.chordPlain ? chordTextSegs(h.asPlainText(eng.accidentalSide), true, eng.accidentalSide) : h.asText(eng.accidentalSide);
+    // 分段排版与量宽走公共那一份（engrave/chord.ts）：总宽照 musicpp TextBlock::width，上/下标按 0.75 缩放
+    const width = harmonyWidth(segs, wordFont, musicFont);
     const grp = layoutHarmonySegs(segs, wordFont, musicFont, 0xff000000);
 
     const m = new Matrix33();
@@ -782,7 +814,7 @@ function drawTextBlock(container: Group, t: MeasureText): void {
       h = 0;
       continue;
     }
-    w += it.font.measureText(it.text);
+    w += (it.padBefore ?? 0) + it.font.measureText(it.text);
     // 行高与谱行包围盒（model.ts::tightLineHeights）同一口径：歌本按字号（musicpp Font::height()），
     // 否则多行文字块画得比包围盒高，压进下面的简谱与歌词（《那一天正来临》开头的楷体引言）
     const fm = it.font.metrics;
@@ -810,6 +842,7 @@ function drawTextBlock(container: Group, t: MeasureText): void {
     first = false;
     if (content === "\n") continue;
 
+    xpos += it.padBefore ?? 0;
     const tf = new TextFrame();
     tf.text = content;
     tf.font = it.font;
@@ -1040,41 +1073,45 @@ function drawBarlineItem(
   top: number,
   bot: number,
   repForBack = false,
-  tag: StaffLeafData | null = null,
+  tag: ItemIdentity | null = null,
 ): number {
   // 整组小节线右缘对齐到 x（向左生长），与谱线右端接齐（render.cpp drawBarlineItem）。
+  // 粗细组合与线距走公共那一份（engrave/barline.ts）；反复点按谱表间位另画（drawRepeatDots）。
   const lw = eng.lineWidths;
-  const light = lw.lightBarline;
-  const thick = lw.heavyBarline;
-  const dist = eng.barlineDist;
-  const widths: number[] = [];
-  if (repForBack) {
-    // 反复结束/双向反复：light-heavy-light（与左侧 Final 合并的情况）。
-    widths.push(light, thick, light);
-  } else {
-    switch (style) {
-      case BarGlyph.Single: widths.push(light); break;
-      case BarGlyph.Double: widths.push(light, light); break;
-      case BarGlyph.HeavyHeavy: widths.push(thick, thick); break;
-      case BarGlyph.Final: widths.push(light, thick); break;
-      case BarGlyph.ReverseFinal: widths.push(thick, light); break;
-      case BarGlyph.None:
-      default:
-        return 0;
-    }
-  }
-  let w = 0;
-  for (const ww of widths) w += ww;
-  w += (widths.length - 1) * dist;
-  let xx = x - w;
-  for (const ww of widths) {
-    const cx = xx + ww / 2;
-    const l = addLine(container, cx, top, cx, bot, ww);
-    if (tag) l.data = tag;
-    xx += dist + ww;
+  const spec = repForBack ? { repeatBackward: true, repeatForward: true } : BAR_GLYPH_SPEC[style];
+  const bar = new BarlineGlyph(spec, false, {
+    top,
+    bot,
+    light: lw.lightBarline,
+    heavy: lw.heavyBarline,
+    gap: eng.barlineDist,
+    dots: false,
+    color: 0xff000000,
+  });
+  if (bar.lines.length === 0) return 0;
+  const w = bar.inkRight - bar.inkLeft;
+  const dx = x - w - bar.inkLeft;
+  for (const l of bar.lines) {
+    // 混排的线一律写绝对端点（x = 0），页面树与原先逐字节一致
+    const cx = l.x + dx;
+    l.x = 0;
+    l.p0 = new Point(cx, l.p0.y);
+    l.p1 = new Point(cx, l.p1.y);
+    if (tag) l.ident = tag;
+    container.add(l);
   }
   return w;
 }
+
+/** 五线谱的小节线样式 → 公共小节线的 spec。 */
+const BAR_GLYPH_SPEC: Record<BarGlyph, BarlineSpec> = {
+  [BarGlyph.Single]: {},
+  [BarGlyph.Double]: { style: BarStyle.LIGHT_LIGHT },
+  [BarGlyph.HeavyHeavy]: { style: BarStyle.HEAVY_HEAVY },
+  [BarGlyph.Final]: { style: BarStyle.LIGHT_HEAVY },
+  [BarGlyph.ReverseFinal]: { style: BarStyle.HEAVY_LIGHT },
+  [BarGlyph.None]: { style: BarStyle.NONE },
+};
 
 /** 反复双点。主谱画两个 repeatDot（第 2、3 间），混排谱在上方简谱层再画一组缩小版。
  *  对齐 render.cpp::drawRepeatDots（mixStaves 分支）。 */
@@ -1166,9 +1203,9 @@ function drawBarline(eng: MixedOptions, container: Group, sys: Sys): void {
     const rep = lightHeavyLight.has(i);
     let width = 0;
     // 这条小节线的身份：系统开头那条是首小节之前，其余是第 i 小节（系统内从 1 数）之后
-    const tag: StaffLeafData = i === 0
-      ? { staffRole: "barline", measure: sys.firstMeasure, side: "before" }
-      : { staffRole: "barline", measure: sys.firstMeasure + i - 1, side: "after" };
+    const tag: ItemIdentity = i === 0
+      ? { kind: "barline", measure: sys.firstMeasure, edge: "before" }
+      : { kind: "barline", measure: sys.firstMeasure + i - 1, edge: "after" };
 
     for (const [first, last] of grps) {
       const stb = sys.staves[last];
@@ -1282,7 +1319,7 @@ function drawSysStaff(container: Group, sys: Sys, st: SysStaff, ypos: number): v
       const md = ps.part.measures[m.index];
       if (md) {
         drawNotesNormal(eng, grp, md, ps.subIndex);
-        drawBeams(grp, md, ps.subIndex);
+        drawBeams(grp, md, ps.subIndex, eng.graceSize);
         drawLrc(eng, grp, md, ps.subIndex);
         drawHarmony(eng, grp, md, ps.subIndex, scr.scaling, nota === Notation.Mixed);
         drawTextBlocks(grp, md, ps.subIndex);
@@ -1319,6 +1356,7 @@ export function drawSystem(container: Group, sys: Sys): Group {
     ypos += st.height();
   }
   res.classes.add(STAFF_SYSTEM);
+  res.ident = { kind: "system" };
   res.data = { top: top ?? 0, bottom: ypos } satisfies StaffSystemData;
 
   drawBarline(eng, res, sys);

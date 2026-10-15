@@ -1,19 +1,20 @@
 // 简谱形状的 `ScoreDoc`（文本谱 / 123 / ABC）→ 断句输入（`score/phraseinput.ts`）；试听输入与演唱顺序也用这份小节序列。
 //
 // 与 `model/phrasedoc.ts`（MusicXML 形状）分工同 `pu/slots.ts::docView` 与 `jianpuproject.ts`：
-// 这里经排版行视图 `docView` 读，和原样档谱面、简谱引擎输入（`jianpuInputOfDoc`）是同一批对象。
+// 这里经排版行视图 `docView` 读，和原样档谱面、简谱输入模型（`jianpuInputOfDoc`）是同一批对象。
 // **口径逐条同 `jianpuinput.ts::rowsPart`**（`forExpanded` 那一份：带歌词的声部当主旋律、同号歌词顺延），
-// 本轮只换输入、不动判据，靠 `scripts/phrase-dual-check.mjs --jianpu` 双跑逐项一致。
+// 本轮只换输入、不动判据，靠 `../dev/scripts/phrase-dual-check.mjs` 双跑逐项一致。
 // 断点集合以这里拼出的对象为键，`idOf` 把它们换回元素 id。
 
 import { Fraction } from "../common/fraction";
-import type { ElementId, ScoreDoc } from "../model/doc";
+import type { ElementId, Measure as DocMeasure, ScoreDoc } from "../model/doc";
+import { sectionMarkOf } from "../model/helpers";
 import { BarStyle, StartStopDiscontinue } from "../score/enums";
 import { MusicCommon, applyJpPitch, type JpKeyState } from "../score/jppitch";
 import type { PhraseChord, PhraseMeasure, PhrasePart } from "../score/phraseinput";
 import { linesOfVoice, marksAt, nextSyllables, takesLyric, voiceNumbers } from "./ast";
 import type { LyricLine, Mark, NoteElement, ScoreLine } from "./ast";
-import { docView } from "./slots";
+import { docView, type SlotRef } from "./slots";
 
 /** `extend`：续记号，只试听填（`model/playsong.ts::markExtends`） */
 interface LyricOut { text: string; number: number; refrain: boolean; extend?: boolean }
@@ -187,7 +188,10 @@ export function buildMeasures(
     return m;
   };
 
+  /** 已读过段落标记的模型小节（小节中间换行时一个模型小节跨两行，只在头一段读） */
+  const sectionSeen = new Set<DocMeasure>();
   for (const line of lines) {
+    const refs = (line as ScoreLine & { refs?: readonly SlotRef[] }).refs;
     const lyrics: readonly LyricLine[] = renumberVerses ? distinctVerses(line.lyrics) : line.lyrics;
     const cursors = lyrics.map(() => 0);
     const voltas = line.marks.filter((mk) => mk.type === "volta");
@@ -201,6 +205,7 @@ export function buildMeasures(
       const noteJumps = (mea: MeasureOut, onBarline: boolean): void => {
         if (!("ornaments" in el)) return;
         for (const orn of el.ornaments) {
+          // MusicXML direction 投过来的 D.C. / Fine、123 左线上的 segno 也算（多段词 × D.C. 的展开口径见 `playorder.ts::jumpByVerse`）
           if (JUMP_NAMES.has(orn.name)) jumps.push({ name: orn.name, measure: measures.indexOf(mea), onBarline });
         }
       };
@@ -247,6 +252,9 @@ export function buildMeasures(
             break;
           default: mea.barline = BarStyle.NONE;
         }
+        // 下一小节左线上的反复起点挂在这条线上（`|] |:` 这类两条线并成一条，`slots.ts::carryToPrevBarline`），
+        // 漏了的话后面那个 `:|` 找不到起点、跳回曲首（116《献上感恩》第二段反复）
+        if (el.repeatForwardAfter) pendingRepeatForward = true;
         newMeasureNeeded = true;
         if (pitch) pitch.key.alter = {}; // 临时记号到小节线为止
         return;
@@ -266,6 +274,12 @@ export function buildMeasures(
       }
       closeVolta(mea);
       noteJumps(mea, false);
+      // 段落标记从模型小节读（`sectionMarkOf`，与 MusicXML 那条路 `phrasedoc.ts` 同一个判据）
+      const dm = refs?.[index]?.measure;
+      if (dm && !sectionSeen.has(dm)) {
+        sectionSeen.add(dm);
+        mea.sectionMark ??= sectionMarkOf(dm);
+      }
 
       const number = el.sound === "rhythm" ? "0" : String(el.pitch);
       const ch: ChordOut = {

@@ -86,7 +86,7 @@ export const GlyphCodes = {
   // Repeats / navigation
   segno: String.fromCharCode(0xe047),
   coda: String.fromCharCode(0xe048),
-  // Dynamics (单字母组合成 mf/sfz 等；见 mixed/layoutpass.ts::convertDynamicsStr)
+  // Dynamics (单字母组合成 mf/sfz 等；见 engrave/dynamics.ts::dynamicGlyphs)
   dynamicPiano: String.fromCharCode(0xe520),
   dynamicMezzo: String.fromCharCode(0xe521),
   dynamicForte: String.fromCharCode(0xe522),
@@ -188,6 +188,14 @@ export interface GlyphBBox {
 }
 
 export interface GlyphAnchor {
+  /** 符尾接符干的那一点（向上 / 向下的符尾）。 */
+  stemUpNW?: [number, number];
+  stemDownSW?: [number, number];
+  /** 短倚音斜线的两端（向上的符尾 SW→NE、向下的 NW→SE）。 */
+  graceNoteSlashSW?: [number, number];
+  graceNoteSlashNE?: [number, number];
+  graceNoteSlashNW?: [number, number];
+  graceNoteSlashSE?: [number, number];
   cutOutSE?: [number, number];
   cutOutNW?: [number, number];
   cutOutNE?: [number, number];

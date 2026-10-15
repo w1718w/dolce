@@ -110,11 +110,7 @@ function baseName(app: App): string {
   // 五线谱/混排档不重排简谱那侧（在这两档里打开的文档，简谱排版器还停在上一份），标题取混排排版器的
   const mixedTitle = app.mode === "mixed" ? app.mixedPainter?.title.split("\n")[0] : "";
   if (mixedTitle) return mixedTitle;
-  if (app.adapter.caps.layout === "scoredoc") {
-    const t = app.puScore()?.title.split("\n")[0];
-    if (t) return t;
-  }
-  return app.painter.score.title.split("\n")[0] || t("file.untitled");
+  return app.painter.title.split("\n")[0] || t("file.untitled");
 }
 
 export async function exportCurrentPagePng(app: App): Promise<void> {
@@ -135,7 +131,7 @@ export async function exportMidi(app: App): Promise<void> {
 export async function exportPptx(app: App): Promise<void> {
   // 一律按**展开档**出片（两种格式同一条展开档排版）：屏幕在原样档也导得出 PPT 观感，
   // 切到展开档预览则是所见即所得。字号/纸张取展开档那一套设置。
-  const bytes = await buildPptx(pptxPainter(app), app.colorsOf("expanded").bg);
+  const bytes = await buildPptx(pptxPainter(app).pptxSource, app.colorsOf("expanded").bg);
   await saveBytes(
     bytes,
     `${baseName(app)}.pptx`,
@@ -149,15 +145,10 @@ export async function exportPptx(app: App): Promise<void> {
 export function pptxPainter(app: App): ScorePainter {
   const cur = app.painter;
   if (cur.renderer === "jianpu" && cur.jianpuView === "expanded") return cur;
-  const score = app.adapter.caps.layout === "scoredoc" ? app.puScore(true) : cur.score;
-  if (!score) throw new Error(t("export.noPuLines"));
+  const req = app.expandedRequest();
+  if (!req) throw new Error(t("export.noPuLines"));
   const p = new ScorePainter(cur.resources);
-  p.loadSync({
-    view: "expanded",
-    score,
-    breakDesc: app.adapter.caps.layout === "scoredoc" ? null : app.breakDesc,
-    style: app.styleOf("expanded"),
-  });
+  p.loadSync(req);
   return p;
 }
 

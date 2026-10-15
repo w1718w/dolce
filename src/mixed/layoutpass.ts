@@ -1,6 +1,7 @@
 // 混排 `StaffLayout` 读入的公共部分：纯函数小工具与各声部读完之后的版面 pass。
 // `layout.ts` 把各声部读成 `StaffLayout` 后调这里的 `finishMixedScore` 排版。从 musicpp mxml/parser.cpp 移植，判据原样。
 
+import { latinWordBreak } from "../engrave/syllable";
 import { Fraction } from "../common/fraction";
 import { Font } from "../layout/font";
 import { GlyphCodes, type MetaData } from "../smufl/smufl";
@@ -11,6 +12,8 @@ import {
   fEq,
   LCR,
   ChordLayout,
+  LyricLayout,
+  type PartLayout,
   StaffLayout,
   MPage,
   Notation,
@@ -44,26 +47,6 @@ export function barGlyphFromStyle(style: string): BarGlyph | null {
   }
 }
 
-/** 力度元素名（如「mf」「sfz」）逐字母 → Bravura 力度字形串，对齐 loader.cpp::convertDynamicsStr。 */
-export function convertDynamicsStr(s: string): string {
-  const map: Record<string, string> = {
-    p: GlyphCodes.dynamicPiano,
-    m: GlyphCodes.dynamicMezzo,
-    f: GlyphCodes.dynamicForte,
-    r: GlyphCodes.dynamicRinforzando,
-    s: GlyphCodes.dynamicSforzando,
-    z: GlyphCodes.dynamicZ,
-    n: GlyphCodes.dynamicNiente,
-  };
-  let res = "";
-  for (const c of s) {
-    const g = map[c];
-    if (g === undefined) return ""; // 非标准力度名（musicpp 此处 assert），忽略
-    res += g;
-  }
-  return res;
-}
-
 /** <beat-unit> 音符类型 → 节拍记号字形，对齐 loader.cpp::makeMetronomeStr（仅四分音符）。 */
 export function metNoteGlyph(noteType: string): string {
   // musicpp 只实现了四分音符；其余暂以四分音符字形兜底。
@@ -95,10 +78,38 @@ const AUTO_LEFT_DATA = 16; // 小节左侧到首音符的名义留白（折行�
 const AUTO_NOTE_PAD = 8;    // 铺开音符时两端留白
 const AUTO_LYRIC_SPACE = 6;  // 相邻两个字之间至少留的空
 const AUTO_HARMONY_SPACE = 8; // 相邻两个和弦符号之间至少留的空
+const AUTO_GRACE_STEP = 14;   // 倚音一个占多宽（小号符头 + 符尾 + 间隙；tenths）
+const AUTO_GRACE_GAP = 14;    // 最靠近主音的那个倚音与主音之间再多留的空（倚音的符尾朝右伸；8 时单颗倚音的符尾贴到主音符头）
+
+/** 一个和弦前（`after` = 后）挨着的那串倚音：同声部同谱表、在元素流里紧挨着它的 grace 和弦，按离它由远到近排。 */
+function gracesOf(md: { chords: readonly ChordLayout[] }, ch: ChordLayout, after: boolean): ChordLayout[] {
+  const list = md.chords;
+  const i = list.indexOf(ch);
+  const out: ChordLayout[] = [];
+  const same = (c: ChordLayout): boolean => c.src.voice === ch.src.voice && c.src.staff === ch.src.staff;
+  if (!after) {
+    for (let k = i - 1; k >= 0; k--) {
+      const c = list[k]!;
+      if (!same(c)) continue;
+      if (!c.grace || c.src.grace?.after) break;
+      out.unshift(c);
+    }
+  } else {
+    for (let k = i + 1; k < list.length; k++) {
+      const c = list[k]!;
+      if (!same(c)) continue;
+      if (!c.grace || !c.src.grace?.after) break;
+      out.push(c);
+    }
+  }
+  return out;
+}
 
 function autoSlotWidth(durQuarters: number): number {
   const d = durQuarters > 0 ? durQuarters : 0.25;
-  return Math.max(AUTO_MIN_SLOT, 30 * Math.pow(d, 0.6));
+  // 长音每拍至少一格（简谱层的数字 + 增时线一拍占一格）：只按时值的次线性增长给，转调转拍后那小节里的附点二分
+  // 只有 58，`5 - -` 两条增时线挤成一条、贴到小节线上
+  return Math.max(AUTO_MIN_SLOT, 30 * Math.pow(d, 0.6), Math.floor(d) * AUTO_MIN_SLOT);
 }
 
 /** 该 MusicXML 是否自带版面坐标（任一小节有 width 或任一音符有 default-x）。读谱之前就要知道（弧的缺省朝向跟它走），
@@ -116,9 +127,17 @@ function autoMeasureSlots(score: StaffLayout, mi: number): Slot[] {
   const hit = cache[mi];
   if (hit) return hit;
   const durAt = new Map<string, { offset: Fraction; dur: number }>();
+  const graceLead = new Map<string, number>();
+  const graceTail = new Map<string, number>();
   const textAt = new Map<string, number>();
+  /** 只算和弦符号要的槽宽（连音段里歌词按各自的行另算） */
+  const harmAt = new Map<string, number>();
   const harms: { t: number; w: number }[] = [];
   const minText = (key: string, w: number) => textAt.set(key, Math.max(textAt.get(key) ?? 0, w));
+  const minHarm = (key: string, w: number) => {
+    minText(key, w);
+    harmAt.set(key, Math.max(harmAt.get(key) ?? 0, w));
+  };
   const eng = score.options;
   const harmFont = new Font(eng.wordFont, eng.harmonySize / score.scaling);
   for (const part of score.parts) {
@@ -131,8 +150,27 @@ function autoMeasureSlots(score: StaffLayout, mi: number): Slot[] {
       const prev = durAt.get(key);
       // 同 offset 多声部/和弦取最短时值定间距（较密者主导）。
       if (!prev || dq < prev.dur) durAt.set(key, { offset: ch.offset, dur: dq });
+      // 倚音要的地方：前倚音占这个音**前面**那一截，后倚音占它后面那一截
+      const nb = gracesOf(md, ch, false).length, na = gracesOf(md, ch, true).length;
+      const lead = nb ? nb * AUTO_GRACE_STEP + AUTO_GRACE_GAP : 0;
+      const tail = na ? na * AUTO_GRACE_STEP + AUTO_GRACE_GAP : 0;
+      if (lead) graceLead.set(key, Math.max(graceLead.get(key) ?? 0, lead));
+      if (tail) graceTail.set(key, Math.max(graceTail.get(key) ?? 0, tail));
     }
     for (const l of md.lyrics) if (!l.empty) minText(l.offset.toString(), l.width + AUTO_LYRIC_SPACE);
+    // 西文词与词之间留一个空格（判据同另两个引擎，engrave/syllable.ts::latinWordBreak）：歌词按音符居中，
+    // 相邻两个音节的中心距至少「各半宽之和 + 字距 + 空格」，`十love` 才不粘成一个词
+    // 同一段里本小节相邻的两个音节（`LyricLayout.next` 只连一个词内部的音节，词与词之间要自己排）
+    const byVerse = new Map<string, typeof md.lyrics>();
+    for (const l of md.lyrics) if (!l.empty) byVerse.set(l.num, [...(byVerse.get(l.num) ?? []), l]);
+    for (const list of byVerse.values()) {
+      list.sort((a, b) => a.offset.compareTo(b.offset));
+      for (let k = 0; k + 1 < list.length; k++) {
+        const l = list[k]!, n = list[k + 1]!;
+        if (!l.end || !l.offset.compareTo(n.offset) || !latinWordBreak(l.text, n.text)) continue;
+        minText(l.offset.toString(), (l.width + n.width) / 2 + AUTO_LYRIC_SPACE + l.font.measureText(" "));
+      }
+    }
     for (const h of md.harmonies) {
       harms.push({ t: h.offset.toFloat(), w: harmFont.measureText(h.asPlainText()) });
     }
@@ -155,22 +193,134 @@ function autoMeasureSlots(score: StaffLayout, mi: number): Slot[] {
     if (b.t <= c1 + 1e-9) {
       // a、b 在同一个音的槽里（或 b 正落在下一个音上）：slot × (b − a)/(c1 − c0) ≥ need
       const f = (b.t - a.t) / (c1 - c0 || 1);
-      if (f > 0) minText(entries[ia]!.offset.toString(), need / f);
+      if (f > 0) minHarm(entries[ia]!.offset.toString(), need / f);
     }
   }
   for (const h of harms) {
     const e = entries.find((x) => Math.abs(x.offset.toFloat() - h.t) < 1e-9);
-    if (e) minText(e.offset.toString(), h.w + AUTO_HARMONY_SPACE);
+    if (e) minHarm(e.offset.toString(), h.w + AUTO_HARMONY_SPACE);
   }
   const slots: Slot[] = [];
-  let nat = 0;
-  for (const e of entries) {
-    const slot = Math.max(autoSlotWidth(e.dur), textAt.get(e.offset.toString()) ?? 0);
+  // 首音带前倚音：整串往右让出那截
+  let nat = entries.length ? graceLead.get(entries[0]!.offset.toString()) ?? 0 : 0;
+  /** 后倚音与**下一个音的前倚音**要的那截（倚音不挤占音符之间的节奏距离） */
+  const gracesAfter = (k: number): number => {
+    const next = entries[k + 1];
+    return (graceTail.get(entries[k]!.offset.toString()) ?? 0) + (next ? graceLead.get(next.offset.toString()) ?? 0 : 0);
+  };
+  const spans = tupletSpans(score, mi);
+  for (let k = 0; k < entries.length; k++) {
+    const e = entries[k]!;
+    const span = spans.find((sp) => !sp.s.compareTo(e.offset));
+    if (span) {
+      // 连音组（与别的声部重叠的几组并成一段）：段内 x 随时间线性走——组内等分，与外部拍位只在组首组尾对齐。
+      // 逐拍位累加槽宽的话，三连音八分（0、⅓、⅔）与另一声部的普通八分（0、½）合成四个槽，三个音排得一疏一密
+      let j = k;
+      while (j + 1 < entries.length && entries[j + 1]!.offset.compareTo(span.e) < 0) j++;
+      const w = tupletSpanWidth(score, mi, span, entries.slice(k, j + 2).map((x) => x.offset), (i) => gracesAfter(k + i), harmAt);
+      const s = span.s.toFloat(), len = span.e.toFloat() - s;
+      const x0 = nat;
+      for (let i = k; i <= j; i++) {
+        const at = x0 + (w * (entries[i]!.offset.toFloat() - s)) / len;
+        if (i > k) slots[slots.length - 1]!.slot = at - slots[slots.length - 1]!.nat;
+        slots.push({ offset: entries[i]!.offset, nat: at, slot: 0 });
+      }
+      // 组尾之后：组尾正好是下一个拍位就落在段末；不是（另一声部的长音跨过组尾）就照常按末音的槽宽再取大
+      const last = slots[slots.length - 1]!;
+      const tail = Math.max(autoSlotWidth(entries[j]!.dur), textAt.get(entries[j]!.offset.toString()) ?? 0) + gracesAfter(j);
+      nat = Math.max(x0 + w, last.nat + tail);
+      last.slot = nat - last.nat;
+      k = j;
+      continue;
+    }
+    const slot = Math.max(autoSlotWidth(e.dur), textAt.get(e.offset.toString()) ?? 0) + gracesAfter(k);
     slots.push({ offset: e.offset, nat, slot });
     nat += slot;
   }
   cache[mi] = slots;
   return slots;
+}
+
+/** 本小节里的连音组跨度 [组首, 组尾音的终点)，各声部重叠的并成一段；跨小节、零长的不算。 */
+function tupletSpans(score: StaffLayout, mi: number): { s: Fraction; e: Fraction }[] {
+  const raw: { s: Fraction; e: Fraction }[] = [];
+  for (const part of score.parts) {
+    const md = part.measures[mi];
+    if (!md) continue;
+    for (const t of part.tuplets) {
+      if (!t.startNote || !t.endNote) continue;
+      const a = t.startChord(), b = t.endChord();
+      if (a.measure !== md || b.measure !== md || a.grace || b.grace) continue;
+      const e = b.offset.plus(b.dur);
+      if (e.compareTo(a.offset) > 0) raw.push({ s: a.offset, e });
+    }
+  }
+  raw.sort((x, y) => x.s.compareTo(y.s));
+  const out: { s: Fraction; e: Fraction }[] = [];
+  for (const r of raw) {
+    const prev = out[out.length - 1];
+    if (prev && r.s.compareTo(prev.e) < 0) {
+      if (r.e.compareTo(prev.e) > 0) prev.e = r.e;
+    } else out.push({ s: r.s, e: r.e });
+  }
+  return out;
+}
+
+/** 两个不同声部的音挨得再近也要留的距离（tenths，约一个符头宽）：段内线性铺开时另一声部的音会插在组内两音之间 */
+const AUTO_CROSS_VOICE_GAP = 12;
+
+/**
+ * 连音段要多宽：段内 x 随时间线性走，每个音到**同一声部**下一个音的距离要放得下它自己的槽宽、每个字到同一段下一个字
+ * 要放得下字宽，整段宽就是各行按比例折算后的最大值（下一件在段外的按时间比例分摊）。别的声部的字不算——
+ * 它们排在各自的歌词行上，按拍位合并的字宽只会把组里某一截撑大。
+ * `onsets` 是段内各拍位，后面多带一个段后的拍位（没有就到段末为止）；和弦符号与倚音按全体拍位相邻算。
+ */
+function tupletSpanWidth(
+  score: StaffLayout, mi: number, span: { s: Fraction; e: Fraction },
+  onsets: Fraction[], gracesAfter: (i: number) => number, harmAt: ReadonlyMap<string, number>,
+): number {
+  const s = span.s.toFloat(), e = span.e.toFloat(), len = e - s;
+  const inSpan = (t: number) => t >= s - 1e-9 && t < e - 1e-9;
+  let w = 0;
+  /** 拍位 a 到 b 之间要 width 宽：b 在段外时只按段内那截时间的比例分摊（跨过组尾的长音不把整个槽宽压进这一段） */
+  const need = (a: number, b: number, width: number) => { if (b > a + 1e-9) w = Math.max(w, (width * len) / (b - a)); };
+  // 一行里相邻的两件东西：各声部的音（按时值）、各声部各段的歌词（按字宽）。拍位 → 这一拍要的宽与它的终点
+  const rows = new Map<string, Map<number, { width: number; end: number }>>();
+  const put = (key: string, t: number, width: number, end: number) => {
+    if (!inSpan(t)) return;
+    const m = rows.get(key) ?? new Map<number, { width: number; end: number }>();
+    rows.set(key, m);
+    const cur = m.get(t);
+    m.set(t, { width: Math.max(cur?.width ?? 0, width), end: Math.max(cur?.end ?? 0, end) });
+  };
+  score.parts.forEach((part, pi) => {
+    const md = part.measures[mi];
+    if (!md) return;
+    const endOf = (ch: ChordLayout) => ch.offset.plus(ch.dur).toFloat();
+    for (const ch of md.chords) {
+      if (!ch.grace) put(`n${pi}/${ch.src.staff}/${ch.voice}`, ch.offset.toFloat(), autoSlotWidth(ch.dur.toFloat()), endOf(ch));
+    }
+    for (const l of md.lyrics) if (!l.empty) put(`l${pi}/${l.num}`, l.offset.toFloat(), l.width + AUTO_LYRIC_SPACE, endOf(l.chord));
+  });
+  // 行内下一件也在本小节的就到它为止（段外的照样按比例），最后一件到它那个音的终点
+  const after = new Map<string, number>();
+  score.parts.forEach((part, pi) => {
+    const md = part.measures[mi];
+    if (!md) return;
+    const near = (key: string, t: number) => { if (t >= e - 1e-9) after.set(key, Math.min(after.get(key) ?? Infinity, t)); };
+    for (const ch of md.chords) if (!ch.grace) near(`n${pi}/${ch.src.staff}/${ch.voice}`, ch.offset.toFloat());
+    for (const l of md.lyrics) if (!l.empty) near(`l${pi}/${l.num}`, l.offset.toFloat());
+  });
+  for (const [key, m] of rows) {
+    const ts = [...m.keys()].sort((a, b) => a - b);
+    ts.forEach((t, i) => need(t, ts[i + 1] ?? after.get(key) ?? m.get(t)!.end, m.get(t)!.width));
+  }
+  // 全体相邻拍位：不同声部的音不叠在一起，和弦符号、倚音的地方照留
+  const ts = onsets.map((o) => o.toFloat());
+  ts.forEach((t, i) => {
+    if (inSpan(t)) need(t, Math.min(ts[i + 1] ?? e, e), Math.max(AUTO_CROSS_VOICE_GAP, harmAt.get(onsets[i]!.toString()) ?? 0) + gracesAfter(i));
+  });
+  return w;
 }
 
 // 断行的代价（整体最优，见 autoLayoutWidths）。按下面两个用例校准：
@@ -194,7 +344,10 @@ const LAST_LINE_MIN_FILL = 0.5;
 function autoLayoutWidths(score: StaffLayout, input: LayoutInput): Set<number> {
   const n = score.measures.length;
   const w: number[] = [];
-  for (let i = 0; i < n; i++) w[i] = score.measures[i].width = autoNaturalWidth(score, i);
+  for (let i = 0; i < n; i++) {
+    score.measures[i].width = autoNaturalWidth(score, i);
+    w[i] = score.measures[i].width + midAttrWidth(score, i); // 折行按带转调转拍号的宽量
+  }
   const preferred = new Set<number>();
   const hard = new Set<number>();
   /** 小节中间换行拆出的后半（`implicit` 且起新行）：拆它就是为了在这儿断，不断就在行中间留一道隐藏线缝 */
@@ -289,6 +442,25 @@ function autoLead(score: StaffLayout, mi: number): number {
   return 5 + 32 + key + time + AUTO_ATTR_GAP;
 }
 
+/** 行中（不在行首）的转调、转拍号要占的宽：`layoutAttr` 从数据区里扣，自然宽不算它的话，那一小节留给音符的地方
+ *  就被吃掉一大截（转调转拍后的 `5 - -` 两条增时线挤成一条、贴到小节线上）。 */
+function midAttrWidth(score: StaffLayout, mi: number): number {
+  if (mi === 0) return 0;
+  const mif = score.measures[mi]!;
+  let key = 0;
+  let time = 0;
+  for (const part of score.parts) {
+    for (const ps of part.staves) {
+      if (ps.keyChange(mif.offset)) {
+        const ks = ps.getKey(mif.offset);
+        key = Math.max(key, keyChangeWidthCalc(ks.cancel, ks.fifths));
+      }
+      if (ps.timeChange(mif.offset)) time = Math.max(time, timeSigWidthCalc(ps.getTime(mif.offset), score.options.meta));
+    }
+  }
+  return key + time;
+}
+
 /** 折行后拉伸每个 system 的小节宽度以铺满页宽（末行保持自然宽，不拉伸）。 */
 function autoJustifySystems(score: StaffLayout): void {
   const d = score.defaults;
@@ -298,15 +470,18 @@ function autoJustifySystems(score: StaffLayout): void {
     const avail = d.pageWidth - d.leftMargin - d.rightMargin - sys.leftMargin - sys.rightMargin;
     // 行首小节预留谱号/调号/拍号占位，使拉伸后仍有容纳区。
     sys.measures[0].width += autoLead(score, sys.firstMeasure);
+    // 行中转调转拍号那一截不拉伸，另加在小节上（行首的已在 autoLead 里）
+    const attr = sys.measures.map((m, k) => (k === 0 ? 0 : midAttrWidth(score, m.index)));
     let sum = 0;
     for (const m of sys.measures) sum += m.width;
     if (sum <= 0) continue;
+    const attrSum = attr.reduce((a, b) => a + b, 0);
     const isLast = si === score.systems.length - 1;
     // 末行也拉满，但最多拉到自然宽的 LAST_LINE_MAX_STRETCH 倍：太短的末行（剩一两个小节）照拉满就稀得不成样子，
     // 拉到上限为止、右边留空
-    let scale = avail / sum;
+    let scale = Math.max(0, avail - attrSum) / sum;
     if (isLast && scale > LAST_LINE_MAX_STRETCH) scale = LAST_LINE_MAX_STRETCH;
-    for (const m of sys.measures) m.width *= scale;
+    sys.measures.forEach((m, k) => { m.width = m.width * scale + attr[k]!; });
   }
 }
 
@@ -335,6 +510,14 @@ function autoPlaceNotes(score: StaffLayout): void {
         const x = xOf.get(ch.offset.toString());
         if (x === undefined) continue;
         for (const nt of ch.notes) nt.x = x;
+        // 倚音挨着主音排：前倚音在左、由近到远一个一个往左数，后倚音在右（地方在槽宽里留过了）
+        const before = gracesOf(md, ch, false);
+        before.forEach((g, k) => {
+          for (const nt of g.notes) nt.x = x - AUTO_GRACE_GAP - (before.length - k) * AUTO_GRACE_STEP;
+        });
+        gracesOf(md, ch, true).forEach((g, k) => {
+          for (const nt of g.notes) nt.x = x + AUTO_GRACE_GAP + (k + 1) * AUTO_GRACE_STEP;
+        });
       }
       // NoteEntry（加线/附点/临时记号）在解析期 layoutNotes 时按未定位的 x(-1) 算过一次，
       // 加线会画到谱表最左端而非音符下方；音符 x 定好后按最终位置重排。
@@ -363,11 +546,87 @@ function autoPlaceNotes(score: StaffLayout): void {
   }
 }
 
-/** 歌词 y：逐 system 取该行符头/朝下符干/下方记号/下方连音数字/下方 slur-tie 的最低点，各 verse 行整齐地排在它下面；
- *  离谱表底线至少 `AUTO_LYRIC_STAFF_GAP`。
+const AUTO_WEDGE_GAP = 8; // 谱表下方最低处到松叶上缘的净空（tenths）
+const WEDGE_HALF = 15 / 2; // 松叶全开口的一半（同 render.ts::drawWedge）
+
+/** 没给 default-y 的松叶（渐强/渐弱）：照五线谱的惯例放在谱表**下方**，起头那一行最低处之下一道空。
+ *  缺省的 0 是谱表第一线，松叶的开口正压在线上。只管第一谱表（混排的简谱层在它上方）。 */
+function autoPlaceWedges(score: StaffLayout): void {
+  for (const part of score.parts) {
+    for (const w of part.wedges) {
+      if (!w.autoY || w.staff !== 0) continue;
+      const sys = score.systems.find((s) => s.contains(w.startTick));
+      if (!sys) continue;
+      w.ypos = systemLowest(score, sys, false) + AUTO_WEDGE_GAP + WEDGE_HALF;
+    }
+  }
+}
+
+/** 歌词 y：逐 system、**逐声部逐谱表**取那一谱表往下伸的最低点（`systemLowest`），各 verse 行整齐地排在它下面；
+ *  离谱表底线至少 `AUTO_LYRIC_STAFF_GAP`。歌词坐标相对它自己的谱表，一个声部的低音只推它自己的歌词。 */
+function autoPlaceLyricsY(score: StaffLayout): void {
+  const font = score.defaults.lyricFont;
+  const ascent = -font.metrics.ascent;
+  const row = Math.max(AUTO_LYRIC_ROW, font.size * 1.1);
+  for (const sys of score.systems) {
+    for (const part of score.parts) {
+      const byStaff = new Map<number, LyricLayout[]>();
+      for (const lrc of systemLyrics(score, sys, [part])) {
+        const list = byStaff.get(lrc.staff) ?? [];
+        list.push(lrc);
+        byStaff.set(lrc.staff, list);
+      }
+      for (const [staff, lyrics] of byStaff) {
+        const base = Math.max(systemLowest(score, sys, true, [part], staff) + AUTO_LYRIC_GAP, 40 + AUTO_LYRIC_STAFF_GAP) + ascent;
+        for (const lrc of lyrics) {
+          const verse = Math.max(0, (parseInt(lrc.num, 10) || 1) - 1);
+          lrc.y = -(base + verse * row);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 带版面坐标的谱：歌词照谱里给的 y 排，但**只许往下让、不许往上提**——某一行里音符低（加线下的音、朝下的符干、
+ * 下方的弧）压到首行歌词字顶时，整行歌词一起往下挪到让开为止，净空与自动排版同一个（`AUTO_LYRIC_GAP`）。
+ * 出版软件的坐标是按它自己的字体与字号定的，换成本工程的歌词字体后常常贴到音符上（470《出到营外》、260《感恩的泪》）。
+ */
+function clearLyricsBelowNotes(score: StaffLayout): void {
+  const ascent = -score.defaults.lyricFont.metrics.ascent;
+  // **逐声部**算：各声部的谱表各自一行，一个声部的低音只该推它自己的歌词（合唱谱分 SATB 几个声部时）
+  for (const sys of score.systems) {
+    for (const part of score.parts) {
+      // 只挪第一谱表的：`systemLowest` 量的是第一谱表，别的谱表的歌词坐标相对它自己的谱表
+      const lyrics = systemLyrics(score, sys, [part]).filter((l) => l.staff === 0);
+      if (lyrics.length === 0) continue;
+      // 首行歌词字顶（cy 向下为正；lrc.y 是负的，越负越往下）
+      let top = Infinity;
+      for (const lrc of lyrics) top = Math.min(top, -lrc.y - ascent);
+      const need = systemLowest(score, sys, true, [part]) + AUTO_LYRIC_GAP;
+      if (top >= need) continue;
+      const dy = need - top;
+      for (const lrc of lyrics) lrc.y -= dy;
+    }
+  }
+}
+
+/** 这一行的歌词（`parts` 缺省 = 所有声部）。 */
+function systemLyrics(score: StaffLayout, sys: Sys, parts: readonly PartLayout[] = score.parts): LyricLayout[] {
+  const out: LyricLayout[] = [];
+  for (const mif of sys.measures) {
+    for (const part of parts) {
+      const md = part.measures[mif.index];
+      if (md) out.push(...md.lyrics);
+    }
+  }
+  return out;
+}
+
+/** 这一行第 `staff` 谱表（缺省第一谱表）往下伸到哪（cy 向下为正，谱表底线 = 40）：符头、朝下符干、下方记号、下方连音数字、下方 slur/tie。
  *  弧取画出来的真实曲线底（`slurEnds`/`tiedEnds` + `arcExtent`，与绘制同一份几何），跨行的弧按本行那一截。
  *  要在 `autoPlaceTuplets` 之后：连音数字的上下在那里才定。 */
-function autoPlaceLyricsY(score: StaffLayout): void {
+function systemLowest(score: StaffLayout, sys: Sys, withWedges = true, parts: readonly PartLayout[] = score.parts, staff = 0): number {
   const four = new Fraction(4);
   const eng = score.options;
   const chordLow = (ch: ChordLayout): number => {
@@ -377,51 +636,45 @@ function autoPlaceLyricsY(score: StaffLayout): void {
     if (ch.hasNotation(false)) low += 20;
     return low;
   };
-  const font = score.defaults.lyricFont;
-  const ascent = -font.metrics.ascent;
-  const row = Math.max(AUTO_LYRIC_ROW, font.size * 1.1);
-  for (const sys of score.systems) {
-    let maxDown = 40; // 谱表底线（cy 向下为正）
-    for (const mif of sys.measures) {
-      for (const part of score.parts) {
-        const md = part.measures[mif.index];
-        if (!md) continue;
-        for (const ch of md.chords) {
-          if (ch.grace || ch.rest || ch.notes[0]?.staff !== 0) continue;
-          maxDown = Math.max(maxDown, chordLow(ch));
-        }
-      }
-    }
-    for (const part of score.parts) {
-      // 混排里 slur/tie 画在简谱层上方；这时候谱表记法还没定（formatMixedScore 在后头），按五线谱的画法量，
-      // 画在下方的才算数
-      const arcs = [
-        ...part.slurs.filter((sl) => sl.startNote?.staff === 0).map((sl) => slurEnds(sys, eng, sl, Notation.Normal)),
-        ...part.tied.filter((t) => t.startNote?.staff === 0).map((t) => tiedEnds(sys, eng, t, Notation.Normal)),
-      ];
-      for (const e of arcs) if (e && !e.above) maxDown = Math.max(maxDown, arcExtent(e)[1] + 2);
-      const fsScale = eng.musicFont.size / 40;
-      for (const t of part.tuplets) {
-        if (t.above || !t.startNote || t.startNote.staff !== 0) continue;
-        if (!sys.contains(t.startTick) || !sys.contains(t.endTick)) continue;
-        const [ly, ry] = t.staffEnds();
-        const g0 = Tuplet.makeNumber(t.timeModification.denominator)[0] ?? "";
-        const numH = (smuflTop(eng.meta, g0) - smuflBottom(eng.meta, g0)) * fsScale;
-        maxDown = Math.max(maxDown, (ly + ry) / 2 + numH / 2 + 2);
-      }
-    }
-    const base = Math.max(maxDown + AUTO_LYRIC_GAP, 40 + AUTO_LYRIC_STAFF_GAP) + ascent;
-    for (const mif of sys.measures) {
-      for (const part of score.parts) {
-        const md = part.measures[mif.index];
-        if (!md) continue;
-        for (const lrc of md.lyrics) {
-          const verse = Math.max(0, (parseInt(lrc.num, 10) || 1) - 1);
-          lrc.y = -(base + verse * row);
-        }
+  let maxDown = 40; // 谱表底线（cy 向下为正）
+  for (const mif of sys.measures) {
+    for (const part of parts) {
+      const md = part.measures[mif.index];
+      if (!md) continue;
+      // 倚音也算：低倚音（`{5,,}`）带着加线落到谱表下面，不算的话歌词就排到它身上
+      for (const ch of md.chords) {
+        if (ch.rest || ch.notes[0]?.staff !== staff) continue;
+        maxDown = Math.max(maxDown, chordLow(ch));
       }
     }
   }
+  for (const part of parts) {
+    // 混排里 slur/tie 画在简谱层上方；这时候谱表记法还没定（formatMixedScore 在后头），按五线谱的画法量，
+    // 画在下方的才算数
+    const arcs = [
+      ...part.slurs.filter((sl) => sl.startNote?.staff === staff).map((sl) => slurEnds(sys, eng, sl, Notation.Normal)),
+      ...part.tied.filter((t) => t.startNote?.staff === staff).map((t) => tiedEnds(sys, eng, t, Notation.Normal)),
+    ];
+    for (const e of arcs) if (e && !e.above) maxDown = Math.max(maxDown, arcExtent(e)[1] + 2);
+    // 自动放到谱表下方的松叶（`autoPlaceWedges`）：歌词要排在它下面
+    if (withWedges) {
+      for (const w of part.wedges) {
+        if (!w.autoY || w.staff !== staff) continue;
+        if (!sys.contains(w.startTick) && !sys.contains(w.endTick)) continue;
+        maxDown = Math.max(maxDown, w.ypos + WEDGE_HALF + 2);
+      }
+    }
+    const fsScale = eng.musicFont.size / 40;
+    for (const t of part.tuplets) {
+      if (t.above || !t.startNote || t.startNote.staff !== staff) continue;
+      if (!sys.contains(t.startTick) || !sys.contains(t.endTick)) continue;
+      const [ly, ry] = t.staffEnds();
+      const g0 = Tuplet.makeNumber(t.timeModification.denominator)[0] ?? "";
+      const numH = (smuflTop(eng.meta, g0) - smuflBottom(eng.meta, g0)) * fsScale;
+      maxDown = Math.max(maxDown, (ly + ry) / 2 + numH / 2 + 2);
+    }
+  }
+  return maxDown;
 }
 
 /** 多谱表的谱（合唱 SATB、钢琴）：上一谱表往下伸的（歌词、低音、朝下符干）与本谱表往上伸的（高音、朝上符干）
@@ -443,7 +696,7 @@ function autoStaffDistances(score: StaffLayout): void {
 
 // 标题/词曲信息：OMR MusicXML 的 <credit> 无 default-x/-y/font-size，且标题只在
 // <work-title> 里（未作为 credit）→ 全挤在页首同一位置、无字号区分。此处按页面重排：
-// 标题居中大字，作词/作曲逐行居中小字，堆叠在标题下方。
+// 标题居中大字，作词/作曲逐行靠右小字，堆叠在标题下方。
 const AUTO_TITLE_FS = 20;   // pt
 const AUTO_CREDIT_FS = 11;  // pt
 const AUTO_LYRIC_GAP = 10;   // 音符/符干/弧最低点到首行歌词字顶的净空（tenths）
@@ -472,17 +725,21 @@ function autoLayoutHeader(score: StaffLayout): void {
     });
     yTop += tenths(titleFs) * 0.4;
   }
-  // 标题下依次：副标题 → 题下经文 → 其余 credit（作词/作曲…），各自按原顺序，居中小字
-  const push = (text: string, type: string | null, fs: number): void => {
+  // 标题下依次：副标题 → 题下经文（居中小字）→ 其余 credit（作词/作曲…，**靠右**，右缘对版心右缘），各自按原顺序。
+  // 署名靠右与简谱原样档的页眉同一个排法（`layout/jianpu/place/header.ts::placeHeader`，照 500 首）
+  const push = (text: string, type: string | null, fs: number, right = false): void => {
     yTop += tenths(fs) * 1.3;
-    creds.push({ page: 0, text, type, x: cx, y: d.pageHeight - yTop, justify: LCR.Center, fontSize: fs });
+    creds.push({
+      page: 0, text, type, x: right ? d.pageWidth - d.rightMargin : cx, y: d.pageHeight - yTop,
+      justify: right ? LCR.Right : LCR.Center, fontSize: fs,
+    });
   };
   // 标题已按 `score.title` 排了：credit 里的标题那条（带过版面坐标的谱改动后转自动铺排时就有）不再排第二遍
   const norm = (t: string): string => t.replace(/\s+/g, "");
   const rest = score.credits.filter((c) => c.text && !(score.title && (c.type === "title" || norm(c.text) === norm(score.title))));
   for (const c of rest) if (c.type === "subtitle") push(c.text, c.type, hf.subtitle?.size ?? creditFs);
   for (const t of score.scripture) push(t, "scripture", hf.scripture?.size ?? creditFs);
-  for (const c of rest) if (c.type !== "subtitle") push(c.text, c.type, creditFs);
+  for (const c of rest) if (c.type !== "subtitle") push(c.text, c.type, creditFs, true);
   score.credits = creds;
 }
 
@@ -651,11 +908,32 @@ function updateDataXPos(score: StaffLayout): void {
       // `<harmony relative-x>`：和弦相对拍位的横向微调（歌本改谱脚本写进 XML 的那种）
       for (const h of md.harmonies) h.x = mif.getEntPos(h.offset) + (xmlPos(h.src)?.relativeX ?? 0);
       for (const t of md.textBlocks) {
-        if (t.data.length && t.relative) t.x += mif.getEntPos(t.offset);
+        // 右对齐的跳转字（Fine、D.S.、D.C.、To Coda）右缘贴本小节的右小节线（用户定 2026-10-14，018）：
+        // 原文的 default-x 是按原排版的小节宽给的，重排后小节宽变了，照它画就探出线外
+        if (t.data.length && t.justify === LCR.Right && JUMP_WORD.test(t.data.map((d) => d.text).join(""))) {
+          t.x = mif.width - t.width();
+          t.justify = LCR.Left;
+          continue;
+        }
+        if (!t.data.length || !t.relative) continue;
+        // **写在小节末尾的（`D.S.` / `Fine`）与小节线右对齐**（同简谱 `layout.ts::addDirections`）：
+        // 小节末的拍位是最后一个音之后的数据区末端，照它左对齐就从线上探出去。只管自动铺排、
+        // 原文没写横坐标的（带版面的谱照原文）
+        if (score.autoLayout && fEq(t.offset, mif.dur) && t.justify !== LCR.Center && t.x === 0 && t.src && !xmlPos(t.src)?.relativeX && !xmlPos(t.src)?.defaultX) {
+          // 画文字块不按 justify 往左让（Sibelius 那条路是读谱时自己减的宽，`layout.ts::processDirection`），
+          // 所以直接给左缘：右缘落在小节线上
+          t.x = mif.width - t.width();
+          t.justify = LCR.Left;
+          continue;
+        }
+        t.x += mif.getEntPos(t.offset);
       }
     }
   }
 }
+
+/** 写在小节末的跳转字 */
+const JUMP_WORD = /^\s*(Fine|D\.\s*[CS]\..*|To\s*Coda.*)\s*$/i;
 
 // ---- 系统/分页/谱表间距：读 `<print>` 与 `<staff-details>` 的那三步 ----
 // 输入由 `layout.ts` 从 `ScoreDoc` 拼，判据原样。
@@ -903,7 +1181,9 @@ export function finishMixedScore(score: StaffLayout, input: LayoutInput, partGro
   layoutAttr(score);
   if (autoLayout) autoPlaceNotes(score);
   if (autoLayout) autoPlaceTuplets(score);
+  if (autoLayout) autoPlaceWedges(score);
   if (autoLayout) autoPlaceLyricsY(score);
+  else clearLyricsBelowNotes(score);
   if (autoLayout) autoStaffDistances(score);
   updateEntPos(score);
   updateDataXPos(score);

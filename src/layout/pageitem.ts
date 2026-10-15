@@ -2,13 +2,15 @@
 // painter.ts. Skija Path/Canvas/Font replaced by GraphicPath command lists,
 // the common geom types, and the Font abstraction (measurement via SVG/canvas).
 
-import { jpDot } from "./jpglyph";
+import { jpDot } from "../engrave/dot";
+import { arcHeight, calcSlurPoints, type SlurStyle } from "../engrave/arc";
 import { Point, Rect, Matrix33, newMatrix, Colors } from "../common/geom";
 import { pathTightBounds } from "../common/measure";
-import { LYRIC_SPLIT_PUNCT, type CompressMode } from "../common/cjkpunct";
+import type { CompressMode } from "../common/cjkpunct";
+import { syllableRun } from "../engrave/syllable";
 import { Font } from "./font";
 import { MetaData } from "../smufl/smufl";
-import type { LayoutOptions } from "./options";
+import type { ItemIdentity } from "./identity";
 
 export function getOrNull<T>(arr: T[], i: number): T | null {
   return i >= 0 && i < arr.length ? arr[i] : null;
@@ -24,6 +26,8 @@ export class PageItem {
   matrix: Matrix33 = newMatrix();
   classes = new Set<string>();
   data: unknown = null;
+  /** 身份标签：画的是谁（播放高亮、点选、可视化编辑按它认，见 `identity.ts`）。不进 SVG。 */
+  ident?: ItemIdentity;
   _selected = false;
   selectable = false;
 
@@ -238,7 +242,7 @@ export class TextFrame extends PageItem {
   /** 用**紧包围盒**而不是字体的全局 ascent/descent 来算 bound。
    *  给 SMuFL 那类字体用：Bravura 的 ascent−descent 是 4.02 em，一个和弦里夹一个升号，
    *  这一行就凭空高出四个字号——行距全乱。SmuflText 自己重写了 bound，
-   *  但 layout/harmony.ts 里的音乐段是普通 TextFrame，靠这个开关。 */
+   *  但 engrave/chord.ts 里的音乐段是普通 TextFrame，靠这个开关。 */
   inkBound = false;
   /** 逐字笔位（相对本 item 的 x，按码点）。null = 连排，由字体的 advance 说了算。
    *  标点挤压后的歌词用它——测量与绘制拿同一串坐标，`<text>` 的 `x` 直接吃它，
@@ -291,10 +295,16 @@ export class GraphicLine extends PageItem {
   }
 }
 
+/** SMuFL 文字要的两样：字（Bravura 那支）与字形元数据（量紧包围盒）。 */
+export interface SmuflSource {
+  smuflMeta: MetaData;
+  smuflFont: Font;
+}
+
 export class SmuflText extends TextFrame {
   asPath = false;
   meta: MetaData;
-  constructor(options: LayoutOptions) {
+  constructor(options: SmuflSource) {
     super();
     this.meta = options.smuflMeta;
     this.font = options.smuflFont;
@@ -322,7 +332,7 @@ export class SmuflText extends TextFrame {
 /**
  * 八度点 —— **一个实心矢量圆**，不是字体里的 `.` 字形。
  *
- * 三条简谱路统一走 `jpglyph.ts::jpDot`（文本谱本来就是自绘的，谱面与混排原先用
+ * 三条简谱路统一走 `engrave/dot.ts::jpDot`（文本谱本来就是自绘的，谱面与混排原先用
  * `.`／`·` 字形——同一个点三种画法，还得各自补一道「按墨迹而非 advance 居中」的修正）。
  * 圆没有这个问题：局部包围盒恒为 (0,0)–(2r,2r)，调用点照旧 `x − width/2` 居中即可。
  *
@@ -398,9 +408,34 @@ export class JpNumber extends TextFrame {
   }
 }
 
+/**
+ * 减时线：数字下的一道横线，第 `level` 层（1 起），从 `x0` 到 `x1`、中线在 `y`。
+ * 两端记着挂在哪两个数字上：导出 .pptx 时要按目标字体的数字宽把两端接回数字盒（`editor/pptx.ts`）。
+ */
+export class BeamLine extends GraphicLine {
+  constructor(
+    readonly level: number,
+    x0: number,
+    x1: number,
+    y: number,
+    width: number,
+    color: number,
+    readonly leftNum: JpNumber | null = null,
+    readonly rightNum: JpNumber | null = null,
+  ) {
+    super();
+    this.selectable = true;
+    this.x = x0;
+    this.p0 = new Point(0, y);
+    this.p1 = new Point(x1 - x0, y);
+    this.strokeWidth = width;
+    this.strokeColor = color;
+  }
+}
+
 export class Lyric extends TextFrame {
   _widths = [0, 0, 0];
-  /** 标点挤压的档（`LayoutOptions.punctCompress`）。 */
+  /** 标点挤压的档（`JianpuStyle.look.punctCompress`）。 */
   compress: CompressMode = "halfwidth";
   /** 段号（`JLyric.number`）。可视化编辑按它认出点中的是哪一段（叠排时各段同在一个音符格里） */
   verse = 0;
@@ -440,67 +475,16 @@ export class Lyric extends TextFrame {
     return Math.max(0, pen + this.font.charBound([...t][0]).left);
   }
   override update(): void {
-    // 切成「左标点 / 主体 / 右标点」三段。表在 common/cjkpunct.ts（含数字与半角冒号的
-    // 缘由写在那里）。**按码点切**，索引就是 `run()` 里 xs 的索引。
-    const chars = [...this.text];
-    let nl = 0, nc = chars.length;
-    if (chars.length > 1) {
-      const punct = LYRIC_SPLIT_PUNCT;
-      let pos = 0;
-      while (pos < chars.length && punct.includes(chars[pos])) pos++;
-      nl = pos;
-      while (pos < chars.length && !punct.includes(chars[pos])) pos++;
-      nc = pos - nl;
-    }
-    // 宽度取**挤压后**的笔位（`召：` 的冒号右半格、`“凡` 的引号左半格在这里就压掉了）。
-    // 三段宽按落笔点划分，段与段之间的挤压自然落在它该在的那一段里。
-    const { xs, width } = this.compress !== "none"
-      ? this.font.run(this.text, this.compress)
-      : { xs: chars.map((_, i) => this.font.measureText(chars.slice(0, i).join(""))), width: this.measureText() };
-    this.charXs = this.compress !== "none" && xs.length > 1 ? xs : null;
-    const at = (i: number): number => (i <= 0 ? 0 : i >= xs.length ? width : xs[i]);
-    this._widths[0] = at(nl);
-    this._widths[1] = at(nl + nc) - at(nl);
-    this._widths[2] = width - at(nl + nc);
+    // 「前标点 / 主体 / 后标点」三段与挤压后的逐字笔位走公共那一份（engrave/syllable.ts）
+    const run = syllableRun(this.text, this.font, this.compress);
+    const width = run.width;
+    this.charXs = run.xs;
+    this._widths[0] = run.lead;
+    this._widths[1] = run.body;
+    this._widths[2] = run.tail;
     this.width = width;
     this.height = this.font.size;
   }
-}
-
-/** 弧线（圆滑线 / 连音线）的样式参数。位置参数太多不可读，统一走这个对象。 */
-export interface SlurStyle {
-  /** 月牙形的最大厚度（musicpp 的 `lw0`），也是扁平式线宽的折算基准。 */
-  thickness: number;
-  color: number;
-  /** 整条弧随字号缩放（成书排版用小字号，绝对像素会显得过高）。默认 1。 */
-  heightScale?: number;
-  /** 细描边的线宽。默认 0.7。 */
-  outlineWidth?: number;
-  /** 弧高上限，**未乘 `heightScale` 的原始像素口径**。<=0 或省略 = 不封顶。 */
-  maxHeight?: number;
-  /** 弧高下限，同样是未乘 `heightScale` 的原始像素口径。<=0 或省略 = 只用公式自带的 1.2。 */
-  minHeight?: number;
-  /** 跨度超过它就改画扁平长连音线。<=0 或省略 = 一律画弧。 */
-  flatSpan?: number;
-  /** **这一条**强制走扁平式（按弧覆盖的音符个数判，见 `Line.addSlurTie`）。 */
-  forceFlat?: boolean;
-  /** 弧的**宽高比**（跨度 ÷ 弧顶高）超过它就改画扁平式。<=0 或省略 = 不看这一条。
-   *  跨度阈值是绝对宽度，跟不上字号与弧高上限的变化；宽高比才是「这条弧看着扁不扁」。 */
-  flatRatio?: number;
-  /** 扁平式**中段**的墨迹厚度（两端一样收尖）。省略 = `thickness * 0.45`。 */
-  flatLineWidth?: number;
-  /**
-   * 弧的开口朝向。默认 `"up"`——**简谱的弧一律在音符上方、开口朝下**，
-   * 三条简谱路（编辑器 / 成书重排 / 文本谱）都不设它。
-   * `"down"` 只给混排的五线谱层用：那里 slur/tie 跟着符干走，符干朝上时弧在音符下方。
-   */
-  side?: "up" | "down";
-  /**
-   * 中间挖掉 `[x0, x1]` 这一截（页面 x），只画两头——三连音的「两段弧」风格（数字坐在断口里，
-   * 见 `Line.addTuplet`）。切的是**同一条月牙**，所以音符那一端照样收尖、断口处是弧中段的厚度，
-   * 与同页的 slur 同一套形状语言，不另画等宽线。有 gap 时一律画弧，不走扁平式。
-   */
-  gap?: { x0: number; x1: number };
 }
 
 /** 三次贝塞尔在 `[a, b]` 这一段（de Casteljau 切两刀）。 */
@@ -541,49 +525,13 @@ export abstract class SlurTieBase extends Group {
    * 于是压在扁平线上（171《回家吧》末行的延长号）。
    */
   flatHx = 0;
-  /**
-   * 弧高（正数，实际画的时候取负——简谱的弧一律在音符上方、开口朝下）。
-   * **这是弧高的唯一算法**：谱面排版、成书重排、文本谱的绘制与纵向预留全走它。
-   *
-   * musicpp 的公式（按 jianpuFont≈28 调的绝对像素）在**短弧**上会算出负值
-   * ——dist < 10^(16/17) ≈ 8.7pt 时 h 变正，弧就翻过来开口朝上了，所以钳住下限。
-   *
-   * 上限是本项目加的（musicpp / 原 Kotlin 都没有）：对数虽然涨得慢却**没有上限**，
-   * 28px 字号下典型跨度（3 个音符步距，dist≈90）弧高 17px，整行的长弧（dist≈600）
-   * 冲到 31px，将近两倍——顶到上方的和弦符号上。参考 open-fanqie
-   * （renderer.ts:703，弧高恒定 10px 与跨度无关）封顶，短弧的手感一点不变。
-   */
-  static arcHeight(dist: number, o: Pick<SlurStyle, "heightScale" | "maxHeight" | "minHeight"> = {}): number {
-    const floor = o.minHeight !== undefined && o.minHeight > 0 ? o.minHeight : 1.2;
-    const raw = Math.max(Math.log10(Math.max(dist, 1e-6)) * 17 - 16, floor);
-    const cap = o.maxHeight !== undefined && o.maxHeight > 0 ? Math.max(o.maxHeight, floor) : Infinity;
-    return Math.min(raw, cap) * (o.heightScale ?? 1);
-  }
-
-  static calcSlurPoints(pl: Point, pr: Point, o: Pick<SlurStyle, "heightScale" | "maxHeight" | "minHeight" | "side"> = {}): [Point, Point, number] {
-    const xr = pr.x, xl = pl.x, yr = pr.y, yl = pl.y;
-    const dx = xr - xl, dy = yr - yl;
-    const square = dx * dx + dy * dy;
-    const dist = Math.sqrt(square);
-    const theta = Math.atan2(dy, dx);
-    const cos = Math.cos(-theta);
-    const sin = Math.sin(-theta);
-    const xlen = Math.min(dist * 0.04 + 10, dist * 0.25);
-    // 页面坐标 y 向下为正，所以「弧在上方」= 控制点 y 取负。
-    const h = SlurTieBase.arcHeight(dist, o) * (o.side === "down" ? 1 : -1);
-    let p1 = new Point(xlen, h).rotate(cos, sin);
-    let p2 = new Point(dist - xlen, h).rotate(cos, sin);
-    p1 = p1.offset(xl, yl);
-    p2 = p2.offset(xl, yl);
-    return [p1, p2, cos];
-  }
 
   init(pl: Point, pr: Point, style: SlurStyle): void {
     const dx = pr.x - pl.x, dy = pr.y - pl.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     // 「看着扁不扁」按**宽高比**判：弧高是对数公式加上下限算的，长跨度那头封了顶，
     // 所以跨度一长比值就迅速变大。绝对跨度那条阈值留着（两者取先满足的）。
-    const arcH = SlurTieBase.arcHeight(dist, style) * 0.75;
+    const arcH = arcHeight(dist, style) * 0.75;
     const flatByRatio = style.flatRatio !== undefined && style.flatRatio > 0
       && arcH > 0 && dist / arcH > style.flatRatio;
     if (style.gap) {
@@ -599,7 +547,7 @@ export abstract class SlurTieBase extends Group {
   }
 
   private initArc(pl: Point, pr: Point, style: SlurStyle): void {
-    const [pt0, pt1, cos] = SlurTieBase.calcSlurPoints(pl, pr, style);
+    const [pt0, pt1, cos] = calcSlurPoints(pl, pr, style);
     const clr = style.color;
     const lw0 = style.thickness / cos;
 
@@ -663,7 +611,7 @@ export abstract class SlurTieBase extends Group {
    */
   private initFlat(pl: Point, pr: Point, dist: number, style: SlurStyle): void {
     // 高度按阈值那条弧算；没设阈值（纯按音符个数强制扁平）就拿这一条自己的跨度算
-    const h = SlurTieBase.arcHeight(
+    const h = arcHeight(
       style.flatSpan !== undefined && style.flatSpan > 0 ? style.flatSpan : dist, style) * 0.75;
     // 钩的水平长度：短了会显得两端急折，长了中段的直线就没了。h 的 2.5 倍最耐看。
     const hx = Math.min(dist * 0.12, h * 2.5);
@@ -730,21 +678,6 @@ export class Tie extends SlurTieBase {
   endId: number | null = null;
 }
 export class Slur extends SlurTieBase {}
-
-/** LayoutOptions → SlurStyle。谱面这一路的弧全由它配参数，别在调用点各配各的。 */
-export function slurStyleOf(opt: LayoutOptions): SlurStyle {
-  return {
-    thickness: opt.slurTieThickness,
-    color: opt.color,
-    heightScale: opt.slurHeightScale,
-    outlineWidth: opt.slurOutlineWidth,
-    maxHeight: opt.slurMaxHeight,
-    minHeight: opt.slurMinHeight,
-    flatSpan: opt.slurFlatSpan < 0 ? 0 : opt.slurFlatSpan || opt.numberSize * 5,
-    flatRatio: opt.slurFlatRatio,
-    flatLineWidth: opt.slurFlatWidth,
-  };
-}
 
 /** 子树里带类 `cls` 的项，按页面树顺序；命中的项不再往下找。
  *  可视化编辑按它从音符格里认出挂在音符上的记号（和弦名 `chord-group`、装饰 `artic`…）。 */

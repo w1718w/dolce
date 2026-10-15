@@ -1,33 +1,38 @@
-// 简谱引擎那把尺子的适配器：computed `StyleSheet` → `LayoutOptions`。
+// 简谱尺子的折算：computed `StyleSheet` → `JianpuStyle`（engrave/jianpustyle.ts）。**全仓只此一处**（成书另由 `style/book.ts` 出同一类型）。
 //
-// 契约（沿用原来两个「样式表应用器」的）：**painter 构造之后、`resize` 之前调**；构造字号取 `jianpuFontSize`。
-// 只改常量的来源，不动 layout.ts 的算法——`jpDotRung` / `jpStaffTop` 那些都是 getter，覆写字段就全局生效。
-//
-// 顺序：前景色 / 标题 / 词曲字号 → 预设（`jianpu.preset`）→ 角色字体 → `jianpu.overrides`。
+// 顺序：出厂（`defaultJianpuStyle`）→ 前景色 / 标题 / 词曲字号 → 预设（`jianpu.preset`）→ 角色字体 → `jianpu.overrides`。
 // 预设里的公式**原样保留**（常量改存比例会出浮点尾差，见 sheet.ts 头注释）。
-import type { LayoutOptions } from "../layout/options";
-import { Font } from "../layout/font";
-import { LYRIC_STACK_RATIO } from "../layout/options";
-import { applyBookPreset } from "./book";
+//
+// 「排版方式」那几个开关（长图、标题排在首页顶上、整首重断行、页面装饰）不是尺寸，不进 `JianpuStyle`，
+// 由 `jianpuFlagsOf` 另给。
+import type { JianpuStyle } from "../engrave/jianpustyle";
+import { STACK_GAP_DEFAULT } from "../engrave/stack";
+import { bookJianpuStyle } from "./book";
 import { familyOfRole } from "./fonts";
 import { JIANPU_KEYS, ROLE_FONTS, type KeyDef } from "./keys";
 import type { StyleRole, StyleSheet } from "./sheet";
-import { isPagedSheet, PPTX_PAGE } from "./themes";
+import { PPTX_PAGE } from "./themes";
 import { pageMargins } from "./paper";
 import { headerFontsOf } from "./header";
 import { resolveLength } from "./units";
 
-/** 原样档标题/词曲字号 ÷ 基础字号。取出厂那三个数的比（48/28、36/28）——
- *  那一档不单独设标题与词曲，字号一改整块跟着缩放，观感与出厂值一致。 */
-const TITLE_RATIO = PPTX_PAGE.titleSize / PPTX_PAGE.fontSize;
-const CREDIT_RATIO = PPTX_PAGE.creditSize / PPTX_PAGE.fontSize;
+/** 系统中文字体栈（原版用苹方-简 / 微软雅黑，webview 里交给 CSS 字体栈）。 */
+const CJK = "PingFang SC, Microsoft YaHei, sans-serif";
 
-/** 角色字号（pt）。只认 pt——note 是 em 的基准，不能相对自己。 */
-function rolePt(sheet: StyleSheet, role: "note" | "title" | "credit" | "chord"): number | undefined {
+/** 标题/词曲字号 ÷ 音符字号（那两档不单独设标题与词曲，字号一改整块跟着缩放）。
+ *  展开档取投影片出厂那三个数的比（48/28、36/28）；原样档照 500 首成书实测（标题 22.03、署名 10.98、音符 12.08）。 */
+const HEAD_RATIOS = {
+  pptx: { title: PPTX_PAGE.titleSize / PPTX_PAGE.fontSize, credit: PPTX_PAGE.creditSize / PPTX_PAGE.fontSize },
+  original: { title: 22.03 / 12.08, credit: 10.98 / 12.08 },
+} as const;
+
+/** 角色字号（pt）。`note` 是 em 的基准、只认 pt；别的角色写 em 就是音符字号的几倍，折出来落到整数或 .5（样式值少有效位）。 */
+function rolePt(sheet: StyleSheet, role: StyleRole, notePt = NaN): number | undefined {
   const v = sheet.roles[role]?.size;
   if (v === undefined) return undefined;
-  const pt = resolveLength(v, { em: NaN, sp: NaN });
-  return pt !== null && Number.isFinite(pt) && pt > 0 ? pt : undefined;
+  const pt = resolveLength(v, { em: notePt, sp: NaN });
+  if (pt === null || !Number.isFinite(pt) || pt <= 0) return undefined;
+  return typeof v === "string" && v.endsWith("em") ? Math.round(pt * 2) / 2 : pt;
 }
 
 /** 排版器的构造字号。成书取歌词那一档，其余取音符字号。 */
@@ -36,9 +41,8 @@ export function jianpuFontSize(sheet: StyleSheet): number {
   return rolePt(sheet, "note") ?? PPTX_PAGE.fontSize;
 }
 
-/** 原样档是不是长图。判据与 `@media (paged: …)` 共用一处（`themes.ts::isPagedSheet`）。 */
-export function isLongImage(sheet: StyleSheet): boolean {
-  return !isPagedSheet(sheet);
+function headRatios(sheet: StyleSheet): { title: number; credit: number } {
+  return sheet.jianpu.preset === "original" ? HEAD_RATIOS.original : HEAD_RATIOS.pptx;
 }
 
 /** 字号标题、词曲的实际值：给了就用；原样档没给就按出厂比例派生。 */
@@ -46,111 +50,173 @@ export function jianpuSizes(sheet: StyleSheet): { fontSize: number; titleSize: n
   const fontSize = jianpuFontSize(sheet);
   return {
     fontSize,
-    titleSize: rolePt(sheet, "title") ?? Math.round(fontSize * TITLE_RATIO),
-    creditSize: rolePt(sheet, "credit") ?? Math.round(fontSize * CREDIT_RATIO),
+    titleSize: rolePt(sheet, "title", fontSize) ?? Math.round(fontSize * headRatios(sheet).title),
+    creditSize: rolePt(sheet, "credit", fontSize) ?? Math.round(fontSize * headRatios(sheet).credit),
   };
 }
 
-export function applyJianpuStyle(opt: LayoutOptions, sheet: StyleSheet): void {
-  const preset = sheet.jianpu.preset ?? "default";
-  if (preset === "book") {
-    if (!sheet.book) throw new Error("book 预设缺 BookStyle");
-    applyBookPreset(opt, sheet.book);
-  } else {
-    if (sheet.page.ink !== undefined) opt.color = sheet.page.ink;
-    if (preset !== "default") {
-      const s = jianpuSizes(sheet);
-      opt.titleSize = s.titleSize;
-      opt.creditSize = s.creditSize;
-    }
-    opt.headerFonts = headerFontsOf(sheet);
-    if (preset === "original") {
-      applyOriginalPreset(opt, isLongImage(sheet));
-      // 面板或谱里给了边距就用给的；没给仍是字号派生的那套（`LayoutOptions.applyFontSize`）
-      const mg = pageMargins(sheet.page);
-      if (mg) [opt.marginTop, opt.marginRight, opt.marginBottom, opt.marginLeft] = mg;
-      // 和弦（123/ABC 原样档走引擎后才有）：`chord` 角色给了字号就用，没给按音符字号的 0.6（引擎缺省那一档）。
-      // `.jpwabc` 的投影不带和弦，这一项对它不起作用。
-      opt.chordSize = rolePt(sheet, "chord") ?? opt.numberSize * 0.6;
-      // 和弦基线离音符墨迹顶留一道空（0 = 贴着数字）；段落词（123 的 `"^副歌"`）与和弦同一带、同字号
-      opt.chordGap = opt.numberSize * 0.25;
-      opt.sectionWordSize = opt.chordSize;
-      // 房号（一房、二房的括线与数字）：原样档按原谱排一遍，房号要印出来；展开档逐遍展开、不画（pptx 预设不设）。
-      // 比例照五线谱（`mixed/render.ts::drawEnding`，两边共用 `layout/ending.ts` 的画法）：房号字号约为谱高的一半，
-      // 简谱的「谱高」取小节线高（≈ 4/3 字号）
-      opt.endingSize = opt.numberSize * 0.65;
-    }
-    else if (preset === "pptx") applyPptxPreset(opt);
-  }
-  applyFonts(opt, sheet);
-  applyOverrides(opt, sheet);
+/**
+ * 出厂那一份：编辑器与 OMR 那两条路原来的观感（没有样式表的帮助示例也走它）。
+ * 绝对量（小节线 2、弧厚 6…）是按 fontSize≈28 调出来的 musicpp 口径，**默认值必须原样保持**。
+ */
+export function defaultJianpuStyle(fontSize: number): JianpuStyle {
+  const face = (family: string) => ({ family, bold: false, italic: false });
+  return {
+    font: { note: face(CJK), lyric: face(CJK), text: face(CJK), smufl: face("Bravura") },
+    header: { title: { size: 48 }, subtitle: { size: 36 }, credit: { size: 36 }, scripture: { size: 36 } },
+    size: {
+      note: fontSize,
+      lyric: fontSize,
+      chord: 0,
+      keyMeter: fontSize,
+      verseNum: fontSize,
+      ending: 0,
+      sectionWord: 0,
+      words: fontSize,
+      header: fontSize,
+      grace: 0.59,
+      cue: 0.72,
+    },
+    stroke: {
+      barline: 2, // musicpp lineWidths.lightBarline / heavyBarline（pptutil.cpp:139）
+      finalBarline: 3.5,
+      beam: 1.5, // musicpp lineWidths.jpBeam (pptutil.cpp:138)
+      slur: 6, // musicpp render.cpp:1076 (`lw0 = 6/cos`)，按 fontSize≈28 调
+      slurOutline: 0.7,
+      slurFlat: 0,
+      hairpin: 0,
+      timeSigRule: 0,
+      bracket: 0,
+      doubleBarlineGap: 5,
+    },
+    dot: { octave: 0, aug: 0, repeat: 0 },
+    vertical: {
+      stackGap: STACK_GAP_DEFAULT,
+      slurGap: fontSize / 6,
+      lyricBaseline: 0,
+      lyricStack: 0,
+      systemGap: 0,
+      systemSpread: fontSize * 0.75,
+      staffDist: 0,
+      voiceGap: 0,
+      chordGap: 0,
+      bracketFoot: 0,
+      staffTop: 0,
+      staffBottom: 0,
+      barlineHeight: (fontSize * 4) / 3,
+    },
+    arc: { heightScale: 1, maxHeight: 18, minHeight: 10, flatSpan: 0, flatNotes: 0, flatRatio: 0 },
+    spacing: { lyricGap: 0, maxHorizontalScale: 2.0 },
+    look: {
+      noteBold: true,
+      chordPlain: false,
+      accidentalStyle: "csym",
+      accidentalScale: 1,
+      punctCompress: "halfwidth",
+      tupletStyle: "bracket",
+      verseNumbers: "always",
+      verseNumberAutoMin: 3,
+      timeSigDigitRatio: 0,
+      timeSigRuleLenRatio: 0,
+    },
+    page: { color: 0xff000000, margin: { top: fontSize * 1.5, right: 50, bottom: fontSize * 3, left: 50 } },
+  };
 }
 
-/** 角色 → 字体族与字重（`note` → 数字、`lyric` → 歌词、`smufl` → 记号）。
- *  **字号不动**：这一路的字号由 `jianpuFontSize` 定、`applyFontSize` 还要由它派生一串间距。 */
-function applyFonts(opt: LayoutOptions, sheet: StyleSheet): void {
-  const rec = opt as unknown as Record<string, unknown>;
+export function jianpuStyleOf(sheet: StyleSheet): JianpuStyle {
+  const preset = sheet.jianpu.preset ?? "default";
+  let st: JianpuStyle;
+  if (preset === "book") {
+    if (!sheet.book) throw new Error("book 预设缺 BookStyle");
+    st = bookJianpuStyle(sheet.book);
+  } else {
+    st = defaultJianpuStyle(jianpuFontSize(sheet));
+    if (sheet.page.ink !== undefined) st.page.color = sheet.page.ink;
+    if (preset !== "default") {
+      const s = jianpuSizes(sheet);
+      st.header.title.size = s.titleSize;
+      st.header.credit.size = s.creditSize;
+    }
+    // 副标题与经文没单独给字号的跟词曲走
+    st.header.subtitle.size = st.header.scripture.size = st.header.credit.size;
+    const hf = headerFontsOf(sheet);
+    for (const role of ["title", "subtitle", "credit", "scripture"] as const) {
+      const f = hf[role];
+      if (!f) continue;
+      if (f.family !== undefined) st.header[role].family = f.family;
+      if (f.bold !== undefined) st.header[role].bold = f.bold;
+      // 标题与词曲的字号以上面那两个为准；副标题与经文的字号给了才用
+      if (f.size !== undefined && (role === "subtitle" || role === "scripture")) st.header[role].size = f.size;
+    }
+    if (preset === "original") {
+      // 原样档的出厂值都在样式表里（`themes.ts` 的 print 主题，照 500 首、em 口径）：这里只把角色字号落进尺子。
+      // 面板或谱里给了边距就用给的；没给仍是字号派生的那套（`defaultJianpuStyle`）
+      const mg = pageMargins(sheet.page);
+      if (mg) st.page.margin = { top: mg[0], right: mg[1], bottom: mg[2], left: mg[3] };
+      const em = st.size.note;
+      const role = (r: StyleRole, fallback: number): number => rolePt(sheet, r, em) ?? fallback;
+      st.size.lyric = role("lyric", st.size.lyric);
+      st.size.verseNum = role("verseNum", st.size.verseNum);
+      st.size.keyMeter = role("keyMeter", st.size.keyMeter);
+      st.size.chord = role("chord", em * 0.6);
+      // 房号（一房、二房的括线与数字）：原样档按原谱排一遍，房号要印出来（展开档逐遍展开、不画）。字号同三连音数字（`tuplet` 角色）
+      st.size.ending = role("tuplet", em * 0.65);
+      st.size.sectionWord = role("sectionWord", st.size.chord);
+      // 页眉 TL/TR 与页脚
+      st.size.header = role("header", st.size.header);
+    } else if (preset === "pptx") applyPptxPreset(st);
+  }
+  applyFonts(st, sheet);
+  applyOverrides(st, sheet);
+  return st;
+}
+
+/** 角色 → 字体族与字重（`note` → 数字、`lyric` → 歌词、`smufl` → 记号）。**字号不动**。 */
+function applyFonts(st: JianpuStyle, sheet: StyleSheet): void {
+  const fonts = st.font as unknown as Record<string, JianpuStyle["font"]["note"]>;
   for (const [role, def] of Object.entries(ROLE_FONTS)) {
-    const field = def.layout;
+    const field = def.jianpu;
     if (!field) continue;
     const f = familyOfRole(sheet, role as StyleRole);
     if (!f) continue;
-    const base = rec[field] as Font;
-    rec[field] = new Font(f.family || base.family, base.size, f.bold || base.bold, base.italic);
+    const base = fonts[field]!;
+    fonts[field] = { family: f.family || base.family, bold: f.bold || base.bold, italic: base.italic };
   }
 }
 
-/** `@jianpu` / `@staff` 的逻辑键 → `LayoutOptions` 的字段（`style/keys.ts` 的 `layout` 一列）。
- *  em = 音符字号，sp = 名义谱高 / 3（简谱的名义谱高是默认小节线跨度 4/3 字号，不随 `jpStaffTopOverride` 变）。 */
-function applyOverrides(opt: LayoutOptions, sheet: StyleSheet): void {
-  const em = opt.numberSize;
-  const ctx = { em, sp: em / 3 };
-  applyBlock(opt, sheet.jianpu.overrides, JIANPU_KEYS, "jianpu", ctx);
-}
-
-function applyBlock(
-  opt: LayoutOptions,
-  ov: Record<string, unknown> | undefined,
-  table: Record<string, KeyDef>,
-  block: string,
-  ctx: { em: number; sp: number },
-): void {
+/** `@jianpu` 的逻辑键 → `JianpuStyle` 的路径（`style/keys.ts` 的 `jianpu` 一列）。
+ *  em = 音符字号，sp = 名义谱高 / 3（简谱的名义谱高是默认小节线跨度 4/3 字号，不随 `staffTop` 变）。 */
+function applyOverrides(st: JianpuStyle, sheet: StyleSheet): void {
+  const ov = sheet.jianpu.overrides;
   if (!ov) return;
-  const rec = opt as unknown as Record<string, unknown>;
+  const em = st.size.note;
+  const ctx = { em, sp: em / 3 };
   for (const [k, v] of Object.entries(ov)) {
-    const def = table[k];
+    const def: KeyDef | undefined = JIANPU_KEYS[k];
     if (!def) {
-      console.warn(`样式 @${block} 的 ${k}：认不出的键，忽略`);
+      console.warn(`样式 @jianpu 的 ${k}：认不出的键，忽略`);
       continue;
     }
-    if (!def.layout) {
-      console.warn(`样式 @${block} 的 ${k}：纯简谱不支持${def.note ? `（${def.note}）` : ""}，忽略`);
+    if (!def.jianpu) {
+      console.warn(`样式 @jianpu 的 ${k}：纯简谱不支持${def.note ? `（${def.note}）` : ""}，忽略`);
       continue;
     }
+    const [group, field] = def.jianpu.split(".") as [keyof JianpuStyle, string];
+    const rec = st[group] as unknown as Record<string, unknown>;
     if (def.kind === "bool") {
-      if (typeof v === "boolean") rec[def.layout] = v;
-      else console.warn(`样式 @${block} 的 ${k}：开关只收 true / false，${JSON.stringify(v)} 忽略`);
+      if (typeof v === "boolean") rec[field] = v;
+      else console.warn(`样式 @jianpu 的 ${k}：开关只收 true / false，${JSON.stringify(v)} 忽略`);
       continue;
     }
     if (def.kind === "word") {
-      if (typeof v === "string") rec[def.layout] = v;
-      else console.warn(`样式 @${block} 的 ${k}：要一个词，${JSON.stringify(v)} 忽略`);
+      if (typeof v === "string") rec[field] = v;
+      else console.warn(`样式 @jianpu 的 ${k}：要一个词，${JSON.stringify(v)} 忽略`);
       continue;
     }
     const n = resolveLength(v as never, ctx);
-    if (n === null) console.warn(`样式 @${block} 的 ${k}：认不出的长度 ${JSON.stringify(v)}，忽略`);
-    else rec[def.layout] = n;
+    if (n === null) console.warn(`样式 @jianpu 的 ${k}：认不出的长度 ${JSON.stringify(v)}，忽略`);
+    else rec[field] = n * (def.jianpuScale ?? 1);
   }
-}
-
-/**
- * 「原样」档。按原谱排一遍（`lyricStack > 0`，多段叠在同一条谱行下），标题排在第一页顶上
- * （`bookHead`）——印刷歌本的排法；`longImage` = 一张连续长纸（观感同文本谱的「原版」）。
- */
-function applyOriginalPreset(opt: LayoutOptions, longImage: boolean): void {
-  opt.lyricStack = opt.lrcFont.size * LYRIC_STACK_RATIO;
-  opt.continuousPage = longImage;
-  opt.bookHead = true;
 }
 
 // 「PPT 版面」档：投影/导出 .pptx 用的那一档，编辑器的**默认档**。
@@ -175,14 +241,11 @@ function applyOriginalPreset(opt: LayoutOptions, longImage: boolean): void {
 //
 // **不覆写字体与页面尺寸**：字号、纸张、标题/词曲字号由样式表的角色与 page 说了算，
 // 这里只固定那些本来就没有 UI 的**笔画类**常量。
-function applyPptxPreset(opt: LayoutOptions): void {
-  const em = opt.numberSize;
-
-  // 纵向堆叠回到旧式三套步长（数字↔点、点↔弧、三连音各走各的）。见 jpGridLegacy 的注释。
-  opt.jpGridLegacy = true;
+function applyPptxPreset(st: JianpuStyle): void {
+  const em = st.size.note;
 
   // 音符数字**不加粗**：投影那一档的观感是既有的，原样档才照印刷谱加粗。
-  opt.noteBold = false;
+  st.look.noteBold = false;
 
   // **小节线的上下缘不再覆写**（用户口径：「PPT 模式的小节线有点短，用简谱模式的高度」）。
   // 老展开档是 −23/28 em 与 +5/28 em（合起来正好 1 em），比今天的 −1 em / +1/3 em
@@ -192,35 +255,32 @@ function applyPptxPreset(opt: LayoutOptions): void {
   // 拍号画出来与老档一模一样，只有小节线变高了。
 
   // 小节线细线 1.5（今 2）；终止线的粗线 3.5 两版相同，写出来是为了这一档自洽。
-  opt.barlineWidth = 1.5;
-  opt.finalBarlineWidth = 3.5;
+  st.stroke.barline = 1.5;
+  st.stroke.finalBarline = 3.5;
 
-  // 减时线：线宽 1.4（= em/20，同样量自成品；老档 1.25、今默认 1.5）。
-  // **第一道的高度与层间步距也改按 2019 年那批成品
-  // .pptx 量回来的**（`ppt500/`，28pt 上是 4.667 与 3.267）——原先两者都取 `jpBeamDist`
-  // = em/8 = 3.5，减时线贴着数字，投影上看着像粘在音符底下（用户口径：
-  // 「减时线离音符太近」）。低音点那一摞按 `jpBeamDist` 让开减时线、
-  // 旧式八度点阶梯（`LayoutOptions.jpLegacyDotCenter`）也逐级走它，所以两个数一起改。
-  opt.jpBeamWidth = em / 20;
-  opt.jpBeamDist = (em * 7) / 60; // 0.11667 em
-  opt.jpBeamTop = em / 6;
+  // 减时线：线宽 1.4（= em/20，量自 2019 年那批成品 .pptx；老档 1.25、今默认 1.5）。
+  // 落点与各引擎同一套等距叠层（engrave/stack.ts，用户定：展开档也不留旧式阶梯）。
+  st.stroke.beam = em / 20;
+
+  // 临时记号小一号（用户口径：「展开档的升号偏大」）——投影的数字不加粗、字号大，照混排那个比例显得压过数字。
+  st.look.accidentalScale = 0.75;
 
   // 拍号只留分数线粗细（比例走默认，见上面小节线那一段）。
-  opt.timeSigRuleWidth = 1.5;
+  st.stroke.timeSigRule = 1.5;
 
   // **附点 / 高音点 / 低音点三者同大**（用户口径）。默认两者各按自己那个字形的墨迹高折半
   // （附点照 `·` 是 ⌀4.06 @28pt、八度点照 `.` 是 ⌀3.44），附点明显更胖。
   // 这一档取两者之间的一个整数比例：⌀2r = em/7.5，附点缩一点、八度点放一点。
-  opt.octaveDotRadius = em / 15;
-  opt.augDotRadius = em / 15;
+  st.dot.octave = em / 15;
+  st.dot.aug = em / 15;
 
   // 弧线：旧版厚 4、无描边，且没有高度上下限、没有扁平长连音线——
   // 一律退化成 musicpp 的裸对数公式。
-  opt.slurTieThickness = 4;
-  opt.slurOutlineWidth = 0;
-  opt.slurMaxHeight = 0;
-  opt.slurMinHeight = 0;
-  opt.slurFlatSpan = -1;
-  opt.slurFlatNotes = 0;
-  opt.slurFlatRatio = 0;
+  st.stroke.slur = 4;
+  st.stroke.slurOutline = 0;
+  st.arc.maxHeight = 0;
+  st.arc.minHeight = 0;
+  st.arc.flatSpan = -1;
+  st.arc.flatNotes = 0;
+  st.arc.flatRatio = 0;
 }

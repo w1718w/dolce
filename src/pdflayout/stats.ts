@@ -1,4 +1,4 @@
-// 从原书的版面规格（scripts/page-report.mjs 出的 pdf-layout.json）统计出 BookStyle。
+// 从原书的版面规格（scripts/page-report.mjs 出的 out/pdf-layout.json）统计出 BookStyle。
 //
 // **为什么统计的是中位数**：原件是排好版付印的，同一角色的字号/间距本该整齐，
 // 实测值的抖动来自轮廓量测（亚像素、笔画粗细、标点只占字格下部）。取中位数
@@ -667,7 +667,7 @@ export function inferBookStyle(
   rec("midStartGap", ms.midStartGap, false);
 
   // 三个层距（高音点上距 / 低音点下距 / 减时线首层距）够近才共用一把尺子，
-  // 否则 style/book.ts::applyBookPreset 那边要分开覆写（见计划 §5.3 与 docs/实现/简谱纵向栅格.md）。
+  // 否则 style/book.ts::bookJianpuStyle 那边要分开覆写（见计划 §5.3 与 docs/实现/简谱纵向栅格.md）。
   const gUp = med(ms.octaveDotUpGap);
   const gDown = med(ms.octaveDotDownGap);
   const gDiv = med(ms.divLineGap);
@@ -675,7 +675,7 @@ export function inferBookStyle(
   if (spread > noteInk * 0.1) {
     warnings.push(
       `⚠ 层距不等：高音点上 ${gUp.toFixed(2)} / 低音点下 ${gDown.toFixed(2)} / 减时线 ${gDiv.toFixed(2)}（差 ${spread.toFixed(2)}pt > 0.1 墨迹高），` +
-        `jpStackGap 需要拆成三个字段分别覆写`,
+        `（叠层按 stack-gap 等距排，不照这三个数；仅供核对）`,
     );
   }
 
@@ -684,8 +684,6 @@ export function inferBookStyle(
     ...base.metrics,
     systemGapEm: em(ms.systemGap),
     noteStepEm: em(ms.noteStep),
-    divLineGapEm: em(ms.divLineGap),
-    divLineStepEm: em(ms.divLineStep),
     repeatDotDiam: pt(ms.repeatDotDiam),
     // 房号（1./2.）与三连音的括线：原书量到的线宽与「脚」长（脚长按音符字号归一）
     bracketWidth: pt(ms.bracketWidth),

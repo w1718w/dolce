@@ -16,6 +16,7 @@ import type {
   Barline,
   Chord,
   Element,
+  ElementId,
   Key,
   Mark,
   Measure,
@@ -24,7 +25,9 @@ import type {
   ScoreDoc,
   Song,
 } from "../model/doc";
+import { SIMPLE_DIVISIONS } from "../model/doc";
 import { breakAfter, lyricOfVerse, type BreakKind } from "../model/helpers";
+import { beatGroupIndex, beatGroupSize } from "../engrave/beatgroup";
 import { lyricSlots, type LyricSlotRule } from "./lyricslot";
 import { arcsToNextNote, isLatinEnd, isLatinStart, isOneCjkWithPunct, nestArcsInTuplets, ownIds, ownMarks, partRanges, systemRanges, type SystemRange } from "../model/emitutil";
 import { harmonyText } from "../model/jianpu";
@@ -95,13 +98,23 @@ export interface LyricStyle {
   extend?: string;
 }
 
-export function lyricLines(part: Part, sep: string, skip: string, sys: SystemRange, rule: LyricSlotRule, style: LyricStyle = {}): string[] {
+export function lyricLines(
+  part: Part, sep: string, skip: string, sys: SystemRange, rule: LyricSlotRule, style: LyricStyle = {},
+  extraSlots?: (el: Element) => number,
+): string[] {
   const ext = style.extend ?? "_";
-  const { slots } = lyricSlots(part, sys.from, sys.to, sys.fromEl, sys.toEl, rule);
+  const { slots: own } = lyricSlots(part, sys.from, sys.to, sys.fromEl, sys.toEl, rule);
+  // 写出端把一个元素拆成几个音写的（ABC 里长音中途换和弦，见 `AbcFamilyEmitter.extraSlots`），拆出来的每段也占一格；
+  // `null` 标那一格（连音线接着的同一个音，不配字）
+  const slots: (Element | null)[] = [];
+  for (const el of own) {
+    slots.push(el);
+    for (let k = extraSlots?.(el) ?? 0; k > 0; k--) slots.push(null);
+  }
   // 本系统一共几段（区间行按上界算）
   let maxVerse = 0;
   for (const el of slots) {
-    for (const l of el.lyrics ?? []) maxVerse = Math.max(maxVerse, l.numberTo ?? l.number);
+    for (const l of el?.lyrics ?? []) maxVerse = Math.max(maxVerse, l.numberTo ?? l.number);
   }
   const bodies: string[] = [];
   for (let verse = 1; verse <= maxVerse; verse++) {
@@ -118,6 +131,12 @@ export function lyricLines(part: Part, sep: string, skip: string, sys: SystemRan
     /** 上一个写出的音节以拉丁字母/数字收尾（且中间没有 `*` `_` 隔开）——下一个也是拉丁词时要空格 */
     let prevLatin = false;
     for (const el of slots) {
+      if (el === null) {
+        // 拆出来的段是连音线接着的同一个音，不配字：前一个字的 `_` 已占了这一格就算它的，否则跳过
+        if (extendConsumes) extendConsumes = false;
+        else pendingSkips += (pendingSkips === "" ? "" : sep) + skip;
+        continue;
+      }
       // 区间与副歌的包含判断与排版取词同一份（`helpers.ts::lyricOfVerse`）
       const hit = lyricOfVerse(el.lyrics, verse) ?? undefined;
       if (hit?.verseLabel !== undefined && label === undefined) label = hit.verseLabel;
@@ -253,6 +272,12 @@ export abstract class AbcFamilyEmitter {
     return [];
   }
 
+  /** 这个元素写出时另拆出几个音（各占一个歌词格）。缺省不拆；ABC 把中途换和弦的长音拆成连音线相连的几段。 */
+  protected extraSlots(el: Element): number {
+    void el;
+    return 0;
+  }
+
   /** 增时线（123 专有；ABC 那一档没有，返回空串）。 */
   protected sustainsText(ch: Chord, mi?: MarkIndex): string {
     void ch;
@@ -288,6 +313,9 @@ export abstract class AbcFamilyEmitter {
   }
 
   /** 同时发声的几个音怎么包。123 靠多声部表达、不包；ABC 是 `[CEG]`。 */
+  /** 方言写不写得出同时发声的和弦（ABC `[CEG]`）；写不出的（123）`chordGroupText` 原样返回。 */
+  protected readonly writesChordGroups: boolean = false;
+
   protected chordGroupText(inner: string, noteCount: number): string {
     void noteCount;
     return inner;
@@ -313,6 +341,39 @@ export abstract class AbcFamilyEmitter {
 
   /** 符杠分组写不写成「连写」。ABC 写（§4.7 空白即分组）；123 不写——符杠按拍自动算，音符一律空格隔开。 */
   protected readonly spaceBeams: boolean = true;
+
+  /** 正在写的小节的拍号（`autoBeamGroups` 按它分拍）。 */
+  private curTime: { beats: number; beatType: number } = { beats: 4, beatType: 4 };
+
+  /**
+   * 源里没有空白分组（123、文本谱、MusicXML 来源都不设 `Chord.beamGroup`）时**按拍自动分组**：
+   * 带减时线、不超过一拍的音按拍位归组（与简谱减时线同一份判据 `engrave/beatgroup.ts`），各声部分开计位，
+   * 多连音整组按起点那拍归组、时值按比例折。不分的话 123 → ABC 每个音之间都隔空格，读回来全是单独的符尾。
+   */
+  private autoBeamGroups(mea: Measure, mi: MarkIndex): Map<ElementId, number> {
+    const out = new Map<ElementId, number>();
+    const size = beatGroupSize(this.curTime.beats, this.curTime.beatType);
+    const pos = new Map<number, number>();
+    let tuplet: { ratio: number; group: number; left: number } | null = null;
+    for (const el of mea.elements) {
+      const voice = el.voice > 1 ? el.voice : 1;
+      const at = pos.get(voice) ?? 0;
+      if (el.kind !== "chord") {
+        if (el.duration) pos.set(voice, at + el.duration.divisions / SIMPLE_DIVISIONS);
+        continue;
+      }
+      if (el.grace) continue;
+      const tp = mi.tupletStart.get(el.id)?.ratios[0];
+      if (tp && !tuplet) tuplet = { ratio: tp.normal / tp.actual, group: beatGroupIndex(at, 0, size), left: tp.actual };
+      const tm = el.duration.timeMod;
+      const q = (el.duration.divisions / SIMPLE_DIVISIONS) * (tm ? tm.normal / tm.actual : tuplet?.ratio ?? 1);
+      const g = tuplet ? tuplet.group : beatGroupIndex(at, 0, size);
+      if (!el.rest && (el.beams?.length ?? 0) > 0 && q <= size + 1e-9) out.set(el.id, voice * 1000 + g);
+      pos.set(voice, at + q);
+      if (tuplet && (--tuplet.left <= 0 || mi.tupletEnd.has(el.id))) tuplet = null;
+    }
+    return out;
+  }
 
   /** 小节内临时多声部的分隔符（ABC 的 `&`，§7.4）。123 没有这个记号，恒为 null。 */
   protected readonly overlayText: string | null = null;
@@ -341,12 +402,14 @@ export abstract class AbcFamilyEmitter {
    *  后面的 `w:` 歌词行就成了孤儿。 */
   protected readonly trailingBreak: boolean = true;
 
-  /** 渐强渐弱的起止怎么写（Muse 的 `(<` … `<)`）。缺省 null = 这种方言写不出（123、ABC 照旧不写）。 */
+  /** 渐强渐弱的起止怎么写：缺省是 ABC 的装饰 `!crescendo(!` … `!crescendo)!`（123 同）；Muse 写 `(<` … `<)`。
+   *  null = 这种方言写不出。 */
   protected wedgeText(type: "crescendo" | "diminuendo", edge: "start" | "stop"): string | null {
-    void type;
-    void edge;
-    return null;
+    return `!${type}${edge === "start" ? "(" : ")"}!`;
   }
+
+  /** 收尾写在收尾那个音**前面**（ABC 装饰一律前置）；Muse 的 `<)` 写在后面。 */
+  protected readonly wedgeStopBefore: boolean = true;
 
   /** 段落词/注记（`Chord.sectionWord`）怎么写：ABC §4.19 的注记，`^` = 标在上方。 */
   protected annotationText(word: string): string {
@@ -402,7 +465,11 @@ export abstract class AbcFamilyEmitter {
   /** 倚音 `{6,}` / `{ab}` */
   protected graceText(ch: Chord): string {
     const dur = this.graceDurationText(ch);
-    return `{${this.graceSlashText(ch)}${ch.notes.map((n) => this.noteText(n) + dur).join("")}}`;
+    // 和弦倚音（几个音同时发声）按方言的和弦写法（ABC `{[CE]}`）；方言写不出和弦的（123）只能连写成一串
+    const body = ch.notes.length > 1 && this.writesChordGroups
+      ? this.chordGroupText(ch.notes.map((n) => this.noteText(n)).join(""), ch.notes.length) + dur
+      : ch.notes.map((n) => this.noteText(n) + dur).join("");
+    return `{${this.graceSlashText(ch)}${body}}`;
   }
 
   /** 倚音里每个音后面的时值（123 的 `{2__}`）。ABC 的倚音一律按默认写，不带。 */
@@ -471,6 +538,7 @@ export abstract class AbcFamilyEmitter {
     let key = song.key ? this.keyValue(song.key) : "";
     const timeOf = (t: { beats: number; beatType: number } | undefined): string => (t ? `${t.beats}/${t.beatType}` : "");
     let time = timeOf(song.time);
+    this.curTime = song.time ?? { beats: 4, beatType: 4 };
     /** 收一行：换行标记若是（或带着）真换行，join 出来的两侧空格要收掉；末尾的换行也收掉，否则歌词行前多一个空行。
      *  代码行以「字母（+ 数字）+ 冒号」起头（小节中间换行后 `C :|`、`C4 :|`、123 的 `x :|`）会被读成字段行
      *  （`fields.ts::ASCII_PREFIX` 容忍 `V1:` 式编号与冒号前的空格），前面垫一个空格 */
@@ -507,6 +575,7 @@ export abstract class AbcFamilyEmitter {
       const t = mea.attrs?.time ? timeOf(mea.attrs.time) : time;
       if (t !== time) out.push(`[M:${t}]`);
       time = t;
+      if (mea.attrs?.time) this.curTime = mea.attrs.time;
       let el0 = 0;
       for (const cut of cuts) {
         out.push(this.measureBody(mea, { slurStart, slurEnd, tupletStart, tupletEnd, arcNext, wedgeStart, wedgeEnd }, el0, cut.at));
@@ -540,6 +609,8 @@ export abstract class AbcFamilyEmitter {
   protected measureBody(mea: Measure, mi: MarkIndex, from = 0, to = Infinity): string {
     const pieces: string[] = [];
     let prevGroup: number | undefined;
+    /** 刚写出的那串倚音（并相邻倚音用） */
+    let prevGrace: { text: string } | undefined;
     // 小节**中间**的小节线（`[|]` 不可见线多是这种）：按它在元素流里的位置插回去。
     // 小节线是独立的条目，丢了就会把两个小节并成一个。
     const mid = (mea.barlines ?? []).filter((b) => b.location === "middle");
@@ -548,6 +619,8 @@ export abstract class AbcFamilyEmitter {
     // 一个声部连着一个声部，所以这里只在**声部号变了**的地方断开；MusicXML 读进来的交错
     // 多声部先按声部归并（只在整小节写出时才归并——小节中间换行那条路按下标切片，不能重排）。
     const order = this.voiceOrder(mea, from, to);
+    const auto = this.spaceBeams && !mea.elements.some((e) => e.kind === "chord" && e.beamGroup !== undefined)
+      ? this.autoBeamGroups(mea, mi) : null;
     let prevVoice: number | undefined;
     for (const j of order) {
       const el = mea.elements[j]!;
@@ -565,10 +638,22 @@ export abstract class AbcFamilyEmitter {
       prevVoice = voice;
       // 倚音单独成块、紧贴后一个音符
       if (ch?.grace) {
-        pieces.push(this.graceText(ch));
+        // 相邻的一串倚音（同为前/后倚音、同带不带斜线）并回一对花括号：`{2_3_}`
+        const prev = mea.elements[j - 1];
+        const g = this.graceText(ch);
+        if (prevGrace && prev?.kind === "chord" && prev.grace && pieces[pieces.length - 1] === prevGrace.text
+            && !!prev.grace.slash === !!ch.grace.slash && !!prev.grace.after === !!ch.grace.after) {
+          const merged = prevGrace.text.slice(0, -1) + g.slice(1 + this.graceSlashText(ch).length);
+          pieces[pieces.length - 1] = merged;
+          prevGrace = { text: merged };
+        } else {
+          pieces.push(g);
+          prevGrace = { text: g };
+        }
         prevGroup = undefined;
         continue;
       }
+      prevGrace = undefined;
       let s = "";
       // 和弦符号前置（规范 §8.1）
       // 从 MusicXML 读进来的和弦是结构化的（根音 + kind），没有原文就按结构拼出来
@@ -587,6 +672,7 @@ export abstract class AbcFamilyEmitter {
       // 同一个音上的开、收按嵌套排：包住多连音组的弧在外层（`((3: 1_ 2_ 3_) 4)`），其余在里层
       const tp = mi.tupletStart.get(el.id);
       const opens = mi.slurStart.get(el.id) ?? 0;
+      if (this.wedgeStopBefore) for (const w of mi.wedgeEnd?.get(el.id) ?? []) s += this.wedgeText(w, "stop") ?? "";
       for (const w of mi.wedgeStart?.get(el.id) ?? []) s += this.wedgeText(w, "start") ?? "";
       s += "(".repeat(tp?.outerArcs ?? 0);
       // ABC 按个数收尾、没有嵌套的写法，同起的几层只写最外层（以前就是这样）
@@ -598,7 +684,7 @@ export abstract class AbcFamilyEmitter {
       const closes = mi.slurEnd.get(el.id) ?? 0;
       s += ")".repeat(closes - (te?.outerArcs ?? 0));
       if (te) s += ")".repeat(te.count + te.outerArcs);
-      for (const w of mi.wedgeEnd?.get(el.id) ?? []) s += this.wedgeText(w, "stop") ?? "";
+      if (!this.wedgeStopBefore) for (const w of mi.wedgeEnd?.get(el.id) ?? []) s += this.wedgeText(w, "stop") ?? "";
 
       // 中间小节线按 `afterElements` 计数插入
       while (midIdx < mid.length && mid[midIdx]!.afterElements !== undefined
@@ -608,7 +694,7 @@ export abstract class AbcFamilyEmitter {
         prevGroup = undefined;
       }
       // 符杠分组（ABC）：同组连写、不同组之间留空格
-      const group = ch?.beamGroup;
+      const group = ch ? ch.beamGroup ?? auto?.get(ch.id) : undefined;
       const sameGroup = this.spaceBeams && group !== undefined && group === prevGroup;
       if (pieces.length && sameGroup) pieces[pieces.length - 1] += s;
       else pieces.push(s);
@@ -722,7 +808,7 @@ export abstract class AbcFamilyEmitter {
         if (v !== null) L.push(v);
         L.push(text);
         const sys = pranges[i]![r]!;
-        for (const line of lyricLines(song.parts[i]!, this.lyricSeparator, this.lyricSkip, sys, this.lyricSlotRule, this.lyricStyle)) L.push(line);
+        for (const line of lyricLines(song.parts[i]!, this.lyricSeparator, this.lyricSkip, sys, this.lyricSlotRule, this.lyricStyle, (el) => this.extraSlots(el))) L.push(line);
       }
     }
     return L;

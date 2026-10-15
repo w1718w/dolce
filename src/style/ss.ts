@@ -334,7 +334,7 @@ class Parser {
         return;
       }
       case "pu":
-        this.fail("`@pu` 已删：原样文档布局也读 `@jianpu`（键表里的 original 一列）", at);
+        this.fail("`@pu` 已删：简谱各档都读 `@jianpu`", at);
         break;
       case "template": {
         const nameTok = this.peek();
@@ -794,7 +794,35 @@ function exprWord(e: Expr): string {
 function exprLength(e: Expr): unknown {
   if (e.k === "num") return e.unit ? `${e.v}${e.unit}` : e.v;
   if (e.k === "neg" && e.a.k === "num") return exprLength({ ...e.a, v: -e.a.v });
+  const folded = foldConst(e);
+  if (folded) return exprLength(folded);
   return exprValue(e);
+}
+
+/** 常量四则折成一个长度（`1em / 14`、`0.3em / 12.08`：常见分数照写，不必抄一长串小数）。
+ *  乘除最多一边带单位，加减两边单位相同；折不了返回 null。 */
+function foldConst(e: Expr): Extract<Expr, { k: "num" }> | null {
+  if (e.k === "num") return e;
+  if (e.k === "neg") {
+    const a = foldConst(e.a);
+    return a ? { ...a, v: -a.v } : null;
+  }
+  if (e.k !== "bin") return null;
+  const a = foldConst(e.a);
+  const b = foldConst(e.b);
+  if (!a || !b) return null;
+  switch (e.op) {
+    case "*":
+      if (a.unit && b.unit) return null;
+      return { k: "num", v: a.v * b.v, ...(a.unit || b.unit ? { unit: a.unit ?? b.unit } : {}) };
+    case "/":
+      if (b.unit || b.v === 0) return null;
+      return { k: "num", v: a.v / b.v, ...(a.unit ? { unit: a.unit } : {}) };
+    case "+":
+    case "-":
+      if ((a.unit ?? "") !== (b.unit ?? "")) return null;
+      return { k: "num", v: e.op === "+" ? a.v + b.v : a.v - b.v, ...(a.unit ? { unit: a.unit } : {}) };
+  }
 }
 
 function exprValue(e: Expr): unknown {

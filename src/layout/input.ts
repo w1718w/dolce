@@ -30,6 +30,8 @@ export interface JDirection {
   text: string;
   /** 走乐谱字体（力度记号）还是文本字体（`rit.` / `Fine` / `D.S.`）。 */
   music: boolean;
+  /** 力度记号（字号另按 `engrave/dynamics.ts::DYNAMIC_SIZE` 放大）。 */
+  dynamic?: boolean;
   /** 原文标的斜体。 */
   italic: boolean;
   /** 记号写在小节**最后一个音符之后**（`Fine` / `D.S.`），贴着小节线右对齐排。 */
@@ -75,17 +77,23 @@ export interface JChord {
   /** 增时线：占几拍（1 = 无增时线） */
   beats: number;
   rest: boolean;
+  /** 不可见休止（`x`）：占拍位、不印 */
+  hidden?: boolean;
   slurStart: boolean;
   /** 本和弦收几条弧（嵌套双弧在末音同时收两条） */
   slurEnds: number;
-  slurEndChord: JChord | null;
+  /** 从本和弦起的各条弧收在哪个和弦（同一个音起两条：外弧与内弧同起点 `((5 5) 6)`） */
+  slurEndChords: JChord[];
   fermata: boolean;
   harmony: string | null;
   /** 增时线上的和弦：下标 k 是第 k+1 条增时线（长音中途换和弦，MusicXML 的 `<harmony>` 带 `offset`）。缺省即没有 */
   sustainHarmonies?: (string | null)[];
   sectionWord: string | null;
   directions: JDirection[];
+  /** 奏法记号：`accent` / `staccato` / `tenuto` / `breath`（换气，印在音符右上） */
   articulations: string[];
+  /** 从本和弦起的渐强/渐弱，收在 `end`（同一行里画到 `end`，跨行画到行末/从行首起） */
+  wedges?: { type: "crescendo" | "diminuendo"; end: JChord }[];
   graceNotes: JGrace[];
 }
 
@@ -142,14 +150,4 @@ export function measureDuration(m: JMeasure): Fraction {
     if (e.kind === "chord") return e.position.plus(e.duration!);
   }
   throw new Error("measure has no chord");
-}
-
-/** 空谱：排版器还没装谱时的占位。 */
-export function emptyScore(): JScore {
-  return { parts: [], title: "", credit: [], playData: new PlayData() };
-}
-
-/** 去掉原谱的全部换行（量「自然排下来有多宽」、量一行放得下几格时用）。改的是调用方手里那份输入。 */
-export function clearBreaks(score: JScore): void {
-  for (const p of score.parts) for (const m of p.measures) m.entries = m.entries.filter((e) => e.kind !== "break");
 }

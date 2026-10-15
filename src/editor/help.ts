@@ -1,16 +1,15 @@
 // 帮助对话框：四个标签页（功能帮助、可视化编辑、记谱法、关于）。只读，外框走 dialogs.ts 的
 // openModal（遮罩、Esc、点遮罩关闭），内容用本文件专属的 .help-* 样式。
 // 功能帮助 = 可展开主题列表（<details>）；记谱法 = 分节说明 + 实时渲染的 SVG 示例。
+import { inkOf } from "../common/measure";
 import type { App } from "./app";
 import { PaintResources, ScorePainter } from "../layout/painter";
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { jpwToScoreDoc } from "../model/fromjpw";
-import { jianpuInputOfDoc, jianpuInputOfJpw } from "../model/jianpuinput";
 import { parse123 } from "../j123/parse";
-import type { JScore } from "../layout/input";
+import type { ScoreDoc } from "../model/doc";
 import type { StyleSheet } from "../style/sheet";
 import { THEMES, computeStyleForPaper, themeOfMode } from "../style/themes";
-import { PlayItem } from "../score/playorder";
 import type { MetaData } from "../smufl/smufl";
 import { isTauriRuntime } from "./fileio";
 import { FEEDBACK_EMAIL, openFeedbackMail } from "./feedback";
@@ -48,28 +47,25 @@ export function renderExampleSvg(meta: MetaData, jpwabc: string, opts: ExampleOp
     return null;
   }
   if (!f) return null;
-  let score;
+  let doc;
   try {
-    score = jianpuInputOfJpw(jpwToScoreDoc(f));
+    doc = jpwToScoreDoc(f);
   } catch {
     return null;
   }
-  if (!score) return null;
-  return renderExampleScore(meta, score, f.getSection(LayoutSection)?.desc ?? null, opts);
+  return renderExampleScore(meta, doc, f.getSection(LayoutSection)?.desc ?? null, opts);
 }
 
-/** 同上，源码是 123：`parse123` → `jianpuInputOfDoc`（与编辑器里 123 的原样档同一条投影）。有 error 诊断即不画。 */
+/** 同上，源码是 123（与编辑器里 123 的原样档同一条路）。有 error 诊断即不画。 */
 export function render123ExampleSvg(meta: MetaData, text: string, opts: ExampleOpts = {}): SVGSVGElement | null {
-  let score;
+  let doc;
   try {
-    const doc = parse123(text);
+    doc = parse123(text);
     if (doc.diagnostics.some((d) => d.severity === "error")) return null;
-    score = jianpuInputOfDoc(doc);
   } catch {
     return null;
   }
-  if (!score) return null;
-  return renderExampleScore(meta, score, null, opts);
+  return renderExampleScore(meta, doc, null, opts);
 }
 
 interface ExampleOpts { width?: number; height?: number; titlePage?: boolean }
@@ -81,31 +77,21 @@ function exampleStyleSheet(): StyleSheet {
   return (exampleStyle ??= computeStyleForPaper([THEMES[themeOfMode("original")]], { mode: "original", engine: "jianpu" }));
 }
 
-/** 一次性 painter 排一份引擎输入、取第一页（不碰实时谱面，共用 App 的 SMuFL 元数据）。 */
+/** 一次性 painter 排一份文档、取第一页（不碰实时谱面，共用 App 的 SMuFL 元数据）。 */
 function renderExampleScore(
   meta: MetaData,
-  score: JScore,
+  doc: ScoreDoc,
   breakDesc: string | null,
   opts: ExampleOpts,
 ): SVGSVGElement | null {
   // 纸宽约等于卡片宽（1:1 显示）：长示例在纸上折行，而不是排成一长条再整体缩小
   const width = opts.width ?? 760;
   const height = opts.height ?? 540;
-  // Lyric-less snippets get pass=0 → empty playData → blank layout. Synthesize
-  // a single play pass over all measures so examples without lyrics still render.
-  if (score.playData.measures.length === 0 && score.parts[0]) {
-    const pi = new PlayItem();
-    pi.pass = 1;
-    pi.mid = 0;
-    pi.end = score.parts[0].measures.length;
-    score.playData.measures.push(pi);
-    score.playData.isSimpple = true;
-  }
   const p = new ScorePainter(PaintResources.fixed(meta));
   try {
     p.loadSync({
       view: "original",
-      score,
+      doc,
       breakDesc,
       style: exampleStyleSheet(),
       // 示例画在压暗的米白纸上（styles.css 的 --help-paper），墨色也从纯黑收一档，
@@ -457,8 +443,9 @@ const VISUAL_TOPICS_ZH: Topic[] = [
   {
     title: "换行与换页",
     body: [
-      "`Enter` 在选中元素后面（插入模式：光标处）换行，`Shift+Enter` 换页；落在小节末时小节线留在前一行。",
-      "ABC 的换行就是代码行末：换行时代码行拆成两行、删换行符时两行接成一行，`w:` 同样跟着拆并。文本谱的换行是另起一行 `Q:`：换行时 `Q:`、`C:` 行一起切开，点行末的换行符再按 `Delete` 与下一行合并。`.jpwabc` 的歌词按锚点对齐，增删音符、小节线、换行后会自动重算各段的 `@小节,音符`。",
+      "`Enter` 在选中元素后面（插入模式：光标处）换行，`Shift+Enter` 换页；落在小节末时小节线留在前一行。双击歌词改字时按 `Enter` / `Shift+Enter`，在光标所在那个字的音处换行 / 换页（光标在字前就换在这个音之前）；改标题等页眉文字时 `Enter` 结束改字。",
+      "谱面上的换行符 ↵、换页符 ⤓ 可以点选，也可以用 `←` `→` 停在上面，选中后按 `Delete` / `Backspace` 删掉；插入光标在一行行首按 `Backspace`、在行末按 `Delete` 也是删掉这处换行、与前后行合并。",
+      "ABC 的换行就是代码行末：换行时代码行拆成两行、删换行符时两行接成一行，`w:` 同样跟着拆并。文本谱的换行是另起一行 `Q:`：换行时 `Q:`、`C:` 行一起切开，删换行时与下一行合并。`.jpwabc` 的歌词按锚点对齐，增删音符、小节线、换行后会自动重算各段的 `@小节,音符`。",
       "**歌词跟着拆**：123 的 `$` 结束一行曲，紧跟在代码行后的 `w:` 只挂最后一行曲。所以换行时代码行在光标处拆成两行，每条 `w:` 也按对位格数拆成两半，前一半挪到前一行曲下面；删掉换行符则反过来，两边的词逐段接起来（前一行的词不够长用 `/` 补格）。",
       "歌词用了 `+:` 续行的行曲暂不能自动拆分，会提示在源码里改。",
     ],
@@ -820,10 +807,10 @@ function inkBox(svg: SVGSVGElement, ctx: CanvasRenderingContext2D | null): { x: 
     if (e instanceof SVGTextElement && ctx && e.textContent) {
       const cs = getComputedStyle(e);
       ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
-      const m = ctx.measureText(e.textContent);
+      const ink = inkOf(ctx, e.textContent);
       // 文字基线在本地 y = 0（layout/render.ts 一律这么画）
-      top = -m.actualBoundingBoxAscent;
-      bottom = m.actualBoundingBoxDescent;
+      top = ink.top;
+      bottom = ink.bottom;
     }
     if (b.width <= 0 && bottom - top <= 0) continue;
     const ctm = e.getScreenCTM();

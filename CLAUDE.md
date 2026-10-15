@@ -8,7 +8,7 @@
 文档分四层，**动某一块之前先翻对应那层**——那些阈值和判据多半是拿具体曲子换来的，别照直觉改：
 
 - [docs/需求.md](docs/需求.md) 做什么 · [docs/架构.md](docs/架构.md) 怎么分层、哪些决策不要推翻
-- [docs/模块/](docs/模块/) 每个模块一页：职责/入口/判据/回归/限制（20 篇）
+- [docs/模块/](docs/模块/) 每个模块一页：职责/入口/判据/回归/限制（21 篇）
 - [docs/格式/](docs/格式/) 格式规范：[123格式](docs/格式/123格式.md)（简谱主格式）、[jpwabc](docs/格式/jpwabc.md)、[Muse jcx](docs/格式/jcx.md)；
   样式定制见 [docs/样式机制.md](docs/样式机制.md)
 - [docs/实现/](docs/实现/) 判据与踩坑全录（各模块页开头有指向对应篇的链接；没有单独实现篇的写明判据在本页）
@@ -33,6 +33,8 @@
 - **Bravura（SMuFL）的字体盒不能当墨迹盒用**：它的全局 ascent−descent 约 4 em，按字体度量算高度、
   或对 `<text>` 调 `getBBox()`（得到的是整行字体盒），一个升降号、三连音数字、力度字形就把行高/裁剪框撑出几个字号的空白。
   排版期用紧包围盒——`SmuflText` 自带 bound、音乐段 `TextFrame.inkBound`、字形盒走 `smuflMeta.getBBox(glyph)`；
-  DOM 侧量墨迹用 canvas `measureText` 的 `actualBoundingBox*`（文字基线在本地 y=0，见 `editor/help.ts::inkBox`）。
+  DOM 侧量墨迹一律走 `common/measure.ts::inkOf`（canvas `measureText` 的 `actualBoundingBox*`，文字基线在本地 y=0）。
+  **WebKit（桌面版 WKWebView、Safari）的 `actualBoundingBox*` 不是墨迹**（左恒 0、右是前进宽、上下沿截到基线，「-」量成 0.29 em 高），
+  `inkOf` 探到这种实现就改成离屏画布逐像素量；别再直接调 `measureText` 取墨迹。
 - `window.__app` / `window.__book` 运行时暴露（`src/main.ts`）供无头校验用。
 - Tauri 新增插件要同改的四处见 [编辑器](docs/模块/编辑器.md)「Tauri 外壳」；其余见各模块页。

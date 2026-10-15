@@ -25,6 +25,10 @@
 import { getMeta } from "../model/metakeys";
 import { Fraction } from "../common/fraction";
 import { Font } from "../layout/font";
+import { dynamicGlyphs } from "../engrave/dynamics";
+import { articGlyph } from "../engrave/articulation";
+import { decoKey } from "../model/deconames";
+import { EQ_PAD_EM } from "../engrave/spacing";
 import { GlyphCodes } from "../smufl/smufl";
 import type {
   Barline,
@@ -72,7 +76,6 @@ import {
 } from "./model";
 import {
   barGlyphFromStyle,
-  convertDynamicsStr,
   finishMixedScore,
   hasEmbeddedLayout,
   metNoteGlyph,
@@ -98,7 +101,8 @@ function makeClef(c: DocClef): ClefSig {
     case "TAB": k.sign = GlyphCodes.sixStringTabClef; break;
     default: k.sign = GlyphCodes.gClef;
   }
-  k.line = c.line ?? 2;
+  // 没写线位按各谱号的惯常线位：F 第 4 线、C 第 3 线（中音谱号）、其余第 2 线
+  k.line = c.line ?? (c.sign === "F" ? 4 : c.sign === "C" ? 3 : 2);
   return k;
 }
 
@@ -239,6 +243,7 @@ class DocPartLoader {
     this.calcStemLen();
     if (!this.hasBeamEl) this.autoBeamPart();
     this.formatBeams();
+    this.fitFlagStems();
     // 符干/符杠就绪后再排记号（fermata 等），使 tailY 取到最终符干末端，避免 fermataBelow
     // 压住后续加长的符干（musicpp parser.cpp:2914）。
     for (const md of this.part.measures) md.layoutNotations();
@@ -514,8 +519,8 @@ class DocPartLoader {
       lrc.font = lf?.family || lf?.size
         ? new Font(lf.family ?? this.score.defaults.lyricFont.family, lf.size ? lf.size / this.score.scaling : this.score.defaults.lyricFont.size)
         : this.score.defaults.lyricFont;
-      // parser.cpp:2576：lrcHWID 时歌词字体开 hwid（→ OpenType `halt`），标点占半身
-      lrc.compress = this.score.options.lrcHWID ? "halfwidth" : "clreq";
+      // 挤压档照样式（parser.cpp:2576：歌本开 hwid → 半身式）
+      lrc.compress = this.score.options.punctCompress;
 
       lrc.updateWidth(this.score.options.meta);
 
@@ -557,28 +562,17 @@ class DocPartLoader {
     // articulations（parser.cpp:1463）—— 重音/断奏/保持音/marcato/staccatissimo。
     // above/symbol 初始按上方字形，最终上下由 layoutNotations::setAbove 决定。
     for (const a of n?.articulations ?? []) {
-      const item = new NotationItem();
-      switch (a) {
-        case "strong-accent":
-          item.above = true;
-          item.symbol = GlyphCodes.articMarcatoAbove;
-          break;
-        case "accent":
-          item.symbol = GlyphCodes.articAccentAbove;
-          break;
-        case "staccato":
-          item.symbol = GlyphCodes.articStaccatoAbove;
-          break;
-        case "tenuto":
-          item.symbol = GlyphCodes.articTenutoAbove;
-          break;
-        case "staccatissimo":
-          item.symbol = GlyphCodes.articStaccatissimoAbove;
-          break;
-        default:
-          // spiccato/stress/breath-mark/caesura 等：musicpp 未绘制，忽略。
-          continue;
+      // 换气（`breath-mark`，123 的 `!breath!`）不是挂在符头上下的记号，单记一笔
+      if (decoKey(a) === "hx") {
+        ch.breath = true;
+        continue;
       }
+      // 字形走公共那一份（engrave/articulation.ts，五线谱的印法）；spiccato/stress/caesura 等 musicpp 未绘制，忽略
+      const symbol = articGlyph(a, false);
+      if (!symbol) continue;
+      const item = new NotationItem();
+      if (a === "strong-accent") item.above = true;
+      item.symbol = symbol;
       ch.notations.push(item);
     }
     for (const mk of this.marksByEnd.get(src.id) ?? []) {
@@ -817,6 +811,7 @@ class DocPartLoader {
           if (start.relX !== null) w.dxLeft = start.relX;
           if (p.relX !== null) w.dxRight = p.relX;
           if (start.defY !== null) w.ypos = -start.defY;
+          else w.autoY = true;
           start = null;
         } else {
           start = p;
@@ -906,7 +901,7 @@ class DocPartLoader {
     const rx = pos?.relativeX;
     if (rx !== undefined) blk.x = rx;
     const font = new Font("Bravura", 16 / this.score.scaling);
-    const glyphs = dyn.text ? convertDynamicsStr(dyn.text) : "";
+    const glyphs = dyn.text ? dynamicGlyphs(dyn.text) : "";
     if (!glyphs) return false;
     blk.add(glyphs, font, true);
     return true;
@@ -927,9 +922,11 @@ class DocPartLoader {
     }
     const pm = met.tempo?.perMinuteText?.trim() ?? (met.tempo?.perMinute !== undefined ? String(met.tempo.perMinute) : undefined);
     if (pm !== undefined) {
-      // 「=」左边用不折叠空格：SVG 吞掉文本开头的普通空格（量宽也一样），「♩」与「=」就贴死了；
-      // 右边那个在字中间不会被吞，两边于是等宽
-      blk.add(any ? "\u00a0= " + pm : "= " + pm, wordFont);
+      // 「=」两侧的空与调号「1 = F」同一个（engrave/spacing.ts::EQ_PAD_EM），按字号算、不靠空格字形
+      // （空格宽随字体走，且 SVG 吞掉文本开头的普通空格）
+      const pad = wordFont.size * EQ_PAD_EM;
+      blk.add("=", wordFont, false, undefined, any ? pad : 0);
+      blk.add(pm, wordFont, false, undefined, pad);
       any = true;
     }
     return any;
@@ -938,9 +935,11 @@ class DocPartLoader {
   /** MusicXML <words> 字体 → tenths 空间字号（pt / scaling，对齐 loader.cpp::makeFont）。 */
   private makeWordsFont(f: FontSpec | undefined): Font {
     const fam = f?.family ?? "Times New Roman";
-    const sz = f?.size !== undefined ? f.size : 16;
     const bold = f?.weight === "bold";
-    return new Font(fam, sz / this.score.scaling, bold, f?.style === "italic");
+    // 没写字号：照 `<word-font>`（005「（副歌）」只该 7.5pt）
+    const d = this.score.defaults;
+    const tenths = f?.size !== undefined ? f.size / this.score.scaling : d.wordFontGiven ? d.wordFont.size : 16 / this.score.scaling;
+    return new Font(fam, tenths, bold, f?.style === "italic");
   }
 
   private processHarmony(src: Harmony, md: PartMeasureLayout, tick: Fraction): void {
@@ -1099,15 +1098,35 @@ class DocPartLoader {
   private calcStemLen(): void {
     // parser.cpp::calcStemLen —— 仅有 <stem> 的音符算符干长；有 default-y 用之（长度量到**和弦尾音**：
     // `fabs(-ch->tailNote()->cy() - stemY)`，Sibelius 只在和弦首音写 <stem>，量到首音会把朝上的符干算长一截），
-    // 否则回退 35（grace 乘 cueSize）。无符干（全音符）保持默认 0。
-    const cueSize = this.score.options.cueSize;
+    // 否则回退 35（grace 乘 graceSize）。无符干（全音符）保持默认 0。
     for (const nt of this.stemNotes) {
       const ch = nt.chord;
       const sy = this.stemYMap.get(nt);
-      if (sy !== undefined) {
-        ch.stemLen = Math.abs(-ch.tailNote().cy() - sy);
-      } else {
-        ch.stemLen = ch.grace ? 35 * cueSize : 35;
+      const len = sy !== undefined ? Math.abs(-ch.tailNote().cy() - sy) : NaN;
+      // 量不出数（转来的谱音高位置这会儿还没定、或 default-y 不是数）按没写处理：否则符干长成 NaN，
+      // 挂在符干上的延长记号、混排简谱层的上沿跟着全是 NaN（264《陶我成器》、081 的 `.jpwabc` 混排）
+      ch.stemLen = Number.isFinite(len) ? len : ch.grace ? 35 * this.score.options.graceSize : 35;
+    }
+  }
+
+  /**
+   * 不连符杠、带符尾的符干**至少要比符尾长出 1/4 格**（按这个音的大小缩放）：符尾是从符干末端往音符头那边垂的，
+   * 符干短于它就戳出音符头之外。谱里给的 `<stem default-y>` 照用，只是不许比这短——
+   * 倚音最常见：Sibelius 给倚音 2.1 格的符干，倚音符尾（Bravura `flag8thUp` 3.24 格 × 倚音缩放）比它长（260《感恩的泪》）。
+   */
+  private fitFlagStems(): void {
+    const meta = this.score.options.meta;
+    const cueSize = this.score.options.cueSize;
+    for (const md of this.part.measures) {
+      for (const ch of md.chords) {
+        if (ch.rest || ch.beams.length > 0 || ch.stemLen <= 0) continue;
+        const flag = ch.tailSym(ch.stemUp);
+        if (!flag) continue;
+        const bb = meta.getBBox(flag);
+        if (!bb) continue;
+        const scale = ch.grace ? this.score.options.graceSize : ch.cue || ch.notes.some((n) => n.size === 1) ? cueSize : 1;
+        const flagLen = (bb.bBoxNE[1] - bb.bBoxSW[1]) * 10 * scale; // 1 格 = 10 tenths
+        ch.stemLen = Math.max(ch.stemLen, flagLen + 2.5 * scale);
       }
     }
   }
@@ -1281,6 +1300,7 @@ export function layoutStaff(doc: ScoreDoc, options: MixedOptions): StaffLayout {
       const family = wordFont.family ?? score.defaults.wordFont.family;
       const sz = wordFont.size || score.defaults.wordFont.size;
       score.defaults.wordFont = new Font(family, ptToTenths(sz));
+      score.defaults.wordFontGiven = !!wordFont.size;
     }
   }
   // 用户给了谱表大小：换 scaling，纸与边距按 pt 不变（tenths 跟着换算）
@@ -1335,6 +1355,7 @@ export function layoutStaff(doc: ScoreDoc, options: MixedOptions): StaffLayout {
       fontSize: c.fontSize || 0,
       ...(c.fontFamily ? { family: c.fontFamily } : {}),
       ...(c.fontWeight === "bold" ? { bold: true } : {}),
+      ...(c.valign && c.valign !== "baseline" ? { valign: c.valign } : {}),
     });
   }
   // 题下经文（123/ABC `I:meta scripture`、MusicXML `<miscellaneous-field name="scripture">`）：自动铺排时排在标题下

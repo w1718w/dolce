@@ -1,7 +1,7 @@
 // 「按乐句重排」写回文本谱原文（编辑器工具栏那个按钮的文本谱一侧）。
 //
 // **只做原文片段的搬运**：新的每一行都是原文里那几段字符接起来的，不重新生成任何记号——
-// 和弦 `"hx:…"`、`&记号`、注释、并字号、跳词符都跟着原文走。简谱引擎输入不带的那些东西
+// 和弦 `"hx:…"`、`&记号`、注释、并字号、跳词符都跟着原文走。简谱输入模型不带的那些东西
 // 因此一个都不会掉。
 //
 // 为什么落到文本而不是往引擎输入插换行：原样档走的是原样文档布局（吃排版行视图，不经引擎输入），
@@ -21,7 +21,7 @@ import { takesLyric, voiceNumbers } from "./ast";
 import type { LyricLine, PuSong, ScoreLine, SourceSpan } from "./ast";
 import type { ScoreDoc } from "../model/doc";
 import { docView, type RowView } from "./slots";
-import { dialectSpec } from "./dialect";
+import { dialectSpec, type Dialect } from "./dialect";
 import { BODY_PREFIX } from "./parse";
 import { puLinesEdited, puPhraseLines, voiceStream, type FitMeasure, type PuNewLine, type VoiceStream } from "./phrase";
 
@@ -150,7 +150,7 @@ export function relayoutPuText(
 ): string {
   const raws = text.split(/\r?\n/);
   const doc = docView(sdoc);
-  const skip = dialectSpec(doc.dialect).lyricSkip[0] ?? "@";
+  const skip = dialectSpec((sdoc.puDialect ?? "tomato") as Dialect).lyricSkip[0] ?? "@";
   // 各首各排各的，但都写回同一份文本：先收集「哪一段换成什么」，最后统一拼。
   const patches: Array<{ from: number; to: number; lines: string[] }> = [];
 
@@ -187,7 +187,7 @@ export function relayoutPuBreak(
 ): string | null {
   const raws = text.split(/\r?\n/);
   const doc = docView(sdoc);
-  const skip = dialectSpec(doc.dialect).lyricSkip[0] ?? "@";
+  const skip = dialectSpec((sdoc.puDialect ?? "tomato") as Dialect).lyricSkip[0] ?? "@";
   for (let songIdx = 0; songIdx < doc.songs.length; songIdx++) {
     const song = doc.songs[songIdx]!;
     const plan = puLinesEdited(sdoc, songIdx, edit);
