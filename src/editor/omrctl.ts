@@ -24,15 +24,20 @@ import type { StaffBarMark, StaffMark } from "../rasteromr/overlay";
 import type { PlayPoint } from "./player";
 import type { DocFormatId } from "./formats";
 import { confirmDiscardEdits, type FormatOption, type FormatSource, type FormatSwitch } from "./formatswitch";
-import { reprojectRecognized, type Reprojected } from "../omr/reproject";
+import { harmonyPlacesOf, reprojectRecognized, type Reprojected } from "../omr/reproject";
 import { doubtItems } from "../omr/overlay";
 import { baseImage } from "../omrkit/svgkit";
 import type { ProjectKind, ProjectSnapshot } from "./omrproject";
 import { t } from "../i18n";
 import { COMPARE_VALUES, type CompareValue } from "./comparemode";
 import { isPdf } from "../omrkit/pdf";
+import type { StaffReviewResult } from "../staffomr/review";
+import type { PendingPage } from "../rasteromr/browser";
 
 /** 一份识别输入（拖进来、选进来的图片或 PDF）。 */
+/** 并排原图一页的整页底图：图的地址与它在识别位图坐标里的位置（见 `placePageView`） */
+type PageView = { url: string; x: number; y: number; w: number; h: number } | null;
+
 export interface RecogInput {
   bytes: Uint8Array;
   mime?: string;
@@ -274,6 +279,7 @@ export class OmrController implements FormatSource {
     const g = ++this.gen;
     const prev = this.lastInputs;
     const ok = await this.recognizeFilesInner(files, g);
+    if (!ok && g === this.gen) this.endPending(false);
     // 改过原图列表重识别没成：谱面还是上一次的结果，原图列表也退回去（存项目、重开补对照要的是那一份）。
     // 没有会话（起始页第一次识别失败）就留着新的，好给「调整原图后重试」
     if (!ok && g === this.gen && this.sessionKind !== null) this.lastInputs = prev;
@@ -284,6 +290,7 @@ export class OmrController implements FormatSource {
   private async recognizeFilesInner(files: readonly RecogInput[], g: number): Promise<boolean> {
     if (!files.length) return false;
     this.lastInputs = [...files];
+    void this.showPending(files, g); // 判路之前就清掉旧图、铺原图与占位（判路要栅格化第一页，得等一会）
     const first = files[0]!;
     // 文字层完整的五线谱 PDF（矢量）先试：只要不是指定按简谱识别
     if (files.length === 1 && this.kind !== "jianpu" && isPdf(first.bytes, first.mime) && (await this.tryStaffPdf(first.bytes, performance.now(), g))) return true;
@@ -319,26 +326,37 @@ export class OmrController implements FormatSource {
     this.busy = true;
     this.cancelRequested = false;
     this.progress(t("omr.staffRunning"));
+    this.prerenderOriginals(files); // 并排原图的原样底图不等识别，现在就画起来
+    void this.showPending(files, g);
     let res;
     try {
       res = await rb.recognizeRasterPdfs(pdfs, {
         title: files.length === 1 && files[0]!.name ? baseTitle(files[0]!.name) : undefined,
-        onPage: (done, total) => g === this.gen && this.progress(t("omr.staffProgress", { done, total }) + t("omr.escCancel")),
+        onPage: (done, total) => {
+          if (g !== this.gen) return;
+          this.progress(t("omr.staffProgress", { done, total }) + t("omr.escCancel"));
+          this.markPendingDone(done);
+        },
         // 过时的（又开始了一次识别、打开了别的文档）自己停下
         cancelled: () => g !== this.gen || this.cancelRequested,
         firstPages,
       });
     } catch (e) {
-      if (g === this.gen) this.host.setStatus(this.cancelRequested ? t("omr.cancelled") : t("omr.staffFailed", { error: e instanceof Error ? e.message : String(e) }));
+      if (g === this.gen) {
+        this.endPending(false);
+        this.host.setStatus(this.cancelRequested ? t("omr.cancelled") : t("omr.staffFailed", { error: e instanceof Error ? e.message : String(e) }));
+      }
       return false;
     } finally {
       if (g === this.gen) this.busy = false;
     }
     if (g !== this.gen) return false;
     if (!res.xml) {
+      this.endPending(false);
       this.host.setStatus(t("omr.noStaffFound"));
       return false;
     }
+    this.endPending(true);
     this.clear();
     this.lastInputs = [...files];
     this.staffResult = res;
@@ -404,19 +422,25 @@ export class OmrController implements FormatSource {
     else this.host.adoptText(s.docFormat, s.text, null);
     this.staffEmitted = s.emitted;
     this.sessionKind = s.kind;
+    this.fromProject = true;
     this.host.setContextControl(this.kindField(), true);
     this.syncPagesBtn();
     if ((s.kind === "staff" || s.kind === "vector") && this.lastInputs.length) {
       if (this.btnEl) this.btnEl.textContent = t("omr.compare");
       this.host.setContextControl(this.btnEl, true);
+      if (s.kind === "staff") this.prerenderOriginals(this.lastInputs); // 并排原图的原样底图先画起来，不等补对照数据
       // 对照方式同刚识别完；档位不动（还没补回对照数据，不知道是不是简线混排谱）。对照数据由并排 / 叠加视图自己从原图补
       await this.enterAfterRecognize(null);
     }
   }
 
+  /** 这个会话是重开的项目（`restore`），对照数据要从原图补；识别出来的会话为 false */
+  private fromProject = false;
+
   /** 五线谱项目重开后第一次进对照：从原图重跑识别补回逐页位图与音符坐标（不动原文）。 */
   private ensureStaffResult(): Promise<boolean> {
-    if (this.staffResult || !this.lastInputs.length) return Promise.resolve(this.staffResult !== null);
+    // 只补重开的项目：识别流程里结果还没落地（矢量路落谱面与渲对照底图之间）并排就开着，别当成缺数据再跑一遍识别
+    if (this.staffResult || !this.lastInputs.length || !this.fromProject) return Promise.resolve(this.staffResult !== null);
     this.ensuring ??= this.loadStaffResult().then((ok) => {
       this.staffLoadFailed = !ok;
       return ok;
@@ -469,7 +493,7 @@ export class OmrController implements FormatSource {
   }
 
   /** 位图五线谱的识别结果（各页位图与音符坐标），对照视图用；简谱识别或清掉后为 null */
-  staffResult: import("../staffomr/review").StaffReviewResult | null = null;
+  staffResult: StaffReviewResult | null = null;
 
   private kindField(): Element | null {
     return this.kindSelects[1]?.closest(".toolbar-select-field") ?? null;
@@ -537,6 +561,82 @@ export class OmrController implements FormatSource {
     }
     box.replaceChildren(svg);
     box.hidden = false;
+  }
+
+  // ---------------- 识别途中先给看得到的 ----------------
+  /** 识别一开始就能给界面了（离开开始页、撤掉整块遮罩）：`main.ts` 接上 */
+  onEarlyView: (() => void) | null = null;
+  /** 识别途中：并排面板先放原图（不带框），谱面区每页一张「识别中」占位，识别完换成结果 */
+  private pending: { g: number; side: boolean; pages: SVGTextElement[] } | null = null;
+
+  /** 开始识别（`recognizeFilesInner` 一进来就调，不等判路）：旧图当场清掉，能看的先给——原图（并排，按用户的核对方式）与逐页的识别进度占位。
+   *  同一次识别只铺一次（各路里再调是空操作） */
+  private async showPending(files: readonly RecogInput[], g: number): Promise<void> {
+    if (this.pending?.g === g) return;
+    this.pending = { g, side: this.side, pages: [] };
+    this.onEarlyView?.();
+    // 旧谱面、旧原图当场清掉（占位与原图等量完页数再铺）
+    this.host.clearPages();
+    this.sideEl?.replaceChildren();
+    this.sideKey = null;
+    // 代码区还是上一份文档（开始页进来是示例谱）：识别期间盖住，别让人以为那就是结果
+    const code = document.getElementById("code-pane");
+    code?.classList.add("omr-pending");
+    code?.setAttribute("data-pending", t("omr.codePending"));
+    if ((this.compare ?? "side") === "side") {
+      this.side = true;
+      this.syncSide(null);
+    }
+    // 占位的页数与比例按原图（PDF 各页先量大小，图片读自然大小），不等识别
+    const sizes: { w: number; h: number }[] = [];
+    for (const src of this.prerenderOriginals(files).sources) {
+      const got = await src.catch(() => null);
+      if (got === null) continue;
+      if (typeof got === "string") sizes.push(await imageSize(got));
+      else sizes.push(...got.map((p) => ({ w: p.w, h: p.h })));
+    }
+    const pend = this.pending;
+    if (!pend || pend.g !== g || g !== this.gen || !sizes.length) return;
+    const NS = "http://www.w3.org/2000/svg";
+    this.host.renderPagesWith(sizes.length, (i) => {
+      const { w, h } = sizes[i]!;
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("class", "omr-pending-page");
+      svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      const text = document.createElementNS(NS, "text");
+      text.setAttribute("x", String(w / 2));
+      text.setAttribute("y", String(h / 2));
+      text.setAttribute("text-anchor", "middle");
+      text.setAttribute("font-size", String(Math.round(w * 0.03)));
+      text.textContent = t("omr.pagePending", { n: i + 1 });
+      svg.appendChild(text);
+      pend.pages.push(text);
+      return svg;
+    }, { aspectRatio: (i) => `${sizes[i]!.w} / ${sizes[i]!.h}`, resetPageIndex: true });
+  }
+
+  /** 识别进度：前 `done` 页的占位改成「已识别」 */
+  private markPendingDone(done: number): void {
+    const pend = this.pending;
+    if (!pend) return;
+    pend.pages.forEach((el, i) => {
+      if (i < done && !el.classList.contains("done")) {
+        el.classList.add("done");
+        el.textContent = t("omr.pageDone", { n: i + 1 });
+      }
+    });
+  }
+
+  /** 识别结束：成功的接着进结果（`enterAfterRecognize` 会重摆并排）；没成的（`recognizeFiles` 收尾）把并排开关还原、谱面按原文重排 */
+  private endPending(ok: boolean): void {
+    const pend = this.pending;
+    if (!pend) return;
+    this.pending = null;
+    document.getElementById("code-pane")?.classList.remove("omr-pending");
+    if (ok) return;
+    this.side = pend.side;
+    this.syncSide(null);
+    this.host.reload(this.host.getText());
   }
 
   // ---------------- 识别完进哪儿 ----------------
@@ -622,7 +722,7 @@ export class OmrController implements FormatSource {
     this.sideBtn?.setAttribute("aria-pressed", String(this.side));
     const box = this.sideEl;
     if (!box) return;
-    const on = this.side && this.host.mode !== "recognize" && (this.bin !== null && this.score !== null || this.staffResult !== null || this.sessionKind === "staff" || this.sessionKind === "vector");
+    const on = this.side && this.host.mode !== "recognize" && (this.bin !== null && this.score !== null || this.staffResult !== null || this.sessionKind === "staff" || this.sessionKind === "vector" || this.pending !== null);
     box.hidden = !on;
     document.getElementById("score-pane")?.classList.toggle("with-omr-side", on);
     if (!on) {
@@ -637,8 +737,22 @@ export class OmrController implements FormatSource {
 
   private async drawSide(id: ElementId | null): Promise<void> {
     const box = this.sideEl!;
+    // 识别途中：先放这次的原图（不带框；上一次的结果还没清，别画回旧图），识别完 `enterAfterRecognize` 再摆一次
+    if (this.pending) {
+      if (this.sideKey === "plain") return;
+      this.sideKey = "plain";
+      const pages = await this.plainOriginalPages();
+      if (this.sideKey === "plain" && this.pending) box.replaceChildren(...pages);
+      return;
+    }
     // 五线谱项目重开后还没有对照数据：先从原图补
     if (!this.staffResult && (this.sessionKind === "staff" || this.sessionKind === "vector") && !(this.bin && this.score)) {
+      // 补的途中先放原图（不带框），别让面板黑着等几十秒
+      if (this.sessionKind === "staff" && this.sideKey !== "plain") {
+        this.sideKey = "plain";
+        const pages = await this.plainOriginalPages();
+        if (this.sideKey === "plain" && !this.staffResult) box.replaceChildren(...pages);
+      }
       if (this.staffLoadFailed || !(await this.ensureStaffResult())) return;
     }
     const doc = this.host.currentScoreDoc();
@@ -657,12 +771,30 @@ export class OmrController implements FormatSource {
 
   /** 并排面板的各页：原图 + 每个音一个框（`data-id` = 排版稿里的元素 id）。 */
   private async sidePages(doc: ScoreDoc | null): Promise<SVGSVGElement[]> {
-    const page = (bin: Binary, boxes: { id: ElementId; x: number; y: number; w: number; h: number }[]): SVGSVGElement => {
+    const page = (bin: Binary, boxes: { id: ElementId; x: number; y: number; w: number; h: number }[], view?: Promise<PageView>): SVGSVGElement => {
       const NS = "http://www.w3.org/2000/svg";
       const svg = document.createElementNS(NS, "svg");
       svg.setAttribute("class", "omr-side-page");
       svg.setAttribute("viewBox", `0 0 ${bin.w} ${bin.h}`);
-      svg.appendChild(baseImage(bin));
+      if (view) {
+        // 整页原图（见 `placePageView`）画好之前先铺白纸（不然面板黑着），画好了换上：框仍按位图坐标，viewBox 把页面伸出去的那截框进来
+        const paper = document.createElementNS(NS, "rect");
+        for (const [k, v] of [["x", 0], ["y", 0], ["width", bin.w], ["height", bin.h]] as const) paper.setAttribute(k, String(v));
+        paper.setAttribute("fill", "#fff");
+        svg.appendChild(paper);
+        void view.then((v) => {
+          if (!v) return void paper.replaceWith(baseImage(bin));
+          svg.setAttribute("viewBox", `${v.x} ${v.y} ${v.w} ${v.h}`);
+          const img = document.createElementNS(NS, "image");
+          for (const [k, n] of [["x", v.x], ["y", v.y], ["width", v.w], ["height", v.h]] as const) img.setAttribute(k, String(n));
+          img.setAttribute("href", v.url);
+          img.setAttribute("preserveAspectRatio", "none");
+          img.style.setProperty("image-orientation", "none"); // 识别时 JPEG 原样包进 PDF、不认 EXIF 方向，底图也不转
+          paper.replaceWith(img);
+        });
+      } else {
+        svg.appendChild(baseImage(bin));
+      }
       for (const b of boxes) {
         const pad = Math.max(3, b.h * 0.25);
         const r = document.createElementNS(NS, "rect");
@@ -681,17 +813,108 @@ export class OmrController implements FormatSource {
       const res = this.staffResult;
       const ids = await this.staffIds(doc);
       const byOmr = new Map([...ids].map(([k, v]) => [v, k]));
+      const views = this.staffPageViews(res);
       return res.pages.map((p, i) => page(p.result.raster!.bin, [...res.noteBoxes].filter(([oid, b]) => b.page === i && byOmr.has(oid))
-        .map(([oid, b]) => ({ id: byOmr.get(oid)!, x: b.box.left, y: b.box.top, w: b.box.right - b.box.left, h: b.box.bottom - b.box.top }))));
+        .map(([oid, b]) => ({ id: byOmr.get(oid)!, x: b.box.left, y: b.box.top, w: b.box.right - b.box.left, h: b.box.bottom - b.box.top })), views[i]));
     }
     if (!this.bin || !this.score) return [];
+    const bin = this.bin;
     const map = this.idMapOf(doc);
     const flat = this.score.rows.flatMap((r) => r.nums);
     const boxes = map ? map.toId.flatMap((id, i) => {
       const b = flat[i]?.bbox;
       return id !== undefined && b ? [{ id, x: b.x, y: b.y, w: b.w, h: b.h }] : [];
     }) : [];
-    return [page(this.bin, boxes)];
+    // 简谱的位图就是整张原图（PDF 是第一页整页）等比缩放来的、没纠斜：原图铺满位图范围就对得上
+    return [page(bin, boxes, this.wholePageView(0, 1, bin))];
+  }
+
+  /** 原图各份的原样底图（`renderPdfPages`），按输入列表缓存：开始识别时就画起来（`prerenderOriginals`），不等识别。
+   *  图片输入直接是原图的地址；PDF 是逐页的 promise（外层知道页数时给出）。 */
+  private originals: { inputs: readonly RecogInput[]; sources: Promise<PendingPage[] | string>[] } | null = null;
+  private prerenderOriginals(inputs: readonly RecogInput[]): NonNullable<OmrController["originals"]> {
+    const cur = this.originals;
+    if (cur && cur.inputs.length === inputs.length && cur.inputs.every((x, i) => x.bytes === inputs[i]!.bytes)) return cur;
+    this.releaseOriginals();
+    // 一份一份接着画：PDF 各页在 `renderPdfPages` 里已按页序排队，几份之间也排队，免得同时开几个画布
+    let prev: Promise<unknown> = Promise.resolve();
+    const sources = inputs.map((src) => {
+      const s: Promise<PendingPage[] | string> = isPdf(src.bytes, src.mime)
+        ? prev.then(async () => (await import("../rasteromr/browser")).renderPdfPages(src.bytes))
+        : Promise.resolve(URL.createObjectURL(new Blob([src.bytes as BlobPart], src.mime ? { type: src.mime } : {})));
+      prev = s.then((pages) => (typeof pages === "string" ? null : Promise.all(pages.map((p) => p.rendered)))).catch(() => null);
+      return s;
+    });
+    this.originals = { inputs: [...inputs], sources };
+    return this.originals;
+  }
+
+  private releaseOriginals(): void {
+    const revoke = (u: string | undefined): void => void (u?.startsWith("blob:") && URL.revokeObjectURL(u));
+    for (const s of this.originals?.sources ?? []) {
+      void s.then((v) => (typeof v === "string" ? revoke(v) : v.forEach((p) => void p.rendered.then((r) => revoke(r?.url))))).catch(() => undefined);
+    }
+    this.originals = null;
+  }
+
+  /** 还没有对照数据时（项目重开、正从原图补）并排面板先放的原图：不带框，按各份各页的顺序，画好一页换上一页（之前铺白纸）。 */
+  private async plainOriginalPages(): Promise<Element[]> {
+    const NS = "http://www.w3.org/2000/svg";
+    const out: Element[] = [];
+    for (const src of this.prerenderOriginals(this.lastInputs).sources) {
+      const got = await src.catch(() => null);
+      if (got === null) continue;
+      if (typeof got === "string") {
+        const img = document.createElement("img");
+        img.className = "omr-side-page";
+        img.src = got;
+        img.style.setProperty("image-orientation", "none");
+        out.push(img);
+        continue;
+      }
+      for (const pg of got) {
+        const svg = document.createElementNS(NS, "svg");
+        svg.setAttribute("class", "omr-side-page");
+        svg.setAttribute("viewBox", `0 0 ${pg.w} ${pg.h}`);
+        void pg.rendered.then((r) => {
+          if (!r) return;
+          const img = document.createElementNS(NS, "image");
+          for (const [k, v] of [["x", 0], ["y", 0], ["width", pg.w], ["height", pg.h]] as const) img.setAttribute(k, String(v));
+          img.setAttribute("href", r.url);
+          img.setAttribute("preserveAspectRatio", "none");
+          svg.appendChild(img);
+        });
+        out.push(svg);
+      }
+    }
+    return out;
+  }
+
+  /** 第 `si` 份原图第 `pn` 页**整页**铺满位图 `bin`（简谱：位图就是整页缩放来的）；画不出为 null */
+  private async wholePageView(si: number, pn: number, bin: Binary): Promise<PageView> {
+    const src = this.prerenderOriginals(this.lastInputs).sources[si];
+    const got = src ? await src.catch(() => null) : null;
+    if (got === null) return null;
+    const url = typeof got === "string" ? got : (await (got[pn - 1]?.rendered ?? Promise.resolve(null)))?.url;
+    return url ? { url, x: 0, y: 0, w: bin.w, h: bin.h } : null;
+  }
+
+  /** 并排原图各页的整页底图：原样底图（`prerenderOriginals`）按识别位图摆好（`placePageView`）。逐页一个 promise，画好一页先给一页；
+   *  取不到的页为 null（照旧画位图）。图片直接画原图：识别时它被包成一页与图同大的 PDF，位图与原图一一对应（彩色放大过的按位图宽高拉伸）。 */
+  private staffPageViews(res: StaffReviewResult): Promise<PageView>[] {
+    // 只有位图路：矢量 PDF 的位图本就是整页渲出来的
+    if (this.sessionKind !== "staff") return res.pages.map(() => Promise.resolve(null));
+    const { sources } = this.prerenderOriginals(this.lastInputs);
+    return res.pages.map(async (p): Promise<PageView> => {
+      const bin = p.result.raster?.bin;
+      const src = sources[p.source];
+      if (!bin || !src) return null;
+      const got = await src.catch(() => null);
+      if (got === null) return null;
+      if (typeof got === "string") return { url: got, x: 0, y: 0, w: bin.w, h: bin.h };
+      const r = await (got[p.pn - 1]?.rendered ?? Promise.resolve(null));
+      return r ? (await import("../rasteromr/browser")).placePageView(r, bin) : null;
+    });
   }
 
   /** 五线谱：模型和弦 id → 识别时写进 `<note id>` 的编号（按当前原文读，改过的谱也认得回来）。 */
@@ -785,10 +1008,12 @@ export class OmrController implements FormatSource {
   /** 简谱识别（`recognizeFiles` 判完了走这里）。 */
   private async recognizeJianpu(picked: { bytes: Uint8Array; mime?: string }, g: number): Promise<boolean> {
     this.host.setStatus(t("omr.running"));
+    void this.showPending([this.lastInputs[0] ?? picked], g);
     try {
       const t0 = performance.now();
       const { bin, score } = await recognizeMusicppDetailed(picked.bytes, picked.mime);
       if (g !== this.gen) return false;
+      this.endPending(true);
       this.emit(score, bin);
       this.host.setContextControl(this.kindField(), true);
       await this.enterAfterRecognize("original"); // 简谱进原样档，对照方式按用户上次的选择（没选过就并排）
@@ -839,8 +1064,13 @@ export class OmrController implements FormatSource {
       return false;
     }
     if (!ok || g !== this.gen) return false;
+    void this.showPending(this.lastInputs, g);
     const res = await recognizeStaffPdf(doc, {
-      onProgress: (done, total) => g === this.gen && this.host.setStatus(t("omr.staffProgress", { done, total })),
+      onProgress: (done, total) => {
+        if (g !== this.gen) return;
+        this.host.setStatus(t("omr.staffProgress", { done, total }));
+        this.markPendingDone(done);
+      },
       noteIds: true,
     });
     if (g !== this.gen) return true; // 过时：不落地，也不让调用方再按简谱试
@@ -850,6 +1080,7 @@ export class OmrController implements FormatSource {
     }
     // 五线谱只出 MusicXML，且只进混排视图（理由见 OmrHost.adoptStaffXml）。
     const inputs = this.lastInputs;
+    this.endPending(true);
     this.clear();
     this.lastInputs = inputs;
     this.sessionKind = "vector";
@@ -1519,7 +1750,7 @@ export class OmrController implements FormatSource {
     return ins ? [...els, ins] : els;
   }
 
-  /** `verse`：歌词是第几段；和弦名是这个音的第几个和弦（`reproject.ts::harmoniesOf` 的序）。 */
+  /** `verse`：歌词是第几段；和弦名是这个音的第几个和弦（`reproject.ts::harmonyPlacesOf` 的序），按它的落点对回源图的框。 */
   hitFor(kind: "note" | "lyric" | "chord", id: ElementId, verse = 0): SVGGraphicsElement | null {
     const pane = document.getElementById("score-pane");
     if (this.staffResult) {
@@ -1528,12 +1759,18 @@ export class OmrController implements FormatSource {
       return omrId ? pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-omr="${omrId}"]`) ?? null
         : pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-kind="note"][data-id="${id}"]`) ?? null;
     }
-    const i = this.idMapOf(this.host.currentScoreDoc())?.toI.get(id);
+    const doc = this.host.currentScoreDoc();
+    const i = this.idMapOf(doc)?.toI.get(id);
     if (kind === "lyric") {
       return i === undefined ? null : pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-kind="lyric"][data-i="${i}"][data-verse="${verse}"]`) ?? null;
     }
     if (kind === "chord") {
-      return i === undefined ? null : pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-kind="chord"][data-i="${i}"][data-slot="${verse}"]`) ?? null;
+      const ch = doc ? locate(doc, id)?.chord : undefined;
+      const place = ch ? harmonyPlacesOf(ch)[verse]?.place : undefined;
+      if (place === undefined) return null;
+      // 源图上有框的按框序认，核对时新加的（`chordAdds`）按元素 id 认
+      return (i === undefined ? null : pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-kind="chord"][data-i="${i}"][data-slot="${place}"]`)) ??
+        pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-kind="chord"][data-id="${id}"][data-slot="${place}"]`) ?? null;
     }
     if (i !== undefined) return pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-kind="note"][data-i="${i}"]`) ?? null;
     return pane?.querySelector<SVGRectElement>(`.omr-hits rect[data-kind="note"][data-id="${id}"]`) ?? null;
@@ -1876,6 +2113,7 @@ export class OmrController implements FormatSource {
   /** 清掉本次 OMR 的识别叠加产物并禁用识别按钮；若正处识别模式则退回简谱模式。 */
   clear(): void {
     this.gen++;
+    this.fromProject = false;
     this.bin = null;
     this.score = null;
     this.beatMarks = [];
@@ -1973,4 +2211,14 @@ function flatOrder(score: RecognizedScore): number[] {
   }
   flatOrderCache.set(score, order);
   return order;
+}
+
+/** 图片地址 → 自然大小（读不出给 A4 比例，只用来定占位页的比例） */
+function imageSize(url: string): Promise<{ w: number; h: number }> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve({ w: img.naturalWidth || 595, h: img.naturalHeight || 842 });
+    img.onerror = () => resolve({ w: 595, h: 842 });
+    img.src = url;
+  });
 }

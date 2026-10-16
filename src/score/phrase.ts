@@ -21,8 +21,9 @@ import { Fraction } from "../common/fraction";
 export interface FitMetric {
   /** 版心宽度。 */
   width: number;
-  /** 每个和弦的自然横向区间。 */
-  spans: Map<PhraseChord, { x0: number; x1: number }>;
+  /** 每个和弦的自然横向区间。`x1b`：后面紧跟小节线时含这条线的右缘——引擎折行量到行末小节线，
+   *  **只在与版心宽比「放不放得下」时用它**（`fitSpan`），行长匀度、行宽比、过短判据照旧量到音为止（`x1`）。 */
+  spans: Map<PhraseChord, { x0: number; x1: number; x1b?: number }>;
 }
 
 /**
@@ -1118,17 +1119,32 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
         && Math.abs(headDurAfter(at) - pickupStd) < 0.01) return at;
     return idx;
   };
-  const aroundSectionPickup = (at0: number): number => {
+  // 这个音收了句：句末分记在它身上，或顺延到了紧跟的休止上（`carriedFrom`：446《迦勒看见主》「虑？」后面那个四分休止）
+  const endsSentenceAt = (i: number): boolean =>
+    punctAfter[i] === 6 || (carriedAway.has(i) && carriedFrom[i + 1] === i && punctAfter[i + 1] === 6);
+  // 段界落在句末字上时，同一小节里紧跟的四分及以上休止是这一句的收气（同 `retreatPastPickupRest` 的口径），
+  // 一并留在上一段：446 的四分休止收在小节线上，不带过去段界就落在小节中间，而副歌歌词那条（`refrainIdx`）
+  // 切在休止之后，成书不许行内断，两刀之间就剩一小节自成一行
+  const pastBreathRest = (idx: number): number => {
+    if (flat[idx].chord.rest || !endsSentenceAt(idx)) return idx;
+    let end = idx;
+    while (end + 1 < K && flat[end + 1].mi === flat[idx].mi && flat[end + 1].chord.rest && flat[end + 1].chord.beams === 0 && depthAfter[end + 1] === 0) end++;
+    return end;
+  };
+  const aroundSectionPickup = (at0: number): number => pastBreathRest(sectionPickupAt(at0));
+  const sectionPickupAt = (at0: number): number => {
     const at = retreatPastPickupRest(at0);
     // 段落标题通常标在新小节上方，但上一句的收尾偶尔占了新小节开头 1~2 个短音（「脚步」的
     // `| 路。 求给我…`）。这种情况应在句号后切段，而不是把「路。」放到副歌新页行首。
+    // 收尾那个音**长短都认**：MusicXML 的「（副歌）」常标在主歌末小节中间、副歌弱起之前，那一小节开头是
+    // 上一句的长音收尾（135《求主进入我心》`方。` 3 拍、491《愿耶和华赐福给你》`安。` 4 拍、446 `虑？` 3 拍）；
+    // 只认短音时段界切在长音之前，收尾字被甩到副歌行首。长音只拦在它后面（长音之后不再往后找）
     let leadingChords = 0;
     for (let idx = at + 1; idx < K && idx <= at + 3; idx++) {
       const c = flat[idx].chord;
-      if (c.beats > 1) break;
       if (!c.rest) leadingChords++;
-      if (punctAfter[idx] === 6 && leadingChords > 0 && leadingChords <= 2) return idx;
-      if (leadingChords > 2) break;
+      if (endsSentenceAt(idx) && leadingChords > 0 && leadingChords <= 2) return idx;
+      if (c.beats > 1 || leadingChords > 2) break;
     }
     // 反过来，新段的弱起可能长达 3 个短音（「立定心志」的 `…路亚！ 我立定|心志，一生赞美你…`：
     // 副歌唱词从「心志」起标，但乐句实际从「我立定」起唱）。弱起放宽到 3 个音，段界就落在
@@ -1529,7 +1545,7 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
       if (!FIT) return true;
       const p0 = FIT.spans.get(flat[idxAt[a] + 1]?.chord);
       const p1 = FIT.spans.get(flat[idxAt[b]]?.chord);
-      return !(p0 && p1) || p1.x1 - p0.x0 < FIT.width;
+      return !(p0 && p1) || (p1.x1b ?? p1.x1) - p0.x0 < FIT.width;
     };
 
     const quality = (nb: number[]): number => {
@@ -1698,7 +1714,10 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
        */
       const evenOf = (k: number): number => {
         const r = rows[k];
-        if (!r || !r.fits) return 1;
+        // 下一行放不放得下都照常按长短打折：原来放不下就返回 1，放不下的行反倒拿满额奖励，
+        // 留着它的方案在选优里占便宜（229《复兴的火》因此交出带超宽行的那套、整首掉进补刀档 16/16/9/12…，D8）。
+        // 也不归零：试过，125《主名至宝》的 24/36（36 拍那行放不下、补刀切成 24/18/18）就输给了 24/24/12
+        if (!r) return 1;
         let best = 0;
         let found = false;
         for (let j = 0; j < rows.length; j++) {
@@ -1801,7 +1820,7 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
     const overRatio = (nb: number[]): number => {
       if (!(paperCap > 0)) return 1;
       let mx = 0;
-      for (let a = 0; a < M; ) { const b = nb[a]; if (b <= a) break; mx = Math.max(mx, lineSpan(a, b)); a = b; }
+      for (let a = 0; a < M; ) { const b = nb[a]; if (b <= a) break; mx = Math.max(mx, fitSpan(a, b)); a = b; }
       return mx / paperCap;
     };
     /** 一行有多宽 / 版心有多宽：有真实坐标就用真实坐标，没有就退回格数（见 PhraseOptions.fit）。 */
@@ -1811,6 +1830,13 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
       const p0 = FIT.spans.get(flat[idxAt[a] + 1]?.chord);
       const p1 = FIT.spans.get(flat[idxAt[b]]?.chord);
       return p0 && p1 ? p1.x1 - p0.x0 : cellsIntBetween(a, b);
+    };
+    /** 同 `lineSpan`，但量到行末小节线（见 `FitMetric.spans`）：与版心宽比「放不放得下」用这把 */
+    const fitSpan = (a: number, b: number): number => {
+      if (!FIT) return cellsIntBetween(a, b);
+      const p0 = FIT.spans.get(flat[idxAt[a] + 1]?.chord);
+      const p1 = FIT.spans.get(flat[idxAt[b]]?.chord);
+      return p0 && p1 ? (p1.x1b ?? p1.x1) - p0.x0 : cellsIntBetween(a, b);
     };
     /** 每一行（末行除外）都不短于**版心三分之一**。见 `tryWant` 里那段注释。
      *  比 `fitsPaper` 的四成松一档：144《求圣灵吹我》一句一行的八行正落在 40% 上
@@ -1826,9 +1852,9 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
     const fitsPaper = (nb: number[]): boolean => {
       if (!(paperCap > 0)) return true;
       const floor = paperCap * 0.4;
-      const segsOf: number[] = [];
-      for (let a = 0; a < M; ) { const b = nb[a]; if (b <= a) break; segsOf.push(lineSpan(a, b)); a = b; }
-      return segsOf.every((c, i) => c < paperCap && (i === segsOf.length - 1 || c >= floor));
+      const segs: Array<[number, number]> = [];
+      for (let a = 0; a < M; ) { const b = nb[a]; if (b <= a) break; segs.push([a, b]); a = b; }
+      return segs.every(([a, b], i) => fitSpan(a, b) < paperCap && (i === segs.length - 1 || lineSpan(a, b) >= floor));
     };
     let best = { score: INF, nb: nextB };
     /** 每行都放得下的方案，连同它的行数（见 FIT_SLACK）。 */
@@ -1880,7 +1906,7 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
       const need = base.map((_, i) => {
         const lo = cuts[i];
         const hi = cuts[i + 1] ?? M;
-        return Math.max(1, Math.ceil(lineSpan(lo, hi) / paperCap));
+        return Math.max(1, Math.ceil(fitSpan(lo, hi) / paperCap));
       });
       for (let d = 0; d <= 2; d++) tryWant(need.map((v, i) => Math.max(base[i], v) + d));
     }
@@ -2077,7 +2103,10 @@ export function computePhraseBreaks(part: PhrasePart, opts: PhraseOptions = {}):
       // @ts-ignore 调试钩子：这一套爬山赚了多少分、挪到哪儿了（页面里先 `window.__hillDebug = []`）
       if (typeof window !== "undefined" && Array.isArray((window as any).__hillDebug))
         (window as any).__hillDebug.push({ q0: +q0.toFixed(2), q1: +curQ.toFixed(2), moved, bs: bs.slice() });
-      if (!moved || q0 - curQ < HILL_MIN_GAIN) return null;
+      // **出发那套有放不下的行就不卡这道门槛**：那一行终归要被补刀切开，`quality` 给它的分不作数，
+      // 没有「调好的谱」可护——169《全新的你》DP 交出的那套有一行 26 拍连行尾小节线超出版心 0.3%，
+      // 爬到行行放得下的 20/22 拍那套只赚 9.2 分，被门槛挡回去，整首掉进均匀补刀档（D8）
+      if (!moved || (q0 - curQ < HILL_MIN_GAIN && overflows(nb0) === 0)) return null;
       const out = nbOf(bs);
       // 两道**绝对**门槛，都照着 line-check 的判据写：段内行长比 ≥ 0.5（D8）、
       // 每行都放得下。**不能写成「别比出发的那套差」**——爬山是从好几套方案各爬一遍，

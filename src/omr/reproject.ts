@@ -6,12 +6,14 @@
 // - 对不上元素的框（音删了）：标 `deleted`（叠加层划掉、变灰）。
 // - 模型里有、框里没有的元素（新插的音）：按同一声部里前后两个有框的音插值定位，另列 `inserted`（叠加层标蓝虚框，命中层带 `data-id`）。
 // - 歌词：当前词与原识别不同的，在原位另盖一层新字（`lyricFixes`）。
-// - 和弦：源图上的每个和弦框按原识别对回「第几个框的第几个和弦」（`chordSlots`），当前原文里改了、删了的另记（`chordFixes`）。
+// - 和弦：源图上的每个和弦框按原识别对回「第几个框的哪个落点」（`chordSlots`：音符本身 / 第几条增时线），当前原文里改了、删了的另记（`chordFixes`）；
+//   源图上没有框的（核对时新加的）按宿主音的框插值出位置另列（`chordAdds`，命中层带 `data-id`）。
 
 import type { Chord, ElementId, Harmony, ScoreDoc } from "../model/doc";
 import { harmonyText } from "../model/jianpu";
 import type { JpNum, RecognizedScore, Rect } from "../omrkit/types";
 import { RHYTHM_DIGIT } from "../omrkit/types";
+import { chordPlacesOf, type ChordPlace } from "./todoc";
 
 export type NumState = "edited" | "deleted";
 
@@ -27,19 +29,36 @@ export interface Reprojected {
   lyricFixes: { i: number; verse: number; text: string }[];
   /** 改过 / 删掉的和弦：`chordRegions` 里第几个框、现在的字（删掉了为 null） */
   chordFixes: { k: number; text: string | null }[];
+  /** 源图上没有框的和弦（核对时新加的）：挂在哪个音（元素 id）的哪个落点、字、插值出来的框（宿主音上方） */
+  chordAdds: { id: ElementId; place: ChordPlace; text: string; bbox: Rect }[];
 }
 
-/** 一个音上按原文顺序的和弦：音符本身的在前，增时线上的（长音中途换的）按增时线顺序在后。
- *  与识别结果的 `chord` + `extraChords`（按拍位升序）同序，可视化编辑数第几个和弦名也按这个序（`App._recognizeElOf`）。 */
-export function harmoniesOf(ch: Chord): Harmony[] {
-  return [...(ch.harmony ? [ch.harmony] : []), ...(ch.sustains ?? []).flatMap((s) => (s.harmony ? [s.harmony] : []))];
+/** 一个音上按原文顺序的和弦及其落点：音符本身的在前，增时线上的（长音中途换的）按增时线顺序在后。
+ *  可视化编辑数第几个和弦名按这个序（`App._recognizeElOf`），再按落点对回源图的框。 */
+export function harmonyPlacesOf(ch: Chord): { harmony: Harmony; place: ChordPlace }[] {
+  return [
+    ...(ch.harmony ? [{ harmony: ch.harmony, place: "h" as ChordPlace }] : []),
+    ...(ch.sustains ?? []).flatMap((s, k) => (s.harmony ? [{ harmony: s.harmony, place: `s${k}` as ChordPlace }] : [])),
+  ];
+}
+
+function locateChord(doc: ScoreDoc, id: ElementId): Chord | undefined {
+  for (const part of doc.songs[0]?.parts ?? []) for (const m of part.measures) for (const el of m.elements) if (el.kind === "chord" && el.id === id) return el;
+  return undefined;
+}
+
+/** 落点上现在的和弦（没有为 undefined）。 */
+function harmonyAt(ch: Chord, place: ChordPlace): Harmony | undefined {
+  if (place === "h") return ch.harmony;
+  const k = Number(place.slice(1));
+  return place[0] === "s" ? ch.sustains?.[k]?.harmony : ch.laterHarmonies?.[k];
 }
 
 /**
- * 源图上的和弦框（`chordRegions`）各是哪个音（框序 `i`）的第几个和弦（`slot`，同 `harmoniesOf`）；对不上为 null。
+ * 源图上的和弦框（`chordRegions`）各是哪个音（框序 `i`）的哪个落点（`place`，`todoc.ts::chordPlacesOf`）；对不上为 null。
  * 识别时和弦挂到音上（`chordline.ts::placeChords`）没记框，这里按字相同、横向最近、在那一行谱上方认回来，一对一。
  */
-export function chordSlots(rec: RecognizedScore): ({ i: number; slot: number } | null)[] {
+export function chordSlots(rec: RecognizedScore): ({ i: number; place: ChordPlace } | null)[] {
   const flat = rec.rows.flatMap((row, ri) => row.nums.map((n) => ({ n, ri })));
   const used = new Set<string>();
   return (rec.chordRegions ?? []).map((r) => {
@@ -58,8 +77,11 @@ export function chordSlots(rec: RecognizedScore): ({ i: number; slot: number } |
         }
       });
     });
-    if (best) used.add(`${(best as { i: number }).i}:${(best as { slot: number }).slot}`);
-    return best;
+    if (!best) return null;
+    const { i, slot } = best as { i: number; slot: number };
+    used.add(`${i}:${slot}`);
+    const place = chordPlacesOf(flat[i]!.n)[slot];
+    return place === undefined ? null : { i, place };
   });
 }
 
@@ -155,12 +177,36 @@ export function reprojectRecognized(rec: RecognizedScore, doc: ScoreDoc, toI: Re
     if (!seen.has(i)) rows[ri]!.nums[k] = { ...rows[ri]!.nums[k]!, state: "deleted" };
   });
   const chordFixes: Reprojected["chordFixes"] = [];
+  const covered = new Set<string>();
   chordSlots(rec).forEach((at, k) => {
     if (!at) return;
+    covered.add(`${at.i}:${at.place}`);
     const ch = chordAt.get(at.i);
-    const h = ch ? harmoniesOf(ch)[at.slot] : undefined;
+    const h = ch ? harmonyAt(ch, at.place) : undefined;
     const text = h ? h.text ?? harmonyText(h) : null;
     if (text !== rec.chordRegions![k]!.text) chordFixes.push({ k, text });
   });
-  return { score: { ...rec, rows }, inserted, lyricFixes, chordFixes };
+  // 新加的和弦：框高取源图和弦框的中位数（没有就按音高的八成），落在宿主那行谱顶上方；
+  // 横向：音符本身的贴音头，增时线上的贴那条增时线（源图有它的横块就用，没有按两个音宽一格估）
+  const hs = (rec.chordRegions ?? []).map((r) => r.bbox.h).sort((a, b) => a - b);
+  const chordAdds: Reprojected["chordAdds"] = [];
+  const hosts: { ch: Chord; i?: number; num: JpNum; ri: number }[] = [
+    ...[...chordAt].map(([i, ch]) => ({ ch, i, num: rec.rows[flat[i]!.ri]!.nums[flat[i]!.k]!, ri: flat[i]!.ri })),
+    ...inserted.flatMap((x) => {
+      const ch = locateChord(doc, x.id);
+      return ch ? [{ ch, num: x.num as JpNum, ri: x.row }] : [];
+    }),
+  ];
+  for (const { ch, i, num, ri } of hosts) {
+    for (const { harmony, place } of harmonyPlacesOf(ch)) {
+      if (i !== undefined && covered.has(`${i}:${place}`)) continue;
+      const text = harmony.text ?? harmonyText(harmony);
+      const h = hs.length ? hs[hs.length >> 1]! : num.bbox.h * 0.8;
+      const k = place === "h" ? -1 : Number(place.slice(1));
+      const x = k < 0 ? num.bbox.x : num.augmentRects?.[k]?.x ?? num.bbox.x + (k + 1) * num.bbox.w * 2;
+      const y = Math.min(rec.rows[ri]!.topY, num.bbox.y) - h * 1.2;
+      chordAdds.push({ id: ch.id, place, text, bbox: { x, y, w: Math.max(h * 0.62 * [...text].length, h * 0.62), h } });
+    }
+  }
+  return { score: { ...rec, rows }, inserted, lyricFixes, chordFixes, chordAdds };
 }

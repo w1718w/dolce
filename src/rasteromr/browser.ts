@@ -13,7 +13,7 @@ import { staffGroupCount } from "./detect";
 import { recognizeRasterSong, type RasterSongResult } from "./song";
 import { ocrHarmonyStrips, ocrJianpuStrips, ocrLabelStrips, ocrLyricStrips, ocrTimeStrips, ocrWordStrips, ocrHeaderStrips, detectPageTexts } from "./ocrlive";
 import type { TimeStrip } from "./timesig";
-import { isPdf } from "../omrkit/pdf";
+import { isPdf, largestPageImageAt } from "../omrkit/pdf";
 import { PagePool, type FromWorker, type PagePort } from "./pagepool";
 
 // 在线 OCR 要推理运行时：自己装上，不靠编辑器先 import 了 `omr/index`
@@ -204,6 +204,91 @@ export async function recognizeRasterPdfs(
     pool?.terminate();
     for (const s of sources) s.pdf.destroy?.();
   }
+}
+
+/** 并排原图整页画布的像素上限（WebKit 单张画布约 16.7M 像素封顶，留余量）。 */
+const PAGE_VIEW_MAX_PX = 12e6;
+
+/** 原样画好的一页 PDF（`renderPdfPages`）：整页 PNG，连同谱图（页上最大那张图）在页面上的变换与页面范围，摆放时用（`placePageView`）。
+ *  页上没有图（矢量谱、文字页）或谱图带旋转/错切的，`ctm` 为 null：整页照画，只是不能按位图路的框摆。 */
+export interface RenderedPage {
+  url: string;
+  ctm: number[] | null;
+  view: number[];
+}
+
+/** 页上没有谱图时画整页的倍数（同矢量路渲对照底图）。 */
+const PAGE_VIEW_PLAIN_SCALE = 2;
+
+/** `renderPdfPages` 的一页：页面大小（PDF 点，先给，好铺白纸占位）与画好的整页（画好前是挂着的 promise）。 */
+export interface PendingPage {
+  w: number;
+  h: number;
+  rendered: Promise<RenderedPage | null>;
+}
+
+/**
+ * 并排原图的底图：原样画出 PDF 各页（页眉的小图块、文字层、页边都在）。**不等识别**：开始识别、打开项目时就画，
+ * 文档只开一次；外层 promise 在量完各页大小时给出，各页按页序一页页画，画好一页先给一页。
+ * 画不出来的页给 null。图片输入不走这里，调用方直接画原图。
+ */
+export async function renderPdfPages(pdfBytes: Uint8Array): Promise<PendingPage[]> {
+  const { pdf, OPS } = await openRasterPdf(pdfBytes); // 图对象要带 `data`（同取图），不然认不出谱图
+  const n = pdf.numPages as number;
+  const sizes: { w: number; h: number }[] = [];
+  for (let pn = 1; pn <= n; pn++) {
+    const [x0, y0, x1, y1] = (await pdf.getPage(pn)).view as number[];
+    sizes.push({ w: x1 - x0, h: y1 - y0 });
+  }
+  let prev: Promise<unknown> = Promise.resolve();
+  const pages = sizes.map((sz, k) => {
+    const rendered = prev.then(() => renderOne(pdf, OPS, k + 1)).catch(() => null);
+    prev = rendered;
+    return { ...sz, rendered };
+  });
+  void prev.finally(() => pdf.destroy?.());
+  return pages;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function renderOne(pdf: any, OPS: any, pn: number): Promise<RenderedPage | null> {
+  const page = await pdf.getPage(pn);
+  try {
+    const found = await largestPageImageAt(page, OPS, (o) => (o.data && o.width && o.height ? o.width * o.height : null));
+    const [a, b, c, d] = found?.ctm ?? [0, 0, 0, 0];
+    const ctm = found && !b && !c && a > 0 && d > 0 ? [...found.ctm] : null;
+    const [x0, y0, x1, y1] = page.view as number[];
+    // 按谱图的原分辨率画（像素/点 = 图宽 / 图在页面上的宽），太大的降下来
+    const r = Math.min(ctm && found ? found.obj.width / a : PAGE_VIEW_PLAIN_SCALE, Math.sqrt(PAGE_VIEW_MAX_PX / ((x1 - x0) * (y1 - y0))));
+    const vp = page.getViewport({ scale: r });
+    const cv = document.createElement("canvas");
+    cv.width = Math.round(vp.width);
+    cv.height = Math.round(vp.height);
+    const ctx = cv.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    // toBlob 异步编码、不堵主线程（整页几百万像素，toDataURL 要卡一两百毫秒）
+    const blob = await new Promise<Blob | null>((res) => cv.toBlob(res, "image/png"));
+    return blob ? { url: URL.createObjectURL(blob), ctm, view: [x0, y0, x1, y1] } : null;
+  } finally {
+    page.cleanup?.();
+  }
+}
+
+/**
+ * 画好的页摆到识别位图的坐标里：识别框在位图像素里，这里只按谱图在页面上的位置做缩放 + 平移
+ *（横竖各按位图宽高 / 谱图宽高），返回整页图在**位图坐标**里的位置（`x`、`y` 为负 = 页面在位图左上方伸出去的那一截）。
+ * 不跟取图的纠斜、推平：干净版与照片没动过图，框是准的；纠过斜、推平过的扫描件框与原图差几个像素（斜率上限 0.015）。
+ */
+export function placePageView(r: RenderedPage, bin: { w: number; h: number }): { url: string; x: number; y: number; w: number; h: number } | null {
+  if (!r.ctm) return null;
+  const [a, , , d, e, f] = r.ctm;
+  const [x0, y0, x1, y1] = r.view;
+  const sx = bin.w / a;
+  const sy = bin.h / d;
+  return { url: r.url, x: -(e - x0) * sx, y: -(y1 - (f + d)) * sy, w: (x1 - x0) * sx, h: (y1 - y0) * sy };
 }
 
 /** 并行路数：留一个核给主线程（OCR、pdf.js 取图在主线程），最多 4 路（每页在途要几百 MB 的整页数组）。 */

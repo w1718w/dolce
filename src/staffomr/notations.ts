@@ -220,8 +220,13 @@ export function findTuplets(pg: SPage, beams: BeamShape[], stems: StemInfo[], no
 /** 三连音是「n 个音占 n-1 个音的时值」（3:2、6:4），按 musicxml 的惯例取最近的二次幂。 */
 export function applyTuplet(marked: Iterable<StaffNote>, n: number): void {
   const normal = n === 3 ? 2 : n === 6 ? 4 : n === 5 ? 4 : n === 7 ? 4 : n - 1;
-  for (const x of marked) {
-    x.tuplet = { actual: n, normal };
+  const list = [...marked];
+  // 起止落在组里最左、最右的音上；和弦各音 x 差不过半个符头，都算（写出时只写在和弦打头那个音上）
+  const lo = Math.min(...list.map((x) => x.x));
+  const hi = Math.max(...list.map((x) => x.x));
+  for (const x of list) {
+    const half = (x.sym.box.right - x.sym.box.left) / 2;
+    x.tuplet = { actual: n, normal, start: x.x - lo <= half, stop: hi - x.x <= half };
     x.duration = (x.duration * normal) / n;
   }
 }
@@ -332,7 +337,7 @@ export function attachDynamics(pg: SPage, notes: StaffNote[], dynamics: Sym[], l
     notes,
     dynamics.flatMap((d) => {
       const text = DYNAMIC_NAME[d.code];
-      return text ? [{ px: d.px, py: d.py, text }] : [];
+      return text ? [{ px: d.px, py: d.py, text, box: d.box }] : [];
     }),
     lyricBottom,
   );
@@ -344,7 +349,12 @@ export function attachDynamics(pg: SPage, notes: StaffNote[], dynamics: Sym[], l
  * 位图路认出来的是一个个字母块（`p`、`m`、`f` 各一个 contour），拼完才是一个力度记号，
  * 给不出单个 SMuFL 名——判据只留这一份，`attachDynamics` 查完表委托过来。
  */
-export function attachDynamicTexts(pg: SPage, notes: StaffNote[], items: { px: number; py: number; text: string }[], lyricBottom?: Map<Staff, number>): void {
+export function attachDynamicTexts(
+  pg: SPage,
+  notes: StaffNote[],
+  items: { px: number; py: number; text: string; box?: { left: number; right: number; top: number; bottom: number } }[],
+  lyricBottom?: Map<Staff, number>,
+): void {
   const sp = pg.normalStaffSpace || pg.space;
   for (const d of items) {
     // 与松叶同一条：先定谱行（力度也印在它那行谱的下方），再在行内按 x 找最近的音符
@@ -362,7 +372,10 @@ export function attachDynamicTexts(pg: SPage, notes: StaffNote[], items: { px: n
         }
       }
       if (best && bd < sp * 3) {
-        best.dynamic ??= d.text;
+        if (best.dynamic === undefined) {
+          best.dynamic = d.text;
+          if (d.box) best.dynamicBox = { left: d.box.left, right: d.box.right, top: d.box.top, bottom: d.box.bottom };
+        }
         break;
       }
     }
@@ -418,6 +431,8 @@ export interface WedgeSpan {
   x0: number;
   x1: number;
   cy: number;
+  /** 宽口那头的开口高（页面单位）；量不到不写 */
+  spread?: number;
 }
 
 /**
@@ -471,8 +486,14 @@ export function attachWedges(pg: SPage, notes: StaffNote[], wedges: WedgeSpan[],
       if (dx < bd) (bd = dx), (b = n);
     }
     b ??= row.filter((n) => n.sym.px <= wg.x1 + sp * 4).reduce<StaffNote | undefined>((m, n) => (!m || n.sym.px > m.sym.px ? n : m), undefined);
-    a.wedgeStart ??= wg.type;
-    if (b) b.wedgeStop = true;
+    if (a.wedgeStart === undefined) {
+      a.wedgeStart = wg.type;
+      a.wedgeAt = { x0: wg.x0, cy: wg.cy, ...(wg.spread ? { spread: wg.spread } : {}) };
+    }
+    if (b) {
+      b.wedgeStop = true;
+      b.wedgeStopAt = { x1: wg.x1, ...(wg.type === "crescendo" && wg.spread ? { spread: wg.spread } : {}) };
+    }
   }
 }
 

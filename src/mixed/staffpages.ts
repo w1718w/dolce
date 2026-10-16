@@ -143,8 +143,8 @@ function placePartAboveStaff(score: StaffLayout, p: PartLayout, mixed: boolean):
       for (const m of sys.measures) {
         for (const l of p.measures[m.index]?.lyrics ?? []) {
           if (l.staff !== 0 || l.y <= 0 || l.empty) continue;
-          const cx = m.xpos() + l.x + l.xOffset;
-          placed.push({ x0: cx - l.width / 2, x1: cx + l.width / 2, y0: l.y - l.font.metrics.descent, y1: l.y + l.font.size });
+          const lx = m.xpos() + l.x + l.xOffset; // 字的左缘
+          placed.push({ x0: lx, x1: lx + l.width, y0: l.y - l.font.metrics.descent, y1: l.y + l.font.size });
         }
       }
       // **速度记号最后排**（摞在最上面）：力度、文字记号贴着谱面，速度是整段的标题性记号，
@@ -165,8 +165,10 @@ function placePartAboveStaff(score: StaffLayout, p: PartLayout, mixed: boolean):
         if (t.staff !== 0 || (!t.autoY && !(t.y > 0))) continue;
         // 源谱版面档已放到下方的（`placement="below"` 的力度、文字记号，`placeDynamicsBelow`）不抬回上方
         if (t.autoY && t.y < 0 && t.src?.placement === "below") continue;
+        // 识别稿照原图写了高度的力度（`sourceY`）：源谱版面档里只按它横向跨过的那段轮廓让开，不抬到整行最高处
+        const keepSource = t.sourceY && !!sky;
         // 带坐标的谱：原文高过和弦行的文字也落回和弦那一层（005「（副歌）」用户定：与和弦大致同高），撞上再摞；速度记号不动
-        if (t.y < floor || (!score.autoLayout && st.hasHarmony && !isTempo(t))) t.y = floor;
+        if (!keepSource && (t.y < floor || (!score.autoLayout && st.hasHarmony && !isTempo(t)))) t.y = floor;
         const w = t.width();
         const left = m.xpos() + t.x - (t.justify === LCR.Center ? w / 2 : t.justify === LCR.Right ? w : 0);
         // 横向按墨迹量：全角括号「（」「）」前进宽里一半是空白，按前进宽量「（副歌）」就把旁边的和弦也算成撞上了（008）
@@ -174,6 +176,7 @@ function placePartAboveStaff(score: StaffLayout, p: PartLayout, mixed: boolean):
         const x0 = left + inkL;
         const x1 = left + inkR;
         if (sky && t.autoY && !isTempo(t)) t.y = localFloor(x0, x1);
+        else if (keepSource) t.y = Math.max(t.y, localFloor(x0, x1) - MIXED_TEXT_CLEAR / 2);
         const h = textInkHeight(t);
         for (let again = true; again; ) {
           again = false;
@@ -318,6 +321,9 @@ function sourceFlow(score: StaffLayout, items: FrameItem[], ph: number): LayoutF
   /** 系统内可压的谱表（首个可见谱表之后的）与各自可压的量 */
   const slack = (i: number) => items[i]!.system.staves.filter((st, k) => k > 0 && st.staffVisible && st.distance > st.minDistance);
   const staffExcess = (i: number) => slack(i).reduce((a, st) => a + st.distance - st.minDistance, 0);
+  /** 系统内各谱表距离比原谱多出来的总和 */
+  const growth = (i: number) =>
+    items[i]!.system.staves.reduce((a, st, k) => a + (k > 0 && st.staffVisible ? st.distance - (st.srcDistance ?? st.distance) : 0), 0);
   /** 首谱表顶线最高能到哪（页首：框顶不高过 `lo`，首页还要让开页眉 `musicYOffset`） */
   const floorOf = (i: number, lo: number) => lo + items[i]!.topY + items[i]!.musicYOffset;
   const refresh = (i: number) => {
@@ -334,7 +340,11 @@ function sourceFlow(score: StaffLayout, items: FrameItem[], ph: number): LayoutF
     const ls: number[] = [];
     list.forEach((i, k) => {
       const floor = k === 0 ? floorOf(i, lo) : ls[k - 1]! + gaps[k]!;
-      ls.push(Math.max(moved.has(i) ? floor : want[i]!, floor));
+      // 上一行比原谱长高了（谱表间距按轮廓撑开、上一行自己又往下让过）：这一行跟着往下顺延，保住原谱两行之间的空；
+      // 从前只照原位，长高的那截吃掉两行之间的空、贴到 `SOURCE_SYSTEM_GAP`（破碎 p5 49 小节那行与下一行）
+      const prev = k > 0 ? list[k - 1]! : -1;
+      const target = moved.has(i) ? floor : k === 0 || moved.has(prev) ? want[i]! : ls[k - 1]! + want[i]! - want[prev]! + growth(prev);
+      ls.push(Math.max(target, floor));
     });
     const lastI = list[list.length - 1]!;
     const over = ls[ls.length - 1]! - items[lastI]!.bottomY - ph;

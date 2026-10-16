@@ -51,7 +51,7 @@ import { BarlineGlyph, type BarlineSpec } from "../engrave/barline";
 import { TupletGlyph } from "../engrave/tuplet";
 import { hairpinPath } from "../engrave/hairpin";
 import { chordTextSegs, harmonyWidth, layoutHarmonySegs } from "../engrave/chord";
-import { addLine, addSmufl, addSmuflScaled, chordGroup, STAFF_SYSTEM, translated, type StaffSystemData } from "./prims";
+import { addLine, addSmufl, addSmuflScaled, chordGroup, STAFF_SYSTEM, translated, type StaffChordData, type StaffSystemData } from "./prims";
 import type { ItemIdentity } from "../layout/identity";
 import { drawJianpuOverlay } from "./jianpuoverlay";
 
@@ -94,14 +94,19 @@ export function drawNotesNormal(
     const code = ch.sym();
     if (!code) continue;
     let cg: Group | null = null;
+    /** 符头中心（`StaffChordData`），画完符头才知道；之后才建的组（只有符干的）建时带上 */
+    let head: StaffChordData | null = null;
     const chordGrp = (): Group => {
       if (!cg) {
         cg = chordGroup(ch.src.id);
+        cg.data = head;
         container.add(cg);
       }
       return cg;
     };
 
+    let headL = Infinity;
+    let headR = -Infinity;
     for (const n of ch.notes) {
       if (n.staff !== subStaff) continue;
       if (!n.visible) continue;
@@ -132,6 +137,8 @@ export function drawNotesNormal(
       } else {
         addSmufl(chordGrp(), code, x, y, fs);
       }
+      headL = Math.min(headL, x);
+      headR = Math.max(headR, x + smuflWidth(meta, code) * scale);
       // 倚音不进 NoteEntry（不参与同拍对齐），加线在这里按它自己的小号符头补画——
       // 否则 `{5,,}` 这种落到谱表外的倚音悬在半空
       if (ch.grace && !ch.rest) {
@@ -143,6 +150,17 @@ export function drawNotesNormal(
         }
       }
     }
+
+    // 跨谱表的和弦，这一行谱只画符干、没有符头：按别的谱行上的符头取（横坐标与谱行无关）
+    if (!(headR > headL)) {
+      for (const n of ch.notes) {
+        if (!n.visible || ch.measureRest || n.x < 0) continue;
+        headL = Math.min(headL, n.x);
+        headR = Math.max(headR, n.x + smuflWidth(meta, code));
+      }
+    }
+    if (headR > headL) head = { cx: (headL + headR) / 2 };
+    if (cg && head) (cg as Group).data = head;
 
     // stem and flag (skip rests, whole notes, half notes with beams)
     if (ch.rest) continue;
@@ -602,6 +620,9 @@ function partStaffOffset(sys: Sys, p: PartLayout, staff: number): number {
 // 跨系统截断：musicpp（render.cpp:2196）仅在 start/end 同属本 system 时绘制松叶，
 // wedge 跨换行就整条丢弃。这里主动 diverge——把松叶在每个相交 system 内裁到系统
 // 左右边界，端点高度按 tick 线性插值，使断开的渐强/渐弱线在两个系统上各画一段。
+/** 源谱版面档：松叶止端离小节线至少留的空（tenths） */
+const WEDGE_BAR_CLEAR = 3;
+
 function drawWedge(container: Group, obj: Wedge, sys: Sys): void {
   const ypos = partStaffOffset(sys, obj.part, obj.staff) + obj.ypos;
   const mifL = obj.startMeasure;
@@ -613,14 +634,19 @@ function drawWedge(container: Group, obj: Wedge, sys: Sys): void {
   const startInSys = mifL.system === sys;
   const endInSys = mifR.system === sys;
   const firstMif = sys.measures[0];
+  // 端点相对拍位的偏移（`relative-x`）：源谱版面档（识别稿照原图写的）才加，只加在落在本系统的那一端；
+  // 带坐标的原文照原 C++ 工程不加
+  const dx = sys.score.keepBreaks;
   const xL = startInSys
-    ? mifL.getEntPos(obj.startTick.minus(mifL.offset)) + mifL.xpos()
+    ? mifL.getEntPos(obj.startTick.minus(mifL.offset)) + mifL.xpos() + (dx ? obj.dxLeft : 0)
     : firstMif.getEntPos(new Fraction(0));
-  const xR = endInSys
-    ? mifR.getEntPos(obj.endTick.minus(mifR.offset)) + mifR.xpos()
+  let xR = endInSys
+    ? mifR.getEntPos(obj.endTick.minus(mifR.offset)) + mifR.xpos() + (dx ? obj.dxRight : 0)
     : sys.width();
+  // 源谱版面档的 `relative-x` 是原图上的间距，重排紧了会把止端推过小节线、伸出系统（破碎 m80 钢琴右移 50）：收在止端那个小节里
+  if (dx && endInSys) xR = Math.min(xR, mifR.xpos() + mifR.width - WEDGE_BAR_CLEAR);
 
-  const h = 15.0 / 2;
+  const h = obj.spread / 2;
   // 真实端点：渐强尖端在 start（高 0）、宽口在 end（高 h），渐弱相反。
   // 落在系统边界的断点不按 tick 插值（否则尖端附近的续接段开度过小），固定取
   // BREAK_FRAC×h，使断开的松叶在续接系统上有明显开口。

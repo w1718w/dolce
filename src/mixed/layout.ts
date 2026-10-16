@@ -84,7 +84,7 @@ import {
   type PrintInput,
 } from "./layoutpass";
 import { melodyChords, topNote } from "../model/jianpu";
-import { defaultsFonts, measureWidth, noteStem, printLayout, staffDetailsOf, xmlAlign, xmlFont, xmlPos } from "../model/xmlsurface";
+import { defaultsFonts, measureWidth, noteStem, partSymbolOf, printLayout, staffDetailsOf, wedgeSpread, xmlAlign, xmlFont, xmlPos } from "../model/xmlsurface";
 
 /** Bravura Text 里 segno/coda 相对 Bravura 同一字形的大小（见 processSegno） */
 const BRAVURA_TEXT_SCALE = 0.8;
@@ -121,7 +121,7 @@ function makeTime(time: DocTime): TimeSig {
   return t;
 }
 
-interface TieRef { note: NoteLayout; pitch: number; endTick: Fraction }
+interface TieRef { note: NoteLayout; pitch: number; endTick: Fraction; /** 源谱写了的朝向（`<tied orientation>`），起点才有 */ above?: boolean }
 
 /** 一个元素在小节里的游标（divisions）：`onset` 缺省 = 前一个元素的终点 */
 function measureTiming(m: Measure): { onsets: number[]; endAfter: number[]; end: number } {
@@ -173,6 +173,8 @@ class DocPartLoader {
 
   tieStarts: TieRef[] = [];
   tieStops: TieRef[] = [];
+  /** 起点音 → 源谱写的延音线朝向（`<tied orientation="over|under">`；识别稿照原图写） */
+  tieAboveOf = new Map<DocNote, boolean>();
   // lrc linking: num → [LyricLayout list in order]
   lrcByNum = new Map<string, LyricLayout[]>();
   // lyric extend (melisma) points, paired 2-by-2 in processLrcExtend
@@ -191,6 +193,7 @@ class DocPartLoader {
     type: "crescendo" | "diminuendo" | "stop";
     relX: number | null;
     defY: number | null;
+    spread: number | null;
   }[] = [];
   pedalPts: {
     mif: MeasureLayout;
@@ -214,6 +217,14 @@ class DocPartLoader {
       }
     }
     for (const mk of marks) {
+      // 延音线朝向只在自动铺排时照源谱：带坐标的原文照原 C++ 工程按声部与符干猜（那边的 orientation 从来不读）
+      if (mk.type === "tied") {
+        if (!score.autoLayout) continue;
+        const dir = mk.placement === "above" || mk.orientation === "over" ? true : mk.placement === "below" || mk.orientation === "under" ? false : undefined;
+        const n = this.docChordById.get(mk.start)?.notes[mk.startNote ?? 0];
+        if (dir !== undefined && n) this.tieAboveOf.set(n, dir);
+        continue;
+      }
       if (mk.type !== "slur" && mk.type !== "tuplet") continue;
       if (!ids.has(mk.start) || !ids.has(mk.end)) continue;
       const list = this.marksByEnd.get(mk.end);
@@ -555,6 +566,7 @@ class DocPartLoader {
       const ry = pos?.relativeY;
       if (ry !== undefined) y += ry;
       lrc.y = y;
+      if (pos?.defaultY !== undefined) lrc.srcY = y;
       const lf = xmlFont(l);
       lrc.font = lf?.family || lf?.size
         ? new Font(lf.family ?? this.score.defaults.lyricFont.family, lf.size ? lf.size / this.score.scaling : this.score.defaults.lyricFont.size)
@@ -579,7 +591,7 @@ class DocPartLoader {
   private processTie(note: DocNote | null, nt: NoteLayout, tick: Fraction): void {
     if (note?.tie?.start) {
       nt.tieBegin = true;
-      this.tieStarts.push({ note: nt, pitch: nt.writtenPitch, endTick: tick.plus(nt.chord.dur) });
+      this.tieStarts.push({ note: nt, pitch: nt.writtenPitch, endTick: tick.plus(nt.chord.dur), above: this.tieAboveOf.get(note) });
     }
     if (note?.tie?.stop) {
       nt.tieEnd = true;
@@ -818,6 +830,7 @@ class DocPartLoader {
       type: ty,
       relX: xmlPos(el)?.relativeX ?? null,
       defY: xmlPos(el)?.defaultY ?? null,
+      spread: wedgeSpread(el) ?? null,
     });
   }
 
@@ -854,6 +867,10 @@ class DocPartLoader {
           w.endMeasure = p.mif;
           if (start.relX !== null) w.dxLeft = start.relX;
           if (p.relX !== null) w.dxRight = p.relX;
+          // `spread` 写在开口那一端：渐强在止点、渐弱在起点；两头都没写取缺省。
+          // 只在源谱版面档（识别稿）认：带坐标的原文照原 C++ 工程一律 15
+          const spread = w.crescendo ? p.spread ?? start.spread : start.spread ?? p.spread;
+          if (this.score.keepBreaks && spread !== null && spread > 0) w.spread = spread;
           if (start.defY !== null) w.ypos = -start.defY;
           else w.autoY = true;
           start = null;
@@ -934,6 +951,12 @@ class DocPartLoader {
     const pos = xmlPos(w);
     const dy = pos?.defaultY;
     if (dy !== undefined) blk.y = dy;
+    // 自动铺排时写了 default-y 的文字是识别稿照原图写的（声部标签「Alto」、「rit.」）：同力度一样照原位、照原字号，
+    // 不抬到整行最高处（`placeAboveStaff` 只按横向跨过那段轮廓让）
+    if (dy !== undefined && this.score.autoLayout) {
+      blk.sourceY = true;
+      if ((xmlFont(w)?.size ?? 0) > 0) blk.sourceSize = true;
+    }
     const ry = pos?.relativeY;
     if (ry !== undefined) blk.y += ry;
     // x 口径同 parser.cpp::processTextPos：有 relative-x 就相对拍位（updateDataXPos 再加拍位 x）；
@@ -960,10 +983,16 @@ class DocPartLoader {
   private processDynamic(blk: MeasureText, dyn: DirectionPart): boolean {
     const pos = xmlPos(dyn);
     const dy = pos?.defaultY;
-    if (dy !== undefined) blk.y = dy;
+    if (dy !== undefined) {
+      blk.y = dy;
+      blk.sourceY = true;
+    }
     const rx = pos?.relativeX;
     if (rx !== undefined) blk.x = rx;
-    const font = new Font("Bravura", 16 / this.score.scaling);
+    // 原文写了字号（识别稿照原图墨迹高折的）就照它；没写取 16pt
+    const pt = xmlFont(dyn)?.size;
+    if (pt !== undefined && pt > 0) blk.sourceSize = true;
+    const font = new Font("Bravura", (pt !== undefined && pt > 0 ? pt : 16) / this.score.scaling);
     const glyphs = dyn.text ? dynamicGlyphs(dyn.text) : "";
     if (!glyphs) return false;
     blk.add(glyphs, font, true);
@@ -1169,6 +1198,8 @@ class DocPartLoader {
       // 量不出数（转来的谱音高位置这会儿还没定、或 default-y 不是数）按没写处理：否则符干长成 NaN，
       // 挂在符干上的延长记号、混排简谱层的上沿跟着全是 NaN（264《陶我成器》、081 的 `.jpwabc` 混排）
       ch.stemLen = Number.isFinite(len) ? len : ch.grace ? 35 * this.score.options.graceSize : 35;
+      // 源谱版面档（识别稿）记下原图的符干端点，符杠组照它连（`BeamGroup.fitSourceTips`）；带坐标的原文仍照原 C++ 工程重算
+      if (this.score.keepBreaks && sy !== undefined && Number.isFinite(sy)) ch.srcTipY = -sy;
     }
   }
 
@@ -1222,6 +1253,10 @@ class DocPartLoader {
         tied.endNote = stop.note;
         tied.startTick = start.note.chord.tick();
         tied.endTick = start.endTick;
+        if (start.above !== undefined) {
+          tied.above = start.above;
+          tied.srcDir = true;
+        }
         break;
       }
     }
@@ -1323,7 +1358,18 @@ function partGroupsOf(score: StaffLayout, song: Song): PartGroup[] {
   });
   for (const g of docGroups) if (!made.has(g)) make(g);
   for (const g of groups) {
-    if (g.parts.length === 1 && g.parts[0].staves.length > 1) g.barline = true;
+    if (g.parts.length === 1 && g.parts[0].staves.length > 1) {
+      g.barline = true;
+      // 多谱表声部自己的符号（`<part-symbol>`）：没写按规范缺省 brace——Finale 导出的钢琴谱、识别稿都不写，
+      // 从前这里不认，钢琴两行谱前没有大括号。分组本身写了符号的（Sibelius 把钢琴写成 brace 分组）照分组的
+      if (g.symbol === GroupSymbol.None) {
+        const idx = score.parts.indexOf(g.parts[0]);
+        const ps = partSymbolOf(song.parts[idx]?.measures[0]?.attrs);
+        const sym = ps?.symbol ?? "brace";
+        g.symbol = sym === "brace" ? GroupSymbol.Brace : sym === "bracket" || sym === "square" ? GroupSymbol.Bracket : GroupSymbol.None;
+        if (ps?.top !== undefined || ps?.bottom !== undefined) g.staffRange = [(ps.top ?? 1) - 1, (ps.bottom ?? g.parts[0].staves.length) - 1];
+      }
+    }
   }
   return groups;
 }

@@ -785,13 +785,30 @@ export function findPrimitives(
   // 半径取两个线宽：符干就这么粗，再大会把相邻两组的符杠连成一条。
   const bMaskC = close1d(bMask, w, h, Math.round(unit.lineThick * 2), true);
   const beams: BeamQuad[] = [];
-  /** 这一列附近有没有一根竖段搭着这块（x 在 ±tol 内、纵向与块相交），有就返回它的 x。 */
+  /** 这一列附近有没有一根竖段搭着这块（x 在 ±tol 内、纵向与块相交或差不到 0.3 格），有就返回它的 x。
+   *  干接杠那几列横墨宽、抽竖段时常截掉一小截，干端离杠底三四像素（宁静的伯利恒 p6 m79 低音 A2–E3 的短杠） */
   const stemNear = (x: number, b: Rect, tol: number): number | null => {
+    const gap = Math.max(2, unit.space * 0.3);
     for (const v of vSegs) {
       const vx = (v.x0 + v.x1) / 2;
-      if (Math.abs(vx - x) <= tol && Math.min(v.y0, v.y1) <= b.y + b.h + 2 && Math.max(v.y0, v.y1) >= b.y - 2) return vx;
+      if (Math.abs(vx - x) <= tol && Math.min(v.y0, v.y1) <= b.y + b.h + gap && Math.max(v.y0, v.y1) >= b.y - gap) return vx;
     }
     return null;
+  };
+  /** 竖段表里没有的干：这一列附近从块上沿往上、或下沿往下连着 `SHORT_BEAM_INK_STEM` 格以上的竖墨（原图），返回列 x。
+   *  干两侧挨着别的墨时抽不成竖段（宁静的伯利恒 p8 m96 钢琴右手 A4、B4 两个十六分，B4 的干左边是两层短杠、下边贴着 A4 的头） */
+  const inkStemNear = (x: number, b: Rect, tol: number): number | null => {
+    const at = (xx: number, y: number) => xx >= 0 && xx < w && y >= 0 && y < h && !!bin.data[y * w + xx];
+    let best: number | null = null;
+    let most = 0;
+    for (let xx = Math.round(x - tol); xx <= Math.round(x + tol); xx++)
+      for (const [y0, dir] of [[b.y, -1], [b.y + b.h - 1, 1]] as const) {
+        let y = y0;
+        while (at(xx, y + dir)) y += dir;
+        const reach = Math.abs(y - y0);
+        if (reach >= unit.space * SHORT_BEAM_INK_STEM && reach > most) (most = reach), (best = xx);
+      }
+    return best;
   };
   /** 两根干之间逐列量块的墨厚（这一列在块盒里最长的竖游程），取中位数。 */
   const midThick = (b: Rect, xa: number, xb: number): number => {
@@ -810,8 +827,8 @@ export function findPrimitives(
     const tol = Math.max(2, unit.lineThick * 2);
     let shortBeam = false;
     if (c.bbox.w >= unit.space * SHORT_BEAM_W && c.bbox.w < unit.space * 1.5 && c.bbox.h <= unit.space * 1.2) {
-      const xa = stemNear(c.bbox.x, c.bbox, tol);
-      const xb = stemNear(c.bbox.x + c.bbox.w - 1, c.bbox, tol);
+      const xa = stemNear(c.bbox.x, c.bbox, tol) ?? inkStemNear(c.bbox.x, c.bbox, tol);
+      const xb = stemNear(c.bbox.x + c.bbox.w - 1, c.bbox, tol) ?? inkStemNear(c.bbox.x + c.bbox.w - 1, c.bbox, tol);
       if (xa !== null && xb !== null && xb - xa >= unit.space * 0.7) {
         const t = midThick(c.bbox, xa + tol, xb - tol) / unit.space;
         shortBeam = t >= SHORT_BEAM_THICK[0] && t <= SHORT_BEAM_THICK[1];
@@ -867,7 +884,7 @@ export function findPrimitives(
       }
       ts.sort((p, q) => p - q);
       const med = ts[ts.length >> 1] || 1;
-      if (ts.length >= unit.space && med > unit.space * BEAM_EVEN_MED && ts[Math.floor(ts.length * 0.1)] < med * BEAM_EVEN_LO) continue;
+      if (ts.length >= unit.space * 0.5 && med > unit.space * BEAM_EVEN_MED && ts[Math.floor(ts.length * 0.1)] < med * BEAM_EVEN_LO) continue;
     }
     beams.push({ ...line, box: c.bbox });
   }
@@ -1312,6 +1329,8 @@ export function repairLineCuts(bin: Binary, nl: Binary, lineYs: number[], unit: 
 const SHORT_BEAM_W = 0.9;
 /** 同上：两根干之间逐列墨厚的中位数（格）。杠约半格厚；比这薄的是连线、谱线残段，比这厚的是挨着两根干的实心头。 */
 const SHORT_BEAM_THICK = [0.4, 0.6] as const;
+/** 短杠一端没有竖段时，图上那一列从杠往外连着的竖墨至少这么多格才算干（`inkStemNear`）。 */
+const SHORT_BEAM_INK_STEM = 1.5;
 /** `thinOnly`：这几条线只抹竖游程不过 `THIN_ONLY_RUN` 个线宽的列（见 `recognize.ts` 调用处）。 */
 /**
  * **按游程去线**（只给认弧用）：每条线逐列取线心处的竖游程，不过这条线的实测线宽就整段清掉，更长的整段留下
@@ -1549,6 +1568,81 @@ export function groupByLeftInk(
       return { x, y: g[0].top, w: unit.space * (LEFTINK_OUT + LEFTINK_IN), h: g[g.length - 1].bottom - g[0].top };
     });
 }
+
+/**
+ * **声部方括号**（合唱谱人声几行左边那个 `[`）：系统线左边一条**粗、直**的竖笔，从一行谱的顶线连到另一行的底线，两头带钩。
+ * 系统线（细）、钢琴花括号（弯，笔画中心左右摆）都不是。罩住两行以上谱的才收，写成 `PartBracket`（`score.ts::groupParts` 据此分组）。
+ *
+ * 逐行在谱行左缘外 `[left − PB_WIN, left − PB_GAP]` 那一小条里找最长的连续墨段：宽 `PB_MIN_W`~`PB_MAX_W` 格算这一行有粗笔；
+ * 纵向连着（断开不过 `PB_JOIN` 格）的成一段，段里墨段中心的横向跨度不过 `PB_STRAIGHT` 格才算直。
+ */
+export function findPartBrackets(
+  bin: Binary,
+  staves: { top: number; bottom: number; left: number }[],
+  unit: RasterUnit,
+): Rect[] {
+  if (staves.length < 2) return [];
+  const sp = unit.space;
+  const ss = [...staves].sort((a, b) => a.top - b.top);
+  const medLeft = ss.map((s) => s.left).sort((a, b) => a - b)[ss.length >> 1]!;
+  const y0 = Math.max(0, Math.round(ss[0]!.top)), y1 = Math.min(bin.h - 1, Math.round(ss[ss.length - 1]!.bottom));
+  /** 某一行左缘外那一条里最长墨段的 [左, 右]；没有合格的粗笔返回 null */
+  const runAt = (y: number): [number, number] | null => {
+    const near = ss.reduce((p, s) => (Math.abs((s.top + s.bottom) / 2 - y) < Math.abs((p.top + p.bottom) / 2 - y) ? s : p));
+    const left = Math.min(near.left, medLeft);
+    const xa = Math.max(0, Math.round(left - sp * PB_WIN)), xb = Math.min(bin.w - 1, Math.round(left - sp * PB_GAP));
+    let best: [number, number] | null = null;
+    for (let x = xa; x <= xb; x++) {
+      if (!bin.data[y * bin.w + x]) continue;
+      let e = x;
+      while (e + 1 <= xb && bin.data[y * bin.w + e + 1]) e++;
+      if (!best || e - x > best[1] - best[0]) best = [x, e];
+      x = e;
+    }
+    if (!best) return null;
+    const w = best[1] - best[0] + 1;
+    return w >= sp * PB_MIN_W && w <= sp * PB_MAX_W ? best : null;
+  };
+  const out: Rect[] = [];
+  let seg: { top: number; bottom: number; cs: number[]; l: number; r: number } | null = null;
+  let miss = 0;
+  const flush = () => {
+    if (!seg) return;
+    const cs = [...seg.cs].sort((a, b) => a - b);
+    // 两头的钩往右拐：中心跨度取中间九成
+    const lo = cs[Math.floor(cs.length * 0.05)]!, hi = cs[Math.floor(cs.length * 0.95)]!;
+    const inside = ss.filter((s) => (s.top + s.bottom) / 2 > seg!.top && (s.top + s.bottom) / 2 < seg!.bottom);
+    if (hi - lo <= sp * PB_STRAIGHT && inside.length >= 2 && seg.top <= inside[0]!.top + sp && seg.bottom >= inside[inside.length - 1]!.bottom - sp)
+      out.push({ x: seg.l, y: seg.top, w: seg.r - seg.l + 1, h: seg.bottom - seg.top });
+    seg = null;
+  };
+  for (let y = y0; y <= y1; y++) {
+    const r = runAt(y);
+    if (!r) {
+      if (seg && ++miss > sp * PB_JOIN) flush();
+      continue;
+    }
+    miss = 0;
+    if (!seg) seg = { top: y, bottom: y, cs: [], l: r[0], r: r[1] };
+    seg.bottom = y;
+    seg.cs.push((r[0] + r[1]) / 2);
+    seg.l = Math.min(seg.l, r[0]);
+    seg.r = Math.max(seg.r, r[1]);
+  }
+  flush();
+  return out;
+}
+
+/** 声部方括号的检测窗口：谱行左缘往左 `PB_WIN` 格到 `PB_GAP` 格（系统线贴着左缘，不进来） */
+const PB_WIN = 1.5;
+const PB_GAP = 0.15;
+/** 粗笔一行的墨宽（格）：细系统线、谱线左端不到这么宽；再宽的是花括号的肚子或别的块 */
+const PB_MIN_W = 0.3;
+const PB_MAX_W = 0.9;
+/** 纵向断开不过这么多格仍算一条 */
+const PB_JOIN = 0.3;
+/** 「直」：墨段中心横向跨度上限（格）。花括号一行谱高里就摆出一格多 */
+const PB_STRAIGHT = 0.25;
 
 /** 抹掉笔画之后剩下的墨——`findBlobs` 与 `findBraces` 都从它出发。
  *  **对外**：叠置空心和弦要在这张图上数孔（原图上符干会把内腔连出去）。 */

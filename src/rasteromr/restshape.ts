@@ -377,6 +377,234 @@ export function sharpCrossbars(bin: Binary, b: Rect, unit: RasterUnit): boolean 
   return gap >= 0.7 && gap <= 1.3;
 }
 
+/** 横杠的竖向厚度（格）、两道中心相距（格）、平行（斜率差）、横向交叠与长度比的门槛，竖笔伸出横杠多少（格）算伸出。 */
+const XBAR_THICK = [0.2, 0.8] as const;
+const XBAR_GAP = [0.6, 1.4] as const;
+const XBAR_SLOPE_DIFF = 0.3;
+const XBAR_OVERLAP = 0.6;
+const XBAR_LEN_RATIO = 0.6;
+const XBAR_REACH = 0.3;
+const XBAR_LEN_MAX = 1.3;
+
+/**
+ * **先找两道平行粗斜横，再按竖笔与横杠的关系分 ♯ / ♮**。临时记号与邻音粘连时竖笔最不可靠：与邻音的干共用一列、被邻头盖住半截、
+ * 被谱线切断；两道横杠反而稳——厚 0.2~0.8 格、同向斜、平行、长短相近、上下相隔一格上下。邻头的残墨凑不齐这几条。
+ *
+ * 逐列取厚度落在横杠那一档的竖游程（通高的竖笔列跳过），相邻列（隔开不过三列，跨过竖笔）中心接得上的连成一道，
+ * 取满足上面几条的一对。再看每根通高竖笔在两道横杠处伸出多少：
+ * - 有一根上下都伸出（过上横杠以上、下横杠以下各 `XBAR_REACH` 格）→ 升号；
+ * - 左竖只往上伸、右竖只往下伸（两根都要见到）→ 还原号。
+ * 只剩一根竖笔且只往一头伸的不判（分不出是还原号的哪一竖）。
+ */
+export function crossbarAccidental(bin: Binary, b: Rect, unit: RasterUnit, win = false): "accidentalSharp" | "accidentalNatural" | null {
+  return crossbarAccidentalBox(bin, b, unit, win)?.code ?? null;
+}
+
+/**
+ * 同上，另交出记号的外框（两道横杠与夹着它们的竖笔）。`win` 为真时 `b` 是头左边的整个窗、图是**带谱线的原图**：
+ * 升号、还原号常压在谱线上，去线时横笔跟着抹掉；原图上谱线只有两三像素厚，过不了横杠的厚度下限，压线的横杠反而更厚。
+ * 窗里竖笔按一格半以上算通高，先找竖笔对、只在这对竖笔附近找横杠，横杠不长过 `XBAR_LEN_MAX` 格（符杠）。
+ */
+export function crossbarAccidentalBox(bin: Binary, b: Rect, unit: RasterUnit, win = false): { code: "accidentalSharp" | "accidentalNatural"; box: Rect } | null {
+  if (!win) return crossbarIn(bin, b, unit, false);
+  // 整窗：先找竖笔对（相隔 0.3~0.8 格的两根一格半以上的竖笔），只在这一对左右各让 0.3 格的范围里找横杠——
+  // 窗里别的墨（前一个音的笔画）与横杠同高时连成一段、碰到窗边，整窗找就被剔掉（赞美三一真神 m12 低音 ♯）
+  const sp = unit.space;
+  const cols: { x: number; xr: number }[] = [];
+  for (let x = b.x; x < b.x + b.w; x++) {
+    let run = 0, best = 0;
+    for (let y = b.y; y < b.y + b.h; y++) (run = bin.data[y * bin.w + x] ? run + 1 : 0), (best = Math.max(best, run));
+    if (best < sp * 1.5) continue;
+    const g = cols[cols.length - 1];
+    if (g && x - g.xr <= 2) g.xr = x;
+    else cols.push({ x, xr: x });
+  }
+  for (let i = 0; i + 1 < cols.length; i++) {
+    const gap = cols[i + 1].x - cols[i].xr;
+    if (gap < sp * 0.3 || gap > sp * 0.8) continue;
+    const x0 = Math.max(b.x, Math.round(cols[i].x - sp * 0.3)), x1 = Math.min(b.x + b.w, Math.round(cols[i + 1].xr + 1 + sp * 0.3));
+    const r = crossbarIn(bin, { x: x0, y: b.y, w: x1 - x0, h: b.h }, unit, true);
+    if (r) return r;
+  }
+  return null;
+}
+
+function crossbarIn(bin: Binary, b: Rect, unit: RasterUnit, win: boolean): { code: "accidentalSharp" | "accidentalNatural"; box: Rect } | null {
+  const sp = unit.space;
+  const ink = (x: number, y: number) => x >= 0 && y >= 0 && x < bin.w && y < bin.h && !!bin.data[y * bin.w + x];
+  // 通高竖笔：列里最长竖游程过盒高 55%
+  const tall: { x: number; top: number; bot: number }[] = [];
+  const runs: { x: number; y0: number; y1: number }[][] = [];
+  for (let x = b.x; x < b.x + b.w; x++) {
+    const col: { x: number; y0: number; y1: number }[] = [];
+    let best = { top: 0, bot: -1 };
+    for (let y = b.y; y < b.y + b.h; y++) {
+      if (!ink(x, y)) continue;
+      let z = y;
+      while (z + 1 < b.y + b.h && ink(x, z + 1)) z++;
+      if (z - y > best.bot - best.top) best = { top: y, bot: z };
+      const t = (z - y + 1) / sp;
+      if (t >= XBAR_THICK[0] && t <= XBAR_THICK[1]) col.push({ x, y0: y, y1: z });
+      y = z;
+    }
+    if (best.bot - best.top + 1 >= (win ? sp * 1.5 : b.h * 0.55)) {
+      tall.push({ x, top: best.top, bot: best.bot });
+      runs.push([]);
+    } else runs.push(col);
+  }
+  // 连成横杠
+  type Bar = { pts: { x: number; y: number; t: number }[] };
+  const bars: Bar[] = [];
+  const open: { bar: Bar; lastX: number; lastY: number }[] = [];
+  for (const col of runs)
+    for (const r of col) {
+      const cy = (r.y0 + r.y1) / 2;
+      const hit = open.find((o) => r.x - o.lastX <= 4 && Math.abs(o.lastY - cy) <= sp * 0.3);
+      const pt = { x: r.x, y: cy, t: r.y1 - r.y0 + 1 };
+      if (hit) {
+        hit.bar.pts.push(pt);
+        hit.lastX = r.x;
+        hit.lastY = cy;
+      } else {
+        const bar = { pts: [pt] };
+        bars.push(bar);
+        open.push({ bar, lastX: r.x, lastY: cy });
+      }
+    }
+  const fit = (bar: Bar) => {
+    const n = bar.pts.length;
+    const mx = bar.pts.reduce((a, p) => a + p.x, 0) / n;
+    const my = bar.pts.reduce((a, p) => a + p.y, 0) / n;
+    let sxy = 0, sxx = 0;
+    for (const p of bar.pts) (sxy += (p.x - mx) * (p.y - my)), (sxx += (p.x - mx) ** 2);
+    const k = sxx ? sxy / sxx : 0;
+    const ts = bar.pts.map((p) => p.t).sort((p, q) => p - q);
+    return { x0: bar.pts[0].x, x1: bar.pts[n - 1].x, k, yAt: (x: number) => my + k * (x - mx), t: ts[ts.length >> 1] };
+  };
+  const cand = bars
+    .filter((q) => q.pts.length >= Math.max(3, sp * 0.3))
+    .map(fit)
+    .filter((c) => !win || c.x1 - c.x0 <= sp * XBAR_LEN_MAX);
+  let pair: [ReturnType<typeof fit>, ReturnType<typeof fit>] | null = null;
+  let bestGap = Infinity;
+  for (let i = 0; i < cand.length; i++)
+    for (let j = 0; j < cand.length; j++) {
+      const u = cand[i], l = cand[j];
+      if (i === j) continue;
+      const ov = Math.min(u.x1, l.x1) - Math.max(u.x0, l.x0);
+      const lu = u.x1 - u.x0, ll = l.x1 - l.x0;
+      if (ov < Math.min(lu, ll) * XBAR_OVERLAP || Math.min(lu, ll) < Math.max(lu, ll) * XBAR_LEN_RATIO) continue;
+      if (Math.abs(u.k - l.k) > XBAR_SLOPE_DIFF) continue;
+      const mx = (Math.max(u.x0, l.x0) + Math.min(u.x1, l.x1)) / 2;
+      const gap = (l.yAt(mx) - u.yAt(mx)) / sp;
+      if (gap < XBAR_GAP[0] || gap > XBAR_GAP[1]) continue;
+      // 两道里取最贴近一格的那对
+      if (Math.abs(gap - 1) < bestGap) (bestGap = Math.abs(gap - 1)), (pair = [u, l]);
+    }
+  if (!pair) return null;
+  const [u, l] = pair;
+  // 竖笔按列成组
+  const groups: { x: number; xr: number; top: number; bot: number }[] = [];
+  for (const t of tall) {
+    const g = groups[groups.length - 1];
+    if (g && t.x - g.xr <= 2) (g.top = Math.min(g.top, t.top)), (g.bot = Math.max(g.bot, t.bot)), (g.xr = t.x);
+    else groups.push({ x: t.x, xr: t.x, top: t.top, bot: t.bot });
+  }
+  const reach = sp * XBAR_REACH;
+  // 窗里只看夹在两道横杠横向范围里（左右各让三像素）的竖笔
+  const xa = Math.min(u.x0, l.x0) - 3, xz = Math.max(u.x1, l.x1) + 3;
+  const near = win ? groups.filter((g) => g.xr >= xa && g.x <= xz) : groups;
+  // 整窗里要见到两根竖笔、相隔 0.35 格以上：琶音的竖波浪只有一根，鼓包也凑得出两道横（恩友歌伴奏 m13）
+  if (win && (near.length < 2 || near[near.length - 1].x - near[0].xr < sp * 0.35)) return null;
+  const ext = near.map((g) => ({
+    x: g.x,
+    up: g.top <= u.yAt(g.x) - u.t / 2 - reach,
+    down: g.bot >= l.yAt(g.x) + l.t / 2 + reach,
+  }));
+  const top = Math.min(u.yAt(xa + 3), u.yAt(xz - 3)) - u.t / 2;
+  const bot = Math.max(l.yAt(xa + 3), l.yAt(xz - 3)) + l.t / 2;
+  const box = {
+    x: Math.min(xa + 3, ...near.map((g) => g.x)),
+    y: Math.round(Math.min(top, ...near.map((g) => g.top))),
+    w: 0,
+    h: 0,
+  };
+  box.w = Math.max(xz - 3, ...near.map((g) => g.xr)) - box.x + 1;
+  box.h = Math.round(Math.max(bot, ...near.map((g) => g.bot))) - box.y + 1;
+  if (ext.some((e) => e.up && e.down)) return { code: "accidentalSharp", box };
+  if (ext.length >= 2 && ext[0].up && !ext[0].down && ext[ext.length - 1].down && !ext[ext.length - 1].up) return { code: "accidentalNatural", box };
+  return null;
+}
+
+/** 降号：竖笔高（格）、整个字形宽（格）、肚子往竖笔右边伸出至少多少（格）、闭合白腔至少多大（格²）、竖笔上段右边至多多少墨（占比）。 */
+const FLAT_STEM_H = [1.5, 3.0] as const;
+const FLAT_W = [0.45, 1.0] as const;
+const FLAT_BELLY = 0.35;
+const FLAT_HOLE = 0.04;
+const FLAT_TOP_INK = 0.15;
+
+/**
+ * **降号按结构认**：一根通高竖笔，右边只在下半挂一个闭合的肚子。字典按块查不出它的时候用——
+ * 竖笔被谱线切成几截、上端又粘着前一个音的头（破碎 p8 m80 钢琴右手和弦前外列的 ♭）。
+ * 图要用修补图（谱线抹掉、切口补回），原图上谱线连通一切、去线图上竖笔断开。
+ *
+ * 逐列找最长竖游程落在 `FLAT_STEM_H` 的竖笔，从它起灌连通块：块不往竖笔左边伸、宽在 `FLAT_W`、
+ * 往右伸出 `FLAT_BELLY` 格以上；竖笔上面四成高的右边几乎没墨（升号、还原号、带干的头上下都有）；块里有闭合白腔。
+ */
+export function flatAccidentalBox(bin: Binary, b: Rect, unit: RasterUnit): Rect | null {
+  const sp = unit.space;
+  const ink = (x: number, y: number) => x >= b.x && y >= b.y && x < b.x + b.w && y < b.y + b.h && !!bin.data[y * bin.w + x];
+  const stems: { x: number; xr: number; top: number; bot: number }[] = [];
+  for (let x = b.x; x < b.x + b.w; x++) {
+    let best = { top: 0, bot: -1 };
+    for (let y = b.y; y < b.y + b.h; y++) {
+      if (!ink(x, y)) continue;
+      let z = y;
+      while (ink(x, z + 1)) z++;
+      if (z - y > best.bot - best.top) best = { top: y, bot: z };
+      y = z;
+    }
+    const len = best.bot - best.top + 1;
+    if (len < sp * FLAT_STEM_H[0] || len > sp * FLAT_STEM_H[1]) continue;
+    const g = stems[stems.length - 1];
+    if (g && x - g.xr <= 1) (g.xr = x), (g.top = Math.min(g.top, best.top)), (g.bot = Math.max(g.bot, best.bot));
+    else stems.push({ x, xr: x, top: best.top, bot: best.bot });
+  }
+  for (const st of stems) {
+    if (st.xr - st.x + 1 > sp * 0.3) continue;
+    // 从竖笔灌连通块
+    const seen = new Set<number>();
+    const stack: number[] = [];
+    for (let y = st.top; y <= st.bot; y++) if (ink(st.x, y)) stack.push(y * bin.w + st.x);
+    let x0 = Infinity, y0 = Infinity, x1 = -1, y1 = -1;
+    while (stack.length) {
+      const i = stack.pop()!;
+      if (seen.has(i)) continue;
+      seen.add(i);
+      const x = i % bin.w, y = (i - x) / bin.w;
+      x0 = Math.min(x0, x), x1 = Math.max(x1, x), y0 = Math.min(y0, y), y1 = Math.max(y1, y);
+      for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) if (ink(nx, ny) && !seen.has(ny * bin.w + nx)) stack.push(ny * bin.w + nx);
+    }
+    const box = { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+    if (x0 < st.x - 1 || box.w < sp * FLAT_W[0] || box.w > sp * FLAT_W[1] || x1 - st.xr < sp * FLAT_BELLY) continue;
+    if (box.h > sp * FLAT_STEM_H[1] + 2) continue;
+    // 竖笔上面四成高：右边几乎没墨
+    let top = 0, all = 0;
+    for (let y = st.top; y < st.top + (st.bot - st.top) * 0.4; y++)
+      for (let x = st.xr + 2; x <= x1; x++) (all++, seen.has(y * bin.w + x) && top++);
+    if (all && top / all > FLAT_TOP_INK) continue;
+    // 闭合白腔：只看这一块的墨
+    const local = { w: box.w + 2, h: box.h + 2, data: new Uint8Array((box.w + 2) * (box.h + 2)) } as Binary;
+    for (const i of seen) {
+      const x = i % bin.w, y = (i - x) / bin.w;
+      local.data[(y - y0 + 1) * local.w + (x - x0 + 1)] = 1;
+    }
+    if (enclosedWhite(local, { left: 1, top: 1, right: box.w, bottom: box.h }, sp, 1) < sp * sp * FLAT_HOLE) continue;
+    return box;
+  }
+  return null;
+}
+
 export function offStaffRest(box: { y: number; h: number }, lines: { y: number }[], unit: RasterUnit): boolean {
   const cy = box.y + box.h / 2;
   const ys = [...lines].map((l) => l.y).sort((a, b) => a - b);

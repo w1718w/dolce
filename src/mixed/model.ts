@@ -456,6 +456,8 @@ export class ChordLayout {
 
   stemLen = 0; // 无符干（全音符）默认 0，与 musicpp 一致；有符干者在 calcStemLen 赋值
   stemUp = true;
+  /** 源谱版面档：原图符干末端的 y（与 `NoteLayout.cy()` 同一坐标，来自 `<stem default-y>`）。符杠组照它定斜度与高低（`BeamGroup.fitSourceTips`） */
+  srcTipY: number | null = null;
   stemExtra = 0; // 跨谱表符杠时符干延伸量（model.hpp stemExtra / styler.cpp calcSlopeLen）
 
   notes: NoteLayout[] = [];
@@ -651,6 +653,13 @@ export class ChordLayout {
     }
   }
 
+  /** 二度翻到符干另一侧的符头横移一个符头宽（朝上的往右、朝下的往左）。音符 x 要先定好：
+   *  Sibelius 原文在读入时（它的 default-x 不含这一截），自动铺排在 `autoPlaceNotes` 定好 x 之后。 */
+  applyFlipOffset(meta: MetaData): void {
+    const width = smuflWidth(meta, this.sym());
+    for (const nt of this.notes) if (nt.flipped) nt.x += this.stemUp ? width : -width;
+  }
+
   static sortByOffset(arr: ChordLayout[]): void {
     arr.sort((a, b) => a.offset.compareTo(b.offset));
   }
@@ -732,13 +741,16 @@ export class AccidentalLayout {
       const rp = GlyphCodes.accidentalParensRight;
       item.text = lp + acc + rp;
       item.symbols = [lp, acc, rp];
-      item.cutOutNE = smuflCutOut(m, rp, "cutOutNE");
-      item.cutOutSE = smuflCutOut(m, rp, "cutOutSE");
+      // 右括号的挖角从它自己的原点量，挪到整串的坐标里要加上前面两个字形的宽
+      const rx = smuflWidth(m, lp) + smuflWidth(m, acc);
+      const shift = (c: { x: number; y: number } | null) => (c ? { x: c.x + rx, y: c.y } : null);
+      item.cutOutNE = shift(smuflCutOut(m, rp, "cutOutNE"));
+      item.cutOutSE = shift(smuflCutOut(m, rp, "cutOutSE"));
       item.cutOutNW = smuflCutOut(m, lp, "cutOutNW");
       item.cutOutSW = smuflCutOut(m, lp, "cutOutSW");
       item.width = smuflWidth(m, lp) + smuflWidth(m, rp) + smuflWidth(m, acc);
       item.down = -Math.min(smuflBottom(m, lp), smuflBottom(m, rp), smuflBottom(m, acc));
-      item.up = -Math.min(smuflTop(m, lp), smuflTop(m, rp), smuflTop(m, acc));
+      item.up = -Math.max(smuflTop(m, lp), smuflTop(m, rp), smuflTop(m, acc));
     } else {
       item.text = acc;
       item.symbols = [acc];
@@ -753,54 +765,54 @@ export class AccidentalLayout {
     this.accidentals.push(item);
   }
 
-  private tryPutItem(acc: AccItem): number {
-    const segs: AccSegment[] = [];
+  /**
+   * 一个记号放在左缘 `pos` 时的**纵向分段轮廓**（本坐标 y 向下，基线 `refY = −line·5`）。
+   * SMuFL 挖角锚点（`cutOutNE` 等）从字形原点量、y 向上为正：右上挖角 (cx, cy) 表示 y 高于 cy 的那截墨迹只到 cx。
+   * `side = "right"` 给每段的右缘离 `pos` 多远（与右边已放的东西比），`"left"` 给左缘（登记成后面记号的边界）。
+   */
+  private profile(acc: AccItem, side: "left" | "right"): { dx: number; top: number; bottom: number }[] {
     const sc = acc.scale;
     const refY = -acc.line * 5;
-    let top = acc.up + refY;
-    if (acc.cutOutNE) {
-      const y = acc.cutOutNE.y + top;
-      segs.push({ x: -sc * acc.cutOutNE.x, top, bottom: y });
-      top = y;
+    const top = refY + acc.up * sc;
+    const bottom = refY + acc.down * sc;
+    const hi = side === "right" ? acc.cutOutNE : acc.cutOutNW;
+    const lo = side === "right" ? acc.cutOutSE : acc.cutOutSW;
+    const full = side === "right" ? acc.width * sc : 0;
+    const out: { dx: number; top: number; bottom: number }[] = [];
+    let midTop = top;
+    let midBottom = bottom;
+    if (hi) {
+      const y = Math.min(bottom, Math.max(top, refY - hi.y * sc));
+      if (y > top) out.push({ dx: hi.x * sc, top, bottom: y });
+      midTop = y;
     }
-    let bot = acc.down + refY;
-    if (acc.cutOutSE) {
-      const y = bot - sc * acc.cutOutSE.y;
-      segs.push({ x: -sc * acc.cutOutSE.x, top: y, bottom: bot });
-      bot = y;
+    if (lo) {
+      const y = Math.max(midTop, Math.min(bottom, refY - lo.y * sc));
+      if (bottom > y) out.push({ dx: lo.x * sc, top: y, bottom });
+      midBottom = y;
     }
-    segs.push({ x: 0, top, bottom: bot });
+    if (midBottom > midTop) out.push({ dx: full, top: midTop, bottom: midBottom });
+    return out;
+  }
+
+  /** 这个记号最靠右能放在哪（左缘）：各段右缘不越过同高处已有东西的左缘 */
+  private tryPutItem(acc: AccItem): number {
     let res = Infinity;
-    for (const s of segs) {
+    for (const s of this.profile(acc, "right")) {
       let leftMost = Infinity;
       for (const b of this.bound) {
         if (b.top >= s.bottom) continue;
         if (s.top >= b.bottom) continue;
         leftMost = Math.min(leftMost, b.x);
       }
-      res = Math.min(res, leftMost - s.x);
+      res = Math.min(res, leftMost - s.dx);
     }
-    return res - acc.width * sc;
+    return res;
   }
 
   private putItem(pos: number, acc: AccItem): void {
-    const segs: AccSegment[] = [];
-    const refY = -acc.line * 5;
-    let top = acc.up + refY;
-    if (acc.cutOutNW) {
-      const y = acc.cutOutNW.y + refY;
-      segs.push({ x: pos + acc.cutOutNW.x, top, bottom: y });
-      top = y;
-    }
-    let bot = acc.down + refY;
-    if (acc.cutOutSW) {
-      const y = acc.cutOutSW.y + refY;
-      segs.push({ x: pos + acc.cutOutSW.x, top: y, bottom: bot });
-      bot = y;
-    }
-    segs.push({ x: pos, top, bottom: bot });
     acc.xpos = pos;
-    for (const s of segs) this.bound.push(s);
+    for (const s of this.profile(acc, "left")) this.bound.push({ x: pos + s.dx, top: s.top, bottom: s.bottom });
   }
 
   update(): void {
@@ -893,7 +905,8 @@ export class NoteEntry {
     this.acc = new AccidentalLayout(meta);
   }
 
-  layout(meta: MetaData, sibelius: boolean): void {
+  /** `stemClear`：符干朝下（干贴在符头左缘、正在临时记号右边）的和弦，临时记号离干至少再让这么多；0 = 照原 C++ 工程只让符头 */
+  layout(meta: MetaData, sibelius: boolean, stemClear = 0): void {
     this.dot = new DotLayout();
     this.leger = new LegerLayout();
     this.acc = new AccidentalLayout(meta);
@@ -912,6 +925,13 @@ export class NoteEntry {
         this.acc.addNote(line, left, n.acc, n.parenthesesAcc, 1);
       } else {
         this.acc.addNoteBound(line, left);
+      }
+    }
+    if (stemClear > 0) {
+      for (const ch of new Set(this.notes.map((n) => n.chord))) {
+        if (ch.rest || ch.stemUp || fGe(ch.noteType, new Fraction(4)) || !ch.notes.some((n) => n.acc !== "")) continue;
+        const ys = ch.notes.map((n) => n.cy());
+        this.acc.bound.push({ x: ch.stemX() - stemClear, top: Math.min(...ys) - 5, bottom: Math.max(ch.tailY(false), ...ys) });
       }
     }
     this.dot.update(meta);
@@ -985,6 +1005,8 @@ export class LyricLayout {
 
   x = -1;
   y = -1;
+  /** 原文写的基线（`<lyric default-y>`）：自动铺排把 `y` 重算掉，源谱版面档拿它对照原图（`autoPlaceLyricsY`） */
+  srcY: number | null = null;
   xOffset = 0;
   width = 0;
   prev: LyricLayout | null = null;
@@ -1389,6 +1411,10 @@ export class MeasureText extends TextBlock {
   relative = true;
   /** y 是自动铺排给的缺省高度（原文没写 default-y）：混排时要让到简谱层之上（`formatMixedScore`） */
   autoY = false;
+  /** 力度记号原文写了 `default-y`（识别稿照原图的位置）：自动铺排不改成缺省高度，只在撞上东西时推开 */
+  sourceY = false;
+  /** 力度记号原文写了字号：自动铺排不统一成歌词字号 */
+  sourceSize = false;
   /** `ScoreDoc` 里对应的 `<direction>`（导出时把排好的高度写回，`engrave.ts`） */
   src: DocDirection | null = null;
 
@@ -1399,6 +1425,14 @@ export class MeasureText extends TextBlock {
 }
 
 // ---------------- BeamGroup ----------------
+
+/** 照原图端点画的符杠组，最短的干至少这么长（tenths；一层符杠时，每多一层加 8） */
+const SOURCE_BEAM_MIN_STEM = 25;
+
+/** 符杠组里的休止离杠内缘至少这么远（tenths） */
+const REST_BEAM_CLEAR = 2;
+/** 让杠时最多挪几个线距 */
+const REST_BEAM_STEPS = 4;
 
 export class BeamGroup {
   chords: ChordLayout[] = [];
@@ -1421,6 +1455,44 @@ export class BeamGroup {
     for (const ch of this.chords) ch.stemUp = up;
   }
 
+  /**
+   * 符杠组中间的休止（`F E 𝄾 F` 一根杠跨过八分休止）让开符杠：休止按单声部摆在谱表中间，杠穿过它或压在它上面。
+   * 杠在上方（符干朝上）就把休止往下挪、杠在下方往上挪，一次一个线距，直到字形离杠内缘 `REST_BEAM_CLEAR`。
+   * 杠的几何同 `render.ts::drawBeamGroup`：首尾两根干端连线，每层 8、厚 5，朝上时往下长、朝下时往上长。
+   * 只管单谱表的组；要在音符横坐标与符干长都定了之后调。
+   */
+  clearRests(meta: MetaData): void {
+    const real = this.chords.filter((ch) => !ch.rest);
+    if (real.length < 2 || this.doubleDir) return;
+    const first = this.chords[0]!, last = this.chords[this.chords.length - 1]!;
+    if (first.rest || last.rest) return;
+    const staff = first.notes[0]!.staff;
+    if (this.chords.some((ch) => ch.notes.some((n) => n.staff !== staff))) return;
+    const up = first.stemUp;
+    const x1 = first.stemX(), y1 = first.tailY(false), x2 = last.stemX(), y2 = last.tailY(false);
+    const beamAt = (x: number) => (x2 !== x1 ? y1 + ((y2 - y1) * (x - x1)) / (x2 - x1) : y1);
+    // 杠底下的休止：读入时休止不带 `<beam>`、不进组，按本小节同声部同谱表、拍位落在组首尾之间的找
+    const md = first.measure;
+    const rests = md.chords.filter(
+      (ch) => ch.rest && !ch.grace && ch.voice === first.voice && ch.notes.length === 1 && ch.notes[0]!.staff === staff &&
+        ch.offset.compareTo(first.offset) > 0 && ch.offset.compareTo(last.offset) < 0,
+    );
+    for (const ch of rests) {
+      const nt = ch.notes[0]!;
+      const sym = ch.sym();
+      const prev = [...real].reverse().find((g) => g.offset.compareTo(ch.offset) < 0);
+      const next = real.find((g) => g.offset.compareTo(ch.offset) > 0);
+      const levels = Math.max(1, prev?.beams.length ?? 1, next?.beams.length ?? 1);
+      const yb = beamAt(nt.x + smuflWidth(meta, sym) / 2);
+      const inner = up ? yb + (levels - 1) * 8 + 5 + REST_BEAM_CLEAR : yb - (levels - 1) * 8 - 5 - REST_BEAM_CLEAR;
+      // 字形上下沿（本坐标 y 向下）：基线在 cy
+      const top = () => nt.cy() - smuflTop(meta, sym);
+      const bottom = () => nt.cy() - smuflBottom(meta, sym);
+      for (let i = 0; i < REST_BEAM_STEPS && (up ? top() < inner : bottom() > inner); i++) nt.writtenPitch += up ? -2 : 2;
+    }
+  }
+
+
   /** 方向定好之后（或音符 x 变了）重排：休止（不画符干）跟本组首个实音，再标 `doubleDir`、按斜率算各符干长。 */
   refresh(): void {
     if (this.chords.length === 0) return;
@@ -1430,7 +1502,38 @@ export class BeamGroup {
     const ref = this.chords.find((ch) => !ch.rest) ?? this.chords[0]!;
     for (const ch of this.chords) if (ch.rest) ch.stemUp = ref.stemUp;
     this.doubleDir = this.chords.some((ch) => ch.stemUp !== ref.stemUp);
-    this.format(0);
+    if (!this.fitSourceTips()) this.format(0);
+  }
+
+  /**
+   * 源谱版面档（识别稿）：组里每个音都带原图的符干端点时，符杠照原图——首尾两根干的端点连一条线（斜率同样截在 ±0.3），
+   * 各干补到这条线上；整条线太贴符头（最短的干不到 `SOURCE_BEAM_MIN_STEM`，按层数加长）就整条平移出去。
+   * 音的横向位置重排过，首尾端点照旧、斜度随之变化。两个方向混排、跨谱表的组仍按原公式（`format`）。
+   */
+  private fitSourceTips(): boolean {
+    const sounding = this.chords.filter((ch) => !ch.rest);
+    if (this.doubleDir || sounding.length < 2 || this.crossStaff() || sounding.some((ch) => ch.srcTipY === null)) return false;
+    const a = sounding[0]!, b = sounding[sounding.length - 1]!;
+    const xa = a.stemX(), xb = b.stemX();
+    let slope = xb - xa > 1e-6 ? (b.srcTipY! - a.srcTipY!) / (xb - xa) : 0;
+    slope = Math.max(-0.3, Math.min(0.3, slope));
+    const xm = (xa + xb) / 2, ym = (a.srcTipY! + b.srcTipY!) / 2;
+    const up = a.stemUp;
+    const inc = up ? -1 : 1;
+    const minLen = SOURCE_BEAM_MIN_STEM + Math.max(0, this.levels() - 1) * 8;
+    let short = 0;
+    for (const ch of this.chords) {
+      const y = ym + slope * (ch.stemX() - xm);
+      ch.stemLen = inc * (y - ch.tailNote().cy());
+      short = Math.max(short, minLen - ch.stemLen);
+    }
+    if (short > 0) for (const ch of this.chords) ch.stemLen += short;
+    return true;
+  }
+
+  /** 组里最多几层符杠 */
+  private levels(): number {
+    return Math.max(1, ...this.chords.map((ch) => ch.beams.length));
   }
 
   /** 最小二乘斜率（styler.cpp::leastSquare）。 */
@@ -1730,14 +1833,7 @@ export class PartMeasureLayout {
     for (const ch of this.chords) {
       ch.sort();
       ch.autoFlip();
-      if (sibelius) {
-        for (const nt of ch.notes) {
-          if (nt.flipped) {
-            const width = smuflWidth(meta, ch.sym());
-            nt.x += ch.stemUp ? width : -width;
-          }
-        }
-      }
+      if (sibelius) ch.applyFlipOffset(meta);
     }
 
     const staves = this.part.staves.length;
@@ -2006,6 +2102,8 @@ export class Slur extends SpanOverNotes {
 
 export class Tied extends SpanOverNotes {
   yOffsetType = 0; // 0 middle, 1 up, -1 below
+  /** 源谱写了朝向（`<tied orientation>`）：`above` 照它，`guessTiedPlacement` 不再猜 */
+  srcDir = false;
 }
 
 export class Tuplet extends SpanOverNotes {
@@ -2052,6 +2150,8 @@ export class Wedge extends SpanObj {
   autoY = false;
   dxLeft = 0;
   dxRight = 0;
+  /** 开口高（tenths，`<wedge spread>`；缺省 15，同原 C++ 工程） */
+  spread = 15;
 }
 
 /** 踏板线（model.hpp:873 PedalLine）。 */
@@ -2252,7 +2352,7 @@ export class PartLayout {
         note: sl.startNote!,
         begin: true,
         up: sl.above,
-        hasDir: false,
+        hasDir: sl.srcDir,
         isTie: true,
         owner: sl,
         other: null,
@@ -2262,7 +2362,7 @@ export class PartLayout {
         note: sl.endNote!,
         begin: false,
         up: sl.above,
-        hasDir: false,
+        hasDir: sl.srcDir,
         isTie: true,
         owner: sl,
         other: null,
@@ -2447,6 +2547,8 @@ export class PartGroup {
   number = "";
   barline = false;
   symbol = GroupSymbol.None;
+  /** 单个多谱表声部的 `<part-symbol top-staff bottom-staff>`：符号只括声部内这几行谱（0 基，含两端） */
+  staffRange?: [number, number];
 }
 
 /** 三次贝塞尔 B(t)（t∈[0,1]）在一个坐标分量上的最小值：比较端点与 B'(t)=0 的内部极值点。 */
@@ -2494,6 +2596,8 @@ export class SysStaff {
   distance = 0;
   /** 与上一可见谱表不相碰的最小距离（自动铺排 `layoutpass.ts::autoStaffDistances` 量的）；源谱版面档一页排不下时压到它为止 */
   minDistance = 0;
+  /** 原谱的谱表距离（`autoStaffDistances` 头一次撑开之前的 `distance`）：装页时按它算这个系统比原谱长高了多少 */
+  srcDistance: number | null = null;
   staffLines = 5;
   staffScale = 1;
   staffVisible = true;
@@ -2747,10 +2851,11 @@ export class SysStaff {
       if (notesOnly) continue;
       for (const lrc of md.lyrics) {
         if (lrc.staff !== sub || lrc.x < 0) continue;
-        const cx = x0 + lrc.x + lrc.xOffset;
+        const lx = x0 + lrc.x + lrc.xOffset; // 字的左缘（`updateWidth` 把居中折进了 xOffset）
         // 谱表上方的词（`lrc.y` 是基线、向上为正）：字顶约在基线上一个字号
-        if (lrc.y > 0) put(cx - lrc.width / 2 - 2, cx + lrc.width / 2 + 2, -(lrc.y + lrc.font.size), 40);
-        else put(cx - lrc.width / 2 - 2, cx + lrc.width / 2 + 2, 40, -lrc.y + 10);
+        if (lrc.y > 0) put(lx - 2, lx + lrc.width + 2, -(lrc.y + lrc.font.size), 40);
+        // 下沿取字体的下伸（汉字墨迹只沉到基线下一点，从前一律 +10 把谱表间距撑大，破碎 49 小节那行）
+        else put(lx - 2, lx + lrc.width + 2, 40, -lrc.y + Math.min(10, lrc.font.metrics.descent));
       }
       for (const t of md.textBlocks) {
         if (t.staff !== sub) continue;
@@ -2928,7 +3033,8 @@ export class Sys {
     let first = -1;
     let last = -1;
     for (const p of grp.parts) {
-      for (const st of p.staves) {
+      for (const [k, st] of p.staves.entries()) {
+        if (grp.staffRange && (k < grp.staffRange[0] || k > grp.staffRange[1])) continue;
         const stf = st.order;
         if (!this.staves[stf].staffVisible) continue;
         if (first < 0) first = stf;

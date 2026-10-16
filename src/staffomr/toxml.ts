@@ -28,6 +28,10 @@ export interface StaffXmlOptions {
   credits?: { text: string; type?: string; justify?: string; size?: number; box?: { x: number; y: number; w: number; h: number } }[];
   /** 写源谱版面（`<defaults>` 的纸与谱表大小、各系统首小节的 `<print>`），缺省写。见 `sourceLayout` */
   layout?: boolean;
+  /** 跨页的弧按「同音高、紧挨着」判延音线（配对优先配它；只找到一半的，相邻系统同声部紧挨着的音同音高也补成延音线）。
+   *  位图路开：延音线行尾行首的半截常认不全。矢量路不开：Finale 直出的谱里跨行同音高相邻两音之间也有记圆滑线的
+   *（牵我的手 m24 小提琴 B3→B3），而两种弧长得一样，照判反倒错 */
+  crossPageTies?: boolean;
 }
 
 /** 本次写出的 `noteId`（`scoreToMusicXml` 进出时设、清；写出是同步的） */
@@ -58,6 +62,82 @@ function textPt(n: StaffNote, size: number | undefined): number | undefined {
 }
 
 const fontAttr = (pt: number | undefined) => (pt ? ` font-size="${pt}"` : "");
+
+/**
+ * 页面上一点 → MusicXML 的纵坐标（tenths，相对这行谱的**顶线**，向上为正）：线距按该处实测的五线（位图路谱线会斜），
+ * 一个线距 10 tenths。取整（识别量出来的位置本来就只有这个精度）。
+ */
+function staffY(st: Staff, x: number, y: number): number {
+  const ys = st.lineYsAt?.(x) ?? st.lineYs;
+  const sp = ys.length >= 2 ? (ys[ys.length - 1]! - ys[0]!) / (ys.length - 1) : st.stepDistance() * 2;
+  return sp > 0 ? Math.round(((ys[0]! - y) * 10) / sp) : 0;
+}
+
+/** 页面上的横向距离 → tenths（取整），按这行谱的线距折 */
+function staffDx(st: Staff, dx: number): number {
+  const sp = st.stepDistance() * 2;
+  return sp > 0 ? Math.round((dx * 10) / sp) : 0;
+}
+
+/**
+ * Bravura 力度字母的墨迹上下沿（线距，基线在 0；取自 `bravura_metadata.json` 的 glyphBBoxes）。
+ * 原图量的是墨迹高，换成字号要除以同一串字在 Bravura 里的墨迹高——不能按字体盒（CLAUDE.md「Bravura 的字体盒不能当墨迹盒用」）。
+ */
+const DYNAMIC_INK: Record<string, [number, number]> = {
+  p: [-0.568, 1.096], m: [-0.04, 1.096], f: [-0.608, 1.776], s: [-0.04, 1.092], r: [0, 1.096], z: [-0.04, 1.072], n: [-0.04, 1.096],
+};
+/** 同上，首字母墨迹左缘离笔位多远（线距）：原图量的是墨迹左缘，`relative-x` 要的是笔位 */
+const DYNAMIC_LSB: Record<string, number> = { p: -0.356, m: -0.08, f: -0.564, s: 0, r: -0.08, z: -0.12, n: -0.092 };
+
+/** 写在谱表顶线之上的算「上方」（宣主荣耀人声的 f、mp 印在谱表上方），其余在下方 */
+function aboveStaff(st: Staff, x: number, y: number): boolean {
+  return staffY(st, x, y) > 0;
+}
+
+/**
+ * `<dynamics>`：没量到墨迹框（OCR 读出来的）照旧只写 `placement="below"`；量到了且写源谱版面时，
+ * 照原图写上下方、基线（`default-y`）、笔位离符头左缘（`relative-x`）与字号（墨迹高折成 Bravura 的 pt）。
+ */
+function dynamicXml(n: StaffNote, dirStaff: string): string {
+  const name = n.dynamic!;
+  const b = n.dynamicBox;
+  const ink = [...name].map((c) => DYNAMIC_INK[c]).filter((v): v is [number, number] => !!v);
+  const pg = n.staff?.page;
+  if (!withSourceLayout || !b || !ink.length || !pg) {
+    return `<direction placement="below"><direction-type><dynamics><${name}/></dynamics></direction-type>${dirStaff}</direction>`;
+  }
+  const lo = Math.min(...ink.map((v) => v[0]));
+  const hi = Math.max(...ink.map((v) => v[1]));
+  // 一个 Bravura 线距合多少页面单位（em = 4 线距）
+  const unit = (b.bottom - b.top) / (hi - lo);
+  const baseline = b.bottom + lo * unit;
+  const pen = b.left - (DYNAMIC_LSB[name[0]!] ?? 0) * unit;
+  const pt = roundPt(4 * unit * ptPerUnit(pg));
+  const x = n.sym.box.left;
+  const pl = aboveStaff(n.staff, x, (b.top + b.bottom) / 2) ? "above" : "below";
+  return `<direction placement="${pl}"><direction-type><dynamics default-y="${staffY(n.staff, x, baseline)}" relative-x="${staffDx(n.staff, pen - x)}" font-size="${pt}"><${name}/></dynamics></direction-type>${dirStaff}</direction>`;
+}
+
+/** `<wedge>` 起点：写源谱版面时照原图写上下方、中线（`default-y`）、左端离符头左缘（`relative-x`）；渐弱的开口（`spread`）写在起点 */
+function wedgeStartXml(n: StaffNote, no: number, dirStaff: string): string {
+  const w = n.wedgeAt;
+  if (!withSourceLayout || !w) return `<direction placement="below"><direction-type><wedge number="${no}" type="${n.wedgeStart}"/></direction-type>${dirStaff}</direction>`;
+  const x = n.sym.box.left;
+  const pl = aboveStaff(n.staff, w.x0, w.cy) ? "above" : "below";
+  const spread = n.wedgeStart === "diminuendo" && w.spread ? ` spread="${staffDx(n.staff, w.spread)}"` : "";
+  return `<direction placement="${pl}"><direction-type><wedge number="${no}" type="${n.wedgeStart}" default-y="${staffY(n.staff, w.x0, w.cy)}" relative-x="${staffDx(n.staff, w.x0 - x)}"${spread}/></direction-type>${dirStaff}</direction>`;
+}
+
+/** `<wedge type="stop">`：右端离符头左缘（`relative-x`）；渐强的开口写在止点（MusicXML 的 `spread` 写在开口那一端） */
+function wedgeStopXml(n: StaffNote, no: number, dirStaff: string): string {
+  const w = n.wedgeStopAt;
+  if (!withSourceLayout || !w) return `<direction placement="below"><direction-type><wedge number="${no}" type="stop"/></direction-type>${dirStaff}</direction>`;
+  const sp = w.spread ? ` spread="${staffDx(n.staff, w.spread)}"` : "";
+  return `<direction placement="below"><direction-type><wedge number="${no}" type="stop" relative-x="${staffDx(n.staff, w.x1 - n.sym.box.left)}"${sp}/></direction-type>${dirStaff}</direction>`;
+}
+
+/** 写出源谱版面（符干端点、力度松叶原位）：`scoreToMusicXml` 按 `opts.layout` 设，只在写出时有效 */
+let withSourceLayout = false;
 
 const TYPE_OF: [number, string][] = [
   [2, "breve"],
@@ -267,16 +347,16 @@ function emitVoices(inBar: StaffNote[], ticks: (d: number) => number, staffNo: n
         const metro = m ? `<direction-type><metronome><beat-unit>${m.unit}</beat-unit><per-minute>${escapeXml(m.text ?? String(m.bpm))}</per-minute></metronome></direction-type>` : "";
         body += `<direction placement="above">${words}${metro}${dirStaff}${m ? `<sound tempo="${m.bpm}"/>` : ""}</direction>`;
       }
-      for (const w of n.words ?? [])
-        body += `<direction placement="${w.above ? "above" : "below"}"><direction-type><words${fontAttr(textPt(n, w.size))}>${escapeXml(w.text)}</words></direction-type>${dirStaff}</direction>`;
-      if (n.dynamic)
-        body += `<direction placement="below"><direction-type><dynamics><${n.dynamic}/></dynamics></direction-type>${dirStaff}</direction>`;
+      for (const w of n.words ?? []) {
+        const wy = withSourceLayout && w.baseY !== undefined ? ` default-y="${staffY(n.staff, n.sym.box.left, w.baseY)}"` : "";
+        body += `<direction placement="${w.above ? "above" : "below"}"><direction-type><words${wy}${fontAttr(textPt(n, w.size))}>${escapeXml(w.text)}</words></direction-type>${dirStaff}</direction>`;
+      }
+      if (n.dynamic) body += dynamicXml(n, dirStaff);
       // 松叶：**止排在起之前**——同一个音符上前一条松叶收尾、下一条起头是常事，
       // 反过来写会让两条重叠（MusicXML 里同号的 wedge 不能套嵌）。
-      if (n.wedgeStop) body += `<direction placement="below"><direction-type><wedge number="${wedgeNo}" type="stop"/></direction-type>${dirStaff}</direction>`;
-      if (n.wedgeStart)
-        body += `<direction placement="below"><direction-type><wedge number="${wedgeNo}" type="${n.wedgeStart}"/></direction-type>${dirStaff}</direction>`;
-      body += noteXml(n, ticks(n.duration), staffNo, withVoice, voiceBase);
+      if (n.wedgeStop) body += wedgeStopXml(n, wedgeNo, dirStaff);
+      if (n.wedgeStart) body += wedgeStartXml(n, wedgeNo, dirStaff);
+      body += noteXml(n, ticks(n.duration), n.crossTo && staffNo ? (partStaffNo.get(n.staff) ?? staffNo) : staffNo, withVoice, voiceBase);
       if (!n.chordExtra && !n.grace) cur += ticks(n.duration);
     }
     // 按拍位排满的小节里，提前收尾的声部补 `<forward>` 到小节末：合唱谱的女低、男低常常
@@ -320,6 +400,12 @@ function voiceTicks(inBar: StaffNote[], ticks: (d: number) => number): number {
   return used;
 }
 
+/**
+ * 多谱表声部显式写 `<part-symbol>brace</part-symbol>`（紧跟 `<staves>`）。规范缺省就是 brace，Finale 导出也不写，
+ * 但并非每个读入端都按缺省补（本仓库从前就不补）；识别出的多谱表声部只来自花括号或「G + F 谱号」大谱表，一律是 brace。
+ */
+const PART_SYMBOL = "<part-symbol>brace</part-symbol>";
+
 /** 正在写的 part 里各行谱的谱表号（`<staff>`）：跨谱表的弧止端按起端那行编号用。 */
 const partStaffNo = new Map<Staff, number>();
 
@@ -348,10 +434,12 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
   // 两者不是一回事：G 调里一个没印记号的 F 也要写 `<alter>1</alter>`。
   const alter = n.alter !== 0 ? `<alter>${n.alter}</alter>` : "";
   const acc = n.accidental !== null ? `<accidental>${accidentalName(n.accidental)}</accidental>` : "";
-  const stem = n.stemUp === null ? "" : `<stem>${n.stemUp ? "up" : "down"}</stem>`;
+  // 符干端点照原图（`<stem default-y>`）：排版不再按缺省 3.5 格重算，长短与符杠斜度跟原谱走
+  const tip = withSourceLayout && n.stemTip !== undefined ? ` default-y="${staffY(n.staff, n.sym.px, n.stemTip)}"` : "";
+  const stem = n.stemUp === null ? "" : `<stem${tip}>${n.stemUp ? "up" : "down"}</stem>`;
   // `<lyric>` 是 `<note>` 的最后一批子元素，排在 `<stem>`/`<accidental>` 之后
   // 一字多音收尾的那个音：只出一个带 `<extend type="stop"/>` 的空 `<lyric>`（延长线画到这里）
-  const lyric = (n.lyrics ?? []).map((l) => lyricXml(l)).join("") +
+  const lyric = (n.lyrics ?? []).map((l) => lyricXml(l, withSourceLayout && l.baseY !== undefined && n.staff ? staffY(n.staff, n.sym.box.left, l.baseY) : undefined)).join("") +
     (n.lyricExtendStop ?? []).map((l) => `<lyric number="${l.verse}"><extend type="stop"/></lyric>`).join("");
   // `<notations>` 排在 `<lyric>` 之前（MusicXML 的子元素顺序）
   const nots: string[] = [];
@@ -375,7 +463,9 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
   const slurPl = n.slurAbove === undefined ? "" : ` placement="${n.slurAbove ? "above" : "below"}"`;
   if (n.slurStart)
     for (const id of arcs(n.slurStartIds)) nots.push(`<slur type="start" number="${slurNo}"${arcAttr(id)}${n.slurDashed ? ` line-type="dashed"` : ""}${slurPl}/>`);
-  if (n.tuplet) nots.push(`<tuplet type="start"/>`);
+  // 连音组只在头尾两个音上写起止（和弦写在打头那个音上）；读入端按起止配对，只有 start 的会一路顶掉、整组丢
+  if (n.tuplet?.start && !n.chordExtra) nots.push(`<tuplet type="start"/>`);
+  if (n.tuplet?.stop && !n.chordExtra) nots.push(`<tuplet type="stop"/>`);
   // `<notations>` 里子元素有固定次序：tied / slur / tuplet / ornaments / articulations / fermata / arpeggiate
   const arts: string[] = [];
   const orns: string[] = [];
@@ -455,7 +545,7 @@ const ARTICULATION: Record<string, string> = {
  *     本来就把配不上对的半截丢掉，写了也白写。系统中间缺一端的半截是识别没挂上符头，要在识别那头补。
  * 没有弧号的（不走 `markSlurNotes` 的路）原样不动。
  */
-export function renumberSlurs(body: string, sysOfBar?: number[]): string {
+export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = false): string {
   const re = /<slur type="(start|stop)" number="(\d+)" arc="([\d.]+)"(?: edge="(\w+)" ab="(\d)")?([^>]*)\/>/g;
   // 第几小节（按 `<measure` 计数）
   const bars = [...body.matchAll(/<measure[ >]/g)].map((m) => m.index!);
@@ -473,23 +563,70 @@ export function renumberSlurs(body: string, sysOfBar?: number[]): string {
     const s0 = sysOfBar![bar - 1];
     return sysOfBar!.find((x) => x > s0);
   };
+  // ── 弧标记所在那个音：音高、声部、谱表，在本系统里是不是头一个 / 末一个 ──
+  type Tok = (typeof toks)[number];
+  /** `at` 所在 `<note>` 的起点（`<notehead>` 也以 `<note` 打头，要认准后面是空格或 `>`） */
+  const noteStart = (at: number) => {
+    let i = body.lastIndexOf("<note", at);
+    while (i >= 0 && !/^<note[ >]/.test(body.slice(i, i + 6))) i = body.lastIndexOf("<note", i - 1);
+    return i;
+  };
+  const noteSeg = (at: number) => {
+    const ns = noteStart(at);
+    return body.slice(ns, body.indexOf("</note>", ns));
+  };
+  const pitchOf = (seg: string) => {
+    const m = /<step>(\w)<\/step>(?:<alter>(-?[\d.]+)<\/alter>)?<octave>(\d+)<\/octave>/.exec(seg);
+    return m ? `${m[1]}${m[2] ?? ""}${m[3]}` : null;
+  };
+  // 同声部 = 同 `<voice>`、同 `<staff>`；和弦附加音（`<chord/>`）、倚音不算
+  const voiceOf = (seg: string) => `${/<voice>(\d+)<\/voice>/.exec(seg)?.[1] ?? "1"}/${/<staff>(\d+)<\/staff>/.exec(seg)?.[1] ?? ""}`;
+  const plain = (seg: string) => !seg.includes("<chord/>") && !seg.includes("<grace");
+  /** [from, to) 里的 `<note>`：起点与内容 */
+  const notesIn = (from: number, to: number) => {
+    const out: { at: number; seg: string }[] = [];
+    for (let i = body.indexOf("<note", from); i >= 0 && i < to; i = body.indexOf("<note", i + 5)) {
+      if (!/^<note[ >]/.test(body.slice(i, i + 6))) continue;
+      out.push({ at: i, seg: body.slice(i, body.indexOf("</note>", i)) });
+    }
+    return out;
+  };
+  const measureEnd = (at: number) => body.indexOf("</measure>", at);
+  const lastInSystem = (t: Tok) => {
+    if (sysOfBar && sysOfBar[t.bar] === sysOfBar[t.bar - 1]) return false;
+    const seg = noteSeg(t.at), v = voiceOf(seg);
+    return !notesIn(noteStart(t.at) + seg.length, measureEnd(t.at)).some((n) => plain(n.seg) && voiceOf(n.seg) === v);
+  };
+  const firstInSystem = (t: Tok) => {
+    const v = voiceOf(noteSeg(t.at));
+    return !notesIn(body.lastIndexOf("<measure", t.at), noteStart(t.at)).some((n) => plain(n.seg) && voiceOf(n.seg) === v);
+  };
+  /** 一前一后两个半截像不像一条跨系统的**延音线**：两头同音高、起端是本系统末一个音、止端是下一系统头一个音
+   *（跨页的长圆滑线两头碰巧同音高，牵我的手 m24、m36、m47 那几条，不相邻） */
+  const tieLike = (a: Tok, b: Tok) => {
+    const pa = pitchOf(noteSeg(a.at));
+    return !!pa && pa === pitchOf(noteSeg(b.at)) && lastInSystem(a) && firstInSystem(b);
+  };
+
   const starts = new Set(toks.filter((t) => t.type === "start").map((t) => t.arc));
   const stops = new Set(toks.filter((t) => t.type === "stop").map((t) => t.arc));
   const alias = new Map<string, string>(); // 后半截的弧号 → 接上的前半截弧号
   const orphan = new Set<string>();
-  const pending = new Map<string, { arc: string; bar: number; above: boolean }[]>(); // 谱表号 → 还没接上的 `end` 半截
+  const pending = new Map<string, Tok[]>(); // 谱表号 → 还没接上的 `end` 半截
   for (const t of toks) {
     if (t.type === "start" && !stops.has(t.arc)) {
       orphan.add(t.arc);
       if (t.edge !== "end") continue;
       const q = pending.get(t.staff) ?? [];
-      q.push({ arc: t.arc, bar: t.bar, above: t.above });
+      q.push(t);
       pending.set(t.staff, q);
     } else if (t.type === "stop" && !starts.has(t.arc)) {
       orphan.add(t.arc);
       if (t.edge !== "begin") continue;
       const q = (pending.get(t.staff) ?? []).filter((p) => (sysOfBar ? sysOfBar[t.bar - 1] === nextSys(p.bar) : t.bar - p.bar <= 1));
-      const hit = q.find((p) => p.above === t.above) ?? q[0];
+      // 先配延音线（同音高、紧挨着），再按朝向配：行尾行首各有一条延音线、一条圆滑线的半截时，
+      // 按朝向先到先得会配串（破碎 p2→p3 m16–17 钢琴右手：E4 延音线的后半截排在圆滑线前面，抢走了朝向相同的圆滑线前半截）
+      const hit = (crossTies ? q.find((p) => tieLike(p, t)) : undefined) ?? q.find((p) => p.above === t.above) ?? q[0];
       pending.set(t.staff, q.filter((p) => p !== hit));
       if (hit) {
         alias.set(t.arc, hit.arc);
@@ -498,15 +635,85 @@ export function renumberSlurs(body: string, sysOfBar?: number[]): string {
       }
     }
   }
+  // **接上的两个半截两头同音高、紧挨着的是延音线**（页内跨行的已在 `slur.ts::reconnectSlurs` 按音级判过，这里是跨页的：
+  // 破碎 p2→p3 m16–17、p5→p6 m59–60、p10→p11 m93–94 钢琴右手）
+  const tieArcs = new Set<string>();
+  for (const [stopArc, startArc] of alias) {
+    const a = toks.find((t) => t.type === "start" && t.arc === startArc), b = toks.find((t) => t.type === "stop" && t.arc === stopArc);
+    if (crossTies && a && b && tieLike(a, b)) tieArcs.add(startArc);
+  }
+  // **只找到一半的跨系统弧**：另一半没认出来，但相邻系统同声部紧挨着的那个音同音高，就当延音线，那一头补上
+  //（行尾的延音线头常只有半格多宽、贴着谱线，行首那截又常与圆滑线起笔粘在一起）
+  /** 补到别的音上的延音线：插入点（原文位置）→ 文本 */
+  const inserts: { pos: number; text: string }[] = [];
+  const tieInto = (n: { at: number; seg: string }, type: string, above: boolean) => {
+    const d = n.seg.indexOf("</duration>");
+    if (d < 0) return false;
+    inserts.push({ pos: n.at + d + 11, text: `<tie type="${type}"/>` });
+    const nt = n.seg.indexOf("<notations>");
+    const ly = n.seg.indexOf("<lyric");
+    const tied = `<tied type="${type}"${type === "start" ? ` orientation="${above ? "over" : "under"}"` : ""}/>`;
+    if (nt >= 0) inserts.push({ pos: n.at + nt + 11, text: tied });
+    else inserts.push({ pos: n.at + (ly >= 0 ? ly : n.seg.length), text: `<notations>${tied}</notations>` });
+    return true;
+  };
+  if (crossTies && sysOfBar) {
+    const barRange = (k: number) => [bars[k]!, k + 1 < bars.length ? bars[k + 1]! : body.length] as const;
+    for (const t of toks) {
+      if (!orphan.has(t.arc)) continue;
+      const seg = noteSeg(t.at), v = voiceOf(seg), p = pitchOf(seg);
+      if (!p) continue;
+      let target: { at: number; seg: string } | undefined;
+      if (t.type === "start" && t.edge === "end" && lastInSystem(t)) {
+        const ns = nextSys(t.bar);
+        const k = ns === undefined ? -1 : sysOfBar.indexOf(ns);
+        if (k >= 0) target = notesIn(...barRange(k)).find((n) => plain(n.seg) && voiceOf(n.seg) === v);
+      } else if (t.type === "stop" && t.edge === "begin" && firstInSystem(t)) {
+        const s0 = sysOfBar[t.bar - 1]!;
+        const prev = Math.max(...sysOfBar.filter((x) => x >= 0 && x < s0));
+        const k = sysOfBar.lastIndexOf(prev);
+        if (k >= 0) target = notesIn(...barRange(k)).filter((n) => plain(n.seg) && voiceOf(n.seg) === v).pop();
+      }
+      if (!target || pitchOf(target.seg) !== p || target.seg.includes('<tie type="' + (t.type === "start" ? "stop" : "start"))) continue;
+      if (!tieInto(target, t.type === "start" ? "stop" : "start", t.above)) continue;
+      orphan.delete(t.arc);
+      tieArcs.add(t.arc);
+    }
+  }
+  inserts.sort((a, b) => a.pos - b.pos);
+  let ii = 0;
+  /** 照抄原文 [from, to)，途中把落在这一段的插入补上 */
+  const copy = (from: number, to: number) => {
+    let s0 = "";
+    let at = from;
+    while (ii < inserts.length && inserts[ii]!.pos < to) {
+      const x = inserts[ii++]!;
+      if (x.pos < from) continue;
+      s0 += body.slice(at, x.pos) + x.text;
+      at = x.pos;
+    }
+    return s0 + body.slice(at, to);
+  };
   const num = new Map<string, number>();
   const used = new Set<number>();
   let out = "";
   let last = 0;
   for (const t of toks) {
     const key = alias.get(t.arc) ?? t.arc;
-    out += body.slice(last, t.at);
+    out += copy(last, t.at);
     last = t.at + t.len;
     if (orphan.has(key)) continue;
+    if (tieArcs.has(key)) {
+      // `<tie>` 紧跟在这个音的 `<duration>` 后面（MusicXML 的子元素顺序），`<tied>` 顶替弧标记
+      let k = out.lastIndexOf("<note");
+      while (k >= 0 && !/^<note[ >]/.test(out.slice(k, k + 6))) k = out.lastIndexOf("<note", k - 1);
+      const d = out.indexOf("</duration>", k);
+      if (d >= 0) out = out.slice(0, d + 11) + `<tie type="${t.type}"/>` + out.slice(d + 11);
+      // 弧的上下方照抄成延音线的朝向（读入端照 `orientation` 定方向，不写就由排版去猜）
+      const ori = t.type === "start" ? ` orientation="${t.above ? "over" : "under"}"` : "";
+      out += `<tied type="${t.type}"${ori}/>`;
+      continue;
+    }
     let n = num.get(key);
     if (n === undefined) {
       n = 1;
@@ -519,13 +726,14 @@ export function renumberSlurs(body: string, sysOfBar?: number[]): string {
     }
     out += `<slur type="${t.type}" number="${n}"${t.rest}/>`;
   }
-  out += body.slice(last);
+  out += copy(last, body.length);
   return out.replace(/<notations><\/notations>/g, "");
 }
 
-function lyricXml(l: { verse: number; text: string; hyphen: boolean; cont: boolean; extend?: boolean; above?: boolean }): string {
+/** `y`：写源谱版面时这一行词的基线（tenths，相对谱表顶线），原图上量的 */
+function lyricXml(l: { verse: number; text: string; hyphen: boolean; cont: boolean; extend?: boolean; above?: boolean }, y?: number): string {
   const syllabic = l.cont ? (l.hyphen ? "middle" : "end") : l.hyphen ? "begin" : "single";
-  return `<lyric number="${l.verse}"${l.above ? ' placement="above"' : ""}><syllabic>${syllabic}</syllabic><text>${escapeXml(l.text)}</text>${l.extend ? '<extend type="start"/>' : ""}</lyric>`;
+  return `<lyric number="${l.verse}"${y !== undefined ? ` default-y="${y}"` : ""}${l.above ? ' placement="above"' : ""}><syllabic>${syllabic}</syllabic><text>${escapeXml(l.text)}</text>${l.extend ? '<extend type="start"/>' : ""}</lyric>`;
 }
 
 function accidentalName(alter: number): string {
@@ -581,10 +789,12 @@ export function scoreToMusicXml(
   opts: StaffXmlOptions = {},
 ): string {
   currentNoteId = opts.noteId ?? null;
+  withSourceLayout = opts.layout !== false;
   try {
     return scoreToMusicXmlRaw(score, notesOf, opts);
   } finally {
     currentNoteId = null;
+    withSourceLayout = false;
   }
 }
 
@@ -639,6 +849,31 @@ function scoreToMusicXmlRaw(
      * 头一个隐藏小节写 `<staff-details print-object="no"/>`，重新露面时写回 `yes`（逐谱表记，见 `staffDetails`）。
      * `sysOfBar` 记 -1：隐藏的系统不算这个声部「出现过」，接跨行弧时跳过它（见 `renumberSlurs`）。
      */
+    /** 一行谱这一小节要写的音：跨谱表书写的音（`crossTo`）按借的那一行写——同一 part 里另一行借这一行地方写的剔出去，
+     *  这一行借别行写的收进来（`<staff>` 仍按符头所在那行，见 `noteXml`）。借到别的 part 的照旧留在符头那行 */
+    const barNotes = (st: Staff, staves: readonly (Staff | null | undefined)[], bar: Bar): StaffNote[] => {
+      const inPart = (s0?: Staff) => !!s0 && staves.includes(s0);
+      return [
+        ...notesOf(st).filter((n) => !(n.crossTo && n.crossTo !== st && inPart(n.crossTo))),
+        ...staves.filter((s0) => s0 && s0 !== st).flatMap((s0) => notesOf(s0!).filter((n) => n.crossTo === st)),
+      ].filter((n) => n.x >= bar.left && n.x < bar.right);
+    };
+    /** 曲首弱起（`Bar.pickup`）的实长（ticks）：系统里各行除整小节休止以外的音写出来最长的那行。
+     *  有一行写满了拍号（弱起认错了）就不算弱起，返回 undefined；整个系统只有一个音（或一个休止）撑着的也不算——
+     *  多半是长音认短了（望十架 m1 长笛全音符读成四分，其余几行整小节休止），宁静的伯利恒那种真弱起是两个八分加一个四分休止 */
+    const pickupTicks = (entry: (typeof score.systems)[number], bi: number, full: number): number | undefined => {
+      if (!entry.sys.staves.some((st) => st.bars[bi]?.pickup)) return undefined;
+      let len = 0;
+      let count = 0;
+      for (const st of entry.sys.staves) {
+        const bar = st.bars[bi];
+        if (!bar) continue;
+        const own = barNotes(st, entry.sys.staves, bar).filter((n) => n.sym.code !== "restHBar");
+        count += own.filter((n) => !n.chordExtra && !n.grace).length;
+        len = Math.max(len, voiceTicks(own, ticks));
+      }
+      return count >= 2 && len > 0 && len < full ? len : undefined;
+    };
     const hiddenSystem = (entry: (typeof score.systems)[number], si: number): string => {
       const ref = entry.sys.staves.find((st) => st.bars.length);
       if (!ref) return "";
@@ -671,7 +906,7 @@ function scoreToMusicXmlRaw(
           const at = score.systems.findIndex((_, sj) => part.scoreStaves.some((ss) => ss.staves[sj]));
           if (at >= 0) {
             const clefs = part.scoreStaves.map((ss) => (ss.staves[at] ? clefXml(rowStartClef(score.systems[at], ss.staves[at]!)) : ""));
-            if (nStaves > 1) attrs += `<staves>${nStaves}</staves>`;
+            if (nStaves > 1) attrs += `<staves>${nStaves}</staves>${PART_SYMBOL}`;
             clefs.forEach((c, k) => {
               if (c) attrs += nStaves > 1 ? c.replace("<clef>", `<clef number="${k + 1}">`) : c;
             });
@@ -680,13 +915,14 @@ function scoreToMusicXmlRaw(
         }
         attrs += staffDetails(Array(nStaves).fill(false));
         const [beats, beatType] = (prevTime ?? "4/4").split("/").map(Number);
-        const dur = ticks(beats / beatType);
+        const pickup = pickupTicks(entry, bi, ticks(beats / beatType));
+        const dur = pickup ?? ticks(beats / beatType);
         let notes = "";
         for (let k = 0; k < nStaves; k++) {
           if (k) notes += `<backup><duration>${dur}</duration></backup>`;
           notes += `<note><rest measure="yes"/><duration>${dur}</duration><voice>${k * 4 + 1}</voice>${nStaves > 1 ? `<staff>${k + 1}</staff>` : ""}</note>`;
         }
-        out += `<measure number="${measureNo}">${bi === 0 && layout ? layout.print(si, pi) : ""}${attrs ? `<attributes>${attrs}</attributes>` : ""}${notes}</measure>`;
+        out += `<measure number="${measureNo}"${pickup ? ' implicit="yes"' : ""}>${bi === 0 && layout ? layout.print(si, pi) : ""}${attrs ? `<attributes>${attrs}</attributes>` : ""}${notes}</measure>`;
       }
       return out;
     };
@@ -729,7 +965,7 @@ function scoreToMusicXmlRaw(
           // 行首的谱号与读音高时用的同一个（`clefFor`）：这一行没认出谱号的沿用上一系统的，不是一律高音谱号
           const clefs = staves.map((st) => (st ? clefXml(rowStartClef(entry, st)) : ""));
           if (clefs.join("|") !== prevClef.join("|")) {
-            if (staves.length > 1) attrs += `<staves>${staves.length}</staves>`;
+            if (staves.length > 1) attrs += `<staves>${staves.length}</staves>${prevClef.length ? "" : PART_SYMBOL}`;
             clefs.forEach((c, k) => {
               if (!c) return;
               attrs += staves.length > 1 ? c.replace("<clef>", `<clef number="${k + 1}">`) : c;
@@ -741,7 +977,9 @@ function scoreToMusicXmlRaw(
         }
         // 被系统换行劈开的小节的后半截：系统里任一行谱配得上就算（一行认漏了音、凑不满，别的行照样配得上，232 主也爱我歌）
         const splitTail = entry.sys.staves.some((st) => st.bars[bi]?.splitTail);
-        body += `<measure number="${measureNo}"${splitTail ? ' implicit="yes"' : ""}>`;
+        const [beats, beatType] = (prevTime ?? "4/4").split("/").map(Number);
+        const pickup = pickupTicks(entry, bi, ticks(beats / beatType));
+        body += `<measure number="${measureNo}"${splitTail || pickup ? ' implicit="yes"' : ""}>`;
         if (bi === 0 && layout) body += layout.print(si, pi);
         if (attrs) body += `<attributes>${attrs}</attributes>`;
         if (bar0)
@@ -757,7 +995,8 @@ function scoreToMusicXmlRaw(
           if (!st) return;
           const bar = st.bars[bi];
           if (!bar) return;
-          const inBar = notesOf(st).filter((n) => n.x >= bar.left && n.x < bar.right);
+          // 弱起小节里的整小节休止按弱起的实长写
+          const inBar = barNotes(st, staves, bar).map((n) => (pickup && n.sym.code === "restHBar" ? { ...n, duration: pickup / ticks(1) } : n));
           // 行中换谱号（读音高时已经按它读了，`clefFor`）：写进这一小节，下一行行首要不要再写照它比
           const mids = midRowClefs(entry, st).filter((c) => c.box.left >= bar.left && c.box.left < bar.right);
           const midXml = mids.map((c) => {
@@ -780,7 +1019,7 @@ function scoreToMusicXmlRaw(
         body += `</measure>`;
       }
     });
-    bodies.push(`<part id="${id}">${renumberSlurs(body, sysOfBar)}</part>`);
+    bodies.push(`<part id="${id}">${renumberSlurs(body, sysOfBar, opts.crossPageTies)}</part>`);
   });
 
   return wrapPartwise({
