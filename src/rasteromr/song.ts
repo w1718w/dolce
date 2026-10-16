@@ -6,15 +6,18 @@
 
 import type { RasterGlyphLookup } from "./rasterglyphs";
 import type { RasterPage } from "./rasterpage";
-import { recognizeRasterPage, type CarryKey, type RasterLiveOcr, type RasterPageResult } from "./recognize";
+import { recognizeRasterPage, type CarryKey, type PageCarry, type RasterLiveOcr, type RasterPageResult } from "./recognize";
+import { pageImageOf, type PageImage } from "./rasterpage";
+import { composeHeaderStrip } from "./pagecompose";
+import type { PagePool } from "./pagepool";
 import type { OcrChar } from "./lyric";
 import type { JianpuRow } from "./jianpufuse";
 import type { HeaderCredit, WordLine } from "../omrkit/headertext";
 import type { Rect } from "../omrkit/types";
 import { markSplitBars } from "../staffomr/notedata";
-import { buildScore } from "../staffomr/score";
+import { buildScore, restructureSystems, type StaffProfile } from "../staffomr/score";
 import type { StaffReviewResult, StaffReviewStats } from "../staffomr/review";
-import { scoreToMusicXml } from "../staffomr/toxml";
+import { pageTextPt, scoreToMusicXml } from "../staffomr/toxml";
 import type { SPage, Staff } from "../staffomr/model";
 import type { LyricLine } from "../staffomr/textanalyze";
 import type { StaffNote } from "../staffomr/notedata";
@@ -53,6 +56,8 @@ export async function recognizeRasterSong(
     cancelled?: () => boolean;
     /** 判路时已栅格化过的页（第几份底本、第几页 → 结果）：识别那一页时直接用 */
     rastered?: (source: number, pn: number) => RasterPage | null | undefined;
+    /** 多页并行（`pagepool.ts`）：给了就各页分给 Worker 跑，结果与串行逐字一致 */
+    pool?: PagePool;
     /** 给每个 `<note>` 写 `id="omr<k>"` 并记下源图框（编辑器的识别对照用；回归脚本不开，产物逐字节不变） */
     noteIds?: boolean;
   } = {},
@@ -70,51 +75,124 @@ export async function recognizeRasterSong(
   const barPages: Parameters<typeof markSplitBars>[0] = [];
   /** 闭合人声谱：两行谱之间印着歌词的上一行（见 `buildScore` 的同名选项） */
   const lyricsBelow = new Set<Staff>();
+  /** 谱面印的声部标签（`recognize.ts` 的 `staffLabels`，按谱行认回对象） */
+  const labelOf = new Map<Staff, string>();
   const total = sources.reduce((n, s) => n + (s.pdf.numPages as number), 0);
   let done = 0;
   /** 曲首页（第一页有谱的）的页眉 */
   let header: HeaderCredit[] | null = null;
+  let headerPage: SPage | null = null;
   /** 整页文字框：离线给的缓存，在线识别时逐页现检补进来 */
   const pageTexts = opts.pageTexts ?? new Map<string, Rect[]>();
-  for (const [si, { pdf, OPS }] of sources.entries()) {
-    for (let pn = 1; pn <= (pdf.numPages as number); pn++) {
+  const caches: RasterOcrCaches = { lyricOcr: opts.lyricOcr, labelOcr: opts.labelOcr, timeOcr: opts.timeOcr, harmonyOcr: opts.harmonyOcr, jianpuOcr: opts.jianpuOcr, wordOcr: opts.wordOcr, headerOcr: opts.headerOcr, pageTexts };
+  /** 收一页结果（按页序）：记账、留页，交出下一页的沿用 */
+  const consume = (r: RasterPageResult, si: number, pn: number, wantHeader: boolean): void => {
+    if (r.jianpuFix) for (const k of Object.keys(stats.jianpuFix) as (keyof RasterSongStats["jianpuFix"])[]) stats.jianpuFix[k] += r.jianpuFix[k];
+    carryTime = r.carryTime;
+    carryKey = r.carryKey;
+    if (r.hasStaff) {
+      if (wantHeader) {
+        header = r.header;
+        headerPage = r.page;
+      }
+      // 页眉带近乎半页像素，读完就不留
+      r.headerStrips = [];
+      stats.pages++;
+      stats.notes += r.notes.length;
+      stats.harmonies += r.harmonies?.length ?? 0;
+      stats.lyricLines += r.lyricLines.length;
+      for (const k of Object.keys(stats.lyricStats) as (keyof RasterSongStats["lyricStats"])[]) stats.lyricStats[k] += r.lyricStats?.[k] ?? 0;
+      stats.bars += r.bars.length;
+      barPages.push({ page: r.page, bars: r.bars });
+      stats.unknown += r.unknown;
+      stats.staves += r.page.staves.length;
+      stats.halftone ??= r.raster?.halftone ?? null;
+      stats.kind ??= r.raster?.kind ?? null;
+      entries.push({ page: r.page, ctx: r.ctx });
+      markLyricsBelow(r.page, r.lyricLines, lyricsBelow);
+      for (const st of r.page.staves) {
+        const lb = r.staffLabels.get(st.index);
+        if (lb) labelOf.set(st, lb);
+      }
+      for (const n of r.notes) {
+        const a = notesByStaff.get(n.staff) ?? [];
+        a.push(n);
+        notesByStaff.set(n.staff, a);
+      }
+      pages.push({ source: si, pn, result: r });
+    }
+  };
+  const order = sources.flatMap(({ pdf }, si) => Array.from({ length: pdf.numPages as number }, (_, i) => ({ si, pn: i + 1 })));
+  if (!opts.pool) {
+    for (const [k, { si, pn }] of order.entries()) {
       if (opts.cancelled?.()) throw new Error("已取消");
+      const { pdf, OPS } = sources[si];
       const page = await pdf.getPage(pn);
       try {
-        const caches: RasterOcrCaches = { lyricOcr: opts.lyricOcr, labelOcr: opts.labelOcr, timeOcr: opts.timeOcr, harmonyOcr: opts.harmonyOcr, jianpuOcr: opts.jianpuOcr, wordOcr: opts.wordOcr, headerOcr: opts.headerOcr, pageTexts };
         const wantHeader = header === null;
-        const r = await recognizeRasterPage(page, OPS, look, pn, { carryTime, carryKey, ...caches, live: opts.live, raster: opts.rastered?.(si, pn), wantHeader });
-        if (r.jianpuFix) for (const k of Object.keys(stats.jianpuFix) as (keyof RasterSongStats["jianpuFix"])[]) stats.jianpuFix[k] += r.jianpuFix[k];
-        carryTime = r.carryTime;
-        carryKey = r.carryKey;
-        if (r.hasStaff) {
-          if (wantHeader) header = r.header;
-          // 页眉带近乎半页像素，读完就不留
-          r.headerStrips = [];
-          stats.pages++;
-          stats.notes += r.notes.length;
-          stats.harmonies += r.harmonies?.length ?? 0;
-          stats.lyricLines += r.lyricLines.length;
-          for (const k of Object.keys(stats.lyricStats) as (keyof RasterSongStats["lyricStats"])[]) stats.lyricStats[k] += r.lyricStats?.[k] ?? 0;
-          stats.bars += r.bars.length;
-          barPages.push({ page: r.page, bars: r.bars });
-          stats.unknown += r.unknown;
-          stats.staves += r.page.staves.length;
-          stats.halftone ??= r.raster?.halftone ?? null;
-          stats.kind ??= r.raster?.kind ?? null;
-          entries.push({ page: r.page, ctx: r.ctx });
-          markLyricsBelow(r.page, r.lyricLines, lyricsBelow);
-          for (const n of r.notes) {
-            const a = notesByStaff.get(n.staff) ?? [];
-            a.push(n);
-            notesByStaff.set(n.staff, a);
-          }
-          pages.push({ source: si, pn, result: r });
-        }
+        const r = await recognizeRasterPage(page, OPS, look, pn, { carryTime, carryKey, ...caches, live: opts.live, raster: opts.rastered?.(si, pn), wantHeader, pageSeq: k });
+        consume(r, si, pn, wantHeader);
       } finally {
         page.cleanup?.();
       }
-      opts.onPage?.(++done, total);
+      done++;
+      opts.onPage?.(done, total);
+    }
+  } else {
+    // 多页并行（`pagepool.ts`）：在途页数不超过池大小；按页序收结果，收到一页就把下一页的沿用交出去
+    const pool = opts.pool;
+    pool.init(look, caches, opts.live);
+    const carries = order.map(() => {
+      let resolve!: (c: PageCarry) => void;
+      const promise = new Promise<PageCarry>((r) => (resolve = r));
+      return { promise, resolve };
+    });
+    carries[0]?.resolve({ carryTime, carryKey, wantHeader: true });
+    const start = async (k: number): Promise<RasterPageResult> => {
+      const { si, pn } = order[k];
+      const { pdf, OPS } = sources[si];
+      const raster = opts.rastered?.(si, pn);
+      let image: PageImage | null | undefined;
+      if (raster === undefined) {
+        const page = await pdf.getPage(pn);
+        try {
+          image = await pageImageOf(page, OPS);
+        } finally {
+          page.cleanup?.();
+        }
+      }
+      const host = {
+        live: opts.live,
+        composeHeader: async (binW: number) => {
+          const page = await pdf.getPage(pn);
+          try {
+            return await composeHeaderStrip(page, OPS, binW);
+          } finally {
+            page.cleanup?.();
+          }
+        },
+      };
+      return pool.run({ index: pn, seq: k, image, raster }, carries[k].promise, host);
+    };
+    const running: Promise<RasterPageResult>[] = [];
+    let next = 0;
+    const fill = () => {
+      while (next < order.length && next - done < pool.size) {
+        const p = start(next++);
+        p.catch(() => undefined); // 由按页序的 await 接住
+        running.push(p);
+      }
+    };
+    fill();
+    for (let k = 0; k < order.length; k++) {
+      if (opts.cancelled?.()) throw new Error("已取消");
+      const r = await running[k];
+      const wantHeader = header === null;
+      consume(r, order[k].si, order[k].pn, wantHeader);
+      carries[k + 1]?.resolve({ carryTime, carryKey, wantHeader: header === null });
+      done++;
+      opts.onPage?.(done, total);
+      fill();
     }
   }
   // 自检：凑满拍的，加上结构上的半截小节（弱起、乐句中间劈开的两半，见 `notedata.ts::markSplitBars`）
@@ -138,8 +216,17 @@ export async function recognizeRasterSong(
   if (!entries.length) return { xml: null, score: null, stats, pages, noteBoxes, assignment: emptyAssign, rebuild: () => { throw new Error("没有谱表"); } };
   // 拉丁段挪到全曲中文段后面（页内先占位，见 `lyricpost.ts::settleLyricVerses`）
   settleLyricVerses([...notesByStaff.values()].flat());
-  let score = buildScore(entries, { lyricsBelow });
-  const credits = (header ?? []).map(({ text, type, justify }) => ({ text, type, justify }));
+  // 内容剖面（有没有词、音域中位数、谱面标签）交给 `buildScore` 做全局指派，见 `score.ts::assignSlots`
+  const profileOf = (st: Staff): StaffProfile => {
+    const ns = notesOf(st);
+    const ps = ns
+      .filter((n) => !n.rest && !n.grace && n.step)
+      .map((n) => "CDEFGAB".indexOf(n.step!) + 7 * n.octave!)
+      .sort((a, b) => a - b);
+    return { lyric: ns.some((n) => n.lyrics?.length), pitch: ps.length ? ps[ps.length >> 1]! : null, label: labelOf.get(st) ?? null };
+  };
+  let score = buildScore(entries, { lyricsBelow, profileOf });
+  const credits = (header ?? []).map(({ text, type, justify, size, box }) => ({ text, type, justify, box, ...(headerPage ? { size: pageTextPt(headerPage, size) } : {}) }));
   // 没给标题（编辑器里打开的图、PDF）就拿页眉的头一个标题
   const title = opts.title ?? credits.find((c) => c.type === "title")?.text;
   const xml = scoreToMusicXml(score, notesOf, { title, credits, ...(noteId ? { noteId } : {}) });
@@ -150,6 +237,11 @@ export async function recognizeRasterSong(
     assignment: () => score.systems.map((e, si) => e.sys.staves.map((st) => score.scoreStaves.findIndex((ss) => ss.staves[si] === st))),
     rebuild: (slots) => {
       score = buildScore(entries, { slots, lyricsBelow });
+      return { xml: scoreToMusicXml(score, notesOf, { title, credits, ...(noteId ? { noteId } : {}) }), score };
+    },
+    restructure: (op) => {
+      if (!restructureSystems(entries, op)) return null;
+      score = buildScore(entries, { lyricsBelow, profileOf });
       return { xml: scoreToMusicXml(score, notesOf, { title, credits, ...(noteId ? { noteId } : {}) }), score };
     },
   };

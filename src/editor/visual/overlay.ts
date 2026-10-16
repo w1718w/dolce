@@ -104,6 +104,8 @@ export function musicBox(el: SVGGraphicsElement): { svg: SVGSVGElement; box: Box
   const limit = anchor.box.y + anchor.box.h * 0.95;
   let box = anchor.box;
   for (const k of kids.slice(1)) {
+    // 和弦名是单独可选的记号，不算音符的框（选中音符的方块不罩它；`vis-chord` 由 `App._bindSyncEls` 标上）
+    if (k.classList.contains("vis-chord")) continue;
     // 临时记号这类 SMuFL 字（Bravura）按墨迹量：整行字体盒约 4 em，会把框撑出好几行高
     const b = isMusicText(k) ? inkBoxInPage(k) : boxInPage(k);
     if (!b || b.box.h <= 0 || b.box.y > limit) continue;
@@ -190,13 +192,13 @@ export function clearOverlay(svgs: Iterable<SVGSVGElement>, kind?: string, keep?
 
 /** 一页上拍数不对的红框整组换新。与上次画的一样就不动——焦点一进谱面就会重画叠加层，
  *  若把按下鼠标时点中的红框换掉，这一下点击就丢了（`click` 要求按下与抬起落在同一节点上）。 */
-export function setBeatIssues(svg: SVGSVGElement, items: readonly { box: Box; title: string }[]): void {
+export function setBeatIssues(svg: SVGSVGElement, items: readonly { box: Box; title: string; tag?: string }[]): void {
   const layer = layerOf(svg);
-  const sig = JSON.stringify(items.map((i) => [i.box.x, i.box.y, i.box.w, i.box.h, i.title].map((v) => (typeof v === "number" ? Math.round(v * 10) : v))));
+  const sig = JSON.stringify(items.map((i) => [i.box.x, i.box.y, i.box.w, i.box.h, i.title, i.tag ?? ""].map((v) => (typeof v === "number" ? Math.round(v * 10) : v))));
   if (layer.dataset.beats === sig) return;
   layer.dataset.beats = sig;
-  for (const el of [...layer.querySelectorAll(".vis-beat")]) el.remove();
-  for (const i of items) drawBeatIssue(svg, i.box, i.title);
+  for (const el of [...layer.querySelectorAll(".vis-beat, .vis-beat-tag")]) el.remove();
+  for (const i of items) drawBeatIssue(svg, i.box, i.title, i.tag);
 }
 
 function el<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string | number>): SVGElementTagNameMap[K] {
@@ -205,14 +207,20 @@ function el<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, 
   return e;
 }
 
-/** 插入光标：一条竖线。 */
-export function drawCaret(svg: SVGSVGElement, x: number, box: Box): void {
+/** 插入光标：一条竖线。`opts.width` 给了就用它当线宽（改字光标与音符光标同粗）；
+ *  `opts.live`：焦点不在谱面也照闪（双击改字时焦点在代码区）。 */
+export function drawCaret(svg: SVGSVGElement, x: number, box: Box, opts: { width?: number; live?: boolean } = {}): void {
   const pad = box.h * 0.15;
   layerOf(svg).appendChild(el("line", {
-    class: "vis-caret",
+    class: opts.live ? "vis-caret vis-caret-live" : "vis-caret",
     x1: x, x2: x, y1: box.y - pad, y2: box.y + box.h + pad,
-    "stroke-width": Math.max(1, box.h * 0.06),
+    "stroke-width": opts.width ?? caretWidth(box.h),
   }));
+}
+
+/** 竖线光标的线宽：按它罩的那一带的高度。 */
+export function caretWidth(h: number): number {
+  return Math.max(1, h * 0.06);
 }
 
 /** `<text>` 里第 `i` 个字之前（`i` = 字数时为末尾）的横坐标，换到页面 SVG 用户坐标；连同这串字的包围盒。 */
@@ -255,9 +263,13 @@ export function drawBlock(svg: SVGSVGElement, box: Box): void {
   }));
 }
 
-/** 拍数对不上的小节：淡红底，悬停显示说明。 */
-function drawBeatIssue(svg: SVGSVGElement, box: Box, title: string): void {
-  const pad = box.h * 0.2;
+/** 拍数对不上的小节：淡红底，悬停显示说明；右上角标差额（`tag`，如 `−♩`）。 */
+function drawBeatIssue(svg: SVGSVGElement, box: Box, title: string, tag?: string): void {
+  // 五线谱对照视图：框的是整个和弦（几个音上下摞），留白、字号按一个音的命中框量，不按整框高
+  const staffRec = svg.classList.contains("omr-staff-recognize");
+  const hit = staffRec ? svg.querySelector<SVGRectElement>(".omr-hits rect[data-kind=note]") : null;
+  const u = hit ? Number(hit.getAttribute("height")) || box.h : box.h;
+  const pad = u * 0.2;
   const r = el("rect", {
     class: "vis-beat",
     x: box.x - pad, y: box.y - pad, width: box.w + pad * 2, height: box.h + pad * 2, rx: pad,
@@ -268,6 +280,13 @@ function drawBeatIssue(svg: SVGSVGElement, box: Box, title: string): void {
   // 垫在叠加层最底下，不挡光标与方块；点击由 `hitThroughOverlay` 透过它落到音符上
   const layer = layerOf(svg);
   layer.insertBefore(r, layer.firstChild);
+  if (tag) {
+    // 对照视图的音名标在符头正上方（`rasteromr/overlay.ts`）：差额再抬过它，不压字
+    const lift = staffRec ? u * 0.75 : 0;
+    const tx = el("text", { class: "vis-beat-tag", x: box.x + box.w + pad, y: box.y - pad * 1.2 - lift, "text-anchor": "end", "font-size": u * 0.55 });
+    tx.textContent = tag;
+    layer.appendChild(tx);
+  }
 }
 
 /** 事件点中的谱面元素，透过拍数不对的红框（红框要接 hover 显示说明，点击却该落到框里的音符上）。 */
@@ -290,4 +309,17 @@ export function drawBreak(svg: SVGSVGElement, x0: number, after: Box, page: bool
   g.appendChild(t);
   layerOf(svg).appendChild(g);
   return g;
+}
+
+/** 拖动挂件时的提示（识谱软件那样）：松手会挂到的那个音描框，从挂件拉一条虚线过去。 */
+export function drawDragHint(svg: SVGSVGElement, from: { x: number; y: number }, to: Box): void {
+  clearDragHints();
+  const layer = layerOf(svg);
+  const pad = to.h * 0.2;
+  layer.appendChild(el("rect", { class: "vis-drag-target", x: to.x - pad, y: to.y - pad, width: to.w + pad * 2, height: to.h + pad * 2, rx: pad }));
+  layer.appendChild(el("line", { class: "vis-drag-link", x1: from.x, y1: from.y, x2: to.x + to.w / 2, y2: to.y + to.h / 2, "stroke-width": Math.max(1, to.h * 0.06) }));
+}
+
+export function clearDragHints(): void {
+  for (const n of [...document.querySelectorAll(".vis-drag-target, .vis-drag-link")]) n.remove();
 }

@@ -27,6 +27,7 @@ import {
   LyricLayout,
   Notation,
   PedalLine,
+  OctaveLine,
   Slur,
   Sys,
   SysStaff,
@@ -653,6 +654,63 @@ function drawPedalLine(container: Group, obj: PedalLine, sys: Sys): void {
   container.add(path);
 }
 
+/**
+ * 八度线：起头印「8va」（15ma；印在下方的 8vb / 15mb），后面一道虚线到止点，止点竖钩朝谱表。
+ * 跨系统的照松叶裁到系统边界，续接段起头印加括号的「(8)」。字形基线让开范围里的符头（上方离最高的音一个半间、下方字顶离最低的音一间多），至少离开谱表。
+ */
+function drawOctaveLine(container: Group, obj: OctaveLine, sys: Sys, eng: MixedOptions): void {
+  const off = partStaffOffset(sys, obj.part, obj.staff);
+  const startInSys = obj.startMeasure.system === sys;
+  const endInSys = obj.endMeasure.system === sys;
+  const xL = startInSys
+    ? obj.startMeasure.getEntPos(obj.startTick.minus(obj.startMeasure.offset)) + obj.startMeasure.xpos()
+    : sys.measures[0].getEntPos(new Fraction(0));
+  // 止点是下一个音的拍位：线收在范围里最后一个音的符头右缘（不压到下一个音上）
+  let lastHead: number | null = null;
+  // 范围里本谱表的符头最高 / 最低（y 向下为正，顶线 0、底线 40）
+  let y = obj.above ? -20 : 68;
+  for (const md of obj.part.measures) {
+    if (md.measureInfo.system !== sys) continue;
+    for (const ch of md.chords) {
+      const t = ch.tick();
+      if (fLt(t, obj.startTick) || !fLt(t, obj.endTick)) continue;
+      for (const n of ch.notes) {
+        if (n.staff !== obj.staff || n.writtenPitch < 0) continue;
+        y = obj.above ? Math.min(y, n.cy() - 15) : Math.max(y, n.cy() + 30);
+        const x = md.measureInfo.getEntPos(ch.offset) + md.measureInfo.xpos() + ch.noteheadWidth(eng.meta);
+        if (lastHead === null || x > lastHead) lastHead = x;
+      }
+    }
+  }
+  const xR = !endInSys ? sys.width() : lastHead ?? obj.endMeasure.getEntPos(obj.endTick.minus(obj.endMeasure.offset)) + obj.endMeasure.xpos();
+  const fs = eng.musicFont.size;
+  const glyph = !startInSys ? (obj.size >= 15 ? GlyphCodes.quindicesima : GlyphCodes.ottava)
+    : obj.above ? (obj.size >= 15 ? GlyphCodes.quindicesimaAlta : GlyphCodes.ottavaAlta)
+    : obj.size >= 15 ? GlyphCodes.quindicesimaBassaMb : GlyphCodes.ottavaBassaVb;
+  const base = off + y;
+  const g = translated(0, 0);
+  addSmufl(g, glyph, xL, base, fs);
+  const gw = smuflWidth(eng.meta, glyph);
+  // 字形立在基线上、高约两间：虚线接在字形半高，钩朝谱表
+  const lineY = base - 9;
+  const hook = obj.above ? 8 : -8;
+  const path = new GraphicPath();
+  path.fill = false;
+  path.stroke = true;
+  path.strokeColor = 0xff000000;
+  path.strokeWidth = 1;
+  for (let x = xL + gw + 3; x < xR; x += 8) {
+    path.moveTo(x, lineY);
+    path.lineTo(Math.min(x + 4, xR), lineY);
+  }
+  if (endInSys && xR > xL + gw + 3) {
+    path.moveTo(xR, lineY);
+    path.lineTo(xR, lineY + hook);
+  }
+  g.add(path);
+  container.add(g);
+}
+
 // -----------------------------------------------------------------------
 // drawLrc（render.cpp::drawLrc）
 
@@ -932,6 +990,10 @@ function drawLineObjs(container: Group, sys: Sys, p: PartLayout): void {
     if (sys.contains(obj.startTick) && sys.contains(obj.endTick)) {
       drawPedalLine(grp, obj, sys);
     }
+  }
+
+  for (const obj of p.octaveLines) {
+    if (sys.overlap(obj)) drawOctaveLine(grp, obj, sys, eng);
   }
 
   for (const obj of p.endings) {
@@ -1265,6 +1327,41 @@ function drawPartGroups(container: Group, sys: Sys): void {
   }
 }
 
+/** 声部名离系统左缘（括号、花括号之外）多远，tenths */
+const PART_NAME_GAP = 25;
+
+/**
+ * 声部名：首个系统印全名、之后印缩写，右对齐在系统左缘外（行首缩进里），纵向居本声部各可见谱表的中线；多行名逐行排。
+ * 只在源谱版面档印（`keepBreaks`）：缩进是照原谱来的，原谱在那里印着名字；自动铺排不留缩进，印了会出版心。
+ */
+function drawPartNames(container: Group, sys: Sys): void {
+  const scr = sys.score;
+  const first = scr.systems[0] === sys;
+  for (const part of scr.parts) {
+    const text = first ? part.name : part.abbrev;
+    if (!text) continue;
+    const ks = sys.staves.flatMap((st, k) => (st.part() === part && st.staffVisible ? [k] : []));
+    if (!ks.length) continue;
+    const y0 = sys.ypos(ks[0]!);
+    const y1 = sys.ypos(ks[ks.length - 1]!) + sys.staves[ks[ks.length - 1]!]!.height();
+    const font = new Font(scr.options.wordFont, part.nameSize > 0 ? part.nameSize / scr.scaling : scr.defaults.wordFont.size);
+    const lines = text.split(/\r?\n/);
+    const lineH = font.size * 1.2;
+    const cap = font.charBound("H");
+    // 首行基线：整块（首行字顶到末行基线）居中
+    const base = (y0 + y1) / 2 - ((lines.length - 1) * lineH + cap.top) / 2;
+    lines.forEach((line, li) => {
+      const tf = new TextFrame();
+      tf.text = line;
+      tf.font = font;
+      const m = new Matrix33();
+      m.setAffine([1, 0, 0, 1, -PART_NAME_GAP - font.measureText(line), base + li * lineH]);
+      tf.matrix = m;
+      container.add(tf);
+    });
+  }
+}
+
 // -----------------------------------------------------------------------
 // drawSysStaff
 
@@ -1361,6 +1458,7 @@ export function drawSystem(container: Group, sys: Sys): Group {
 
   drawBarline(eng, res, sys);
   drawPartGroups(res, sys);
+  if (scr.keepBreaks) drawPartNames(res, sys);
   for (const p of scr.parts) {
     drawLineObjs(res, sys, p);
   }

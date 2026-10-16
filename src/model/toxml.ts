@@ -132,7 +132,7 @@ const OWNS: Readonly<Record<string, { attrs?: readonly string[]; kids?: readonly
   articulations: { kids: "*" },
   ornaments: { kids: "*" },
   technical: { kids: "*" },
-  lyric: { attrs: ["number", "name"], kids: ["syllabic", "text", "extend", "elision"] },
+  lyric: { attrs: ["number", "name", "placement"], kids: ["syllabic", "text", "extend", "elision"] },
   extend: { attrs: ["type"] },
   harmony: { attrs: ["staff"], kids: ["root", "kind", "bass", "degree", "offset"] },
   root: { kids: "*" },
@@ -146,7 +146,7 @@ const OWNS: Readonly<Record<string, { attrs?: readonly string[]; kids?: readonly
   metronome: { kids: ["beat-unit", "beat-unit-dot", "per-minute"] },
   bracket: { attrs: ["type", "line-end", "line-type"] },
   pedal: { attrs: ["type", "line"] },
-  "octave-shift": { attrs: ["type"] },
+  "octave-shift": { attrs: ["type", "size"] },
   sound: { attrs: ["dacapo", "dalsegno", "fine", "segno", "coda", "tocoda", "tempo"] },
   barline: { attrs: ["location"], kids: ["bar-style", "ending", "repeat"] },
   ending: { attrs: ["number", "type", "print-object"], same: { "print-object": "yes" } },
@@ -420,7 +420,7 @@ function harmonyXml(o: Out, h: Harmony, cx: Ctx): void {
   }
   o.open("harmony", posAttrs(cx.layout?.pos.get(h)) + (h.staff !== undefined ? ` staff="${h.staff}"` : ""), surfaceOf(h));
   o.open("root");
-  o.text("root-step", h.root.step);
+  o.text("root-step", h.root.step, h.fontSize ? ` font-size="${h.fontSize}"` : "");
   if (h.root.alter) o.text("root-alter", h.root.alter, h.root.alterLeft ? ' location="left"' : "");
   o.close();
   const kindAttrs =
@@ -447,7 +447,8 @@ function harmonyXml(o: Out, h: Harmony, cx: Ctx): void {
 function lyricXml(o: Out, l: Lyric, cx: Ctx): void {
   const number = l.numberText ?? (l.refrain ? "chorus" : String(l.number));
   const name = l.name !== undefined ? ` name="${escapeAttr(l.name)}"` : "";
-  o.open("lyric", ` number="${escapeAttr(number)}"${name}${posAttrs(cx.layout?.pos.get(l))}`, surfaceOf(l));
+  const pl = l.placement ? ` placement="${l.placement}"` : "";
+  o.open("lyric", ` number="${escapeAttr(number)}"${name}${pl}${posAttrs(cx.layout?.pos.get(l))}`, surfaceOf(l));
   if (l.syllabic) o.text("syllabic", l.syllabic);
   o.text("text", (l.leadingPunctuation ?? "") + l.text + (l.trailingPunctuation ?? ""));
   if (l.extend) o.leaf("extend", l.extendType ? ` type="${l.extendType}"` : "");
@@ -645,10 +646,16 @@ function directionPartXml(o: Out, dir: DirectionPart, sur: Element | undefined, 
       if (dir.spanType) o.leaf("bracket", ` type="${dir.spanType}" line-end="down" line-type="solid"`, sur);
       else o.leaf("bracket", "", sur);
       break;
-    case "pedal":
-    case "octave-shift": {
+    case "pedal": {
       const line = dir.line !== undefined ? ` line="${dir.line ? "yes" : "no"}"` : "";
       o.leaf(dir.type, ` type="${dir.spanType ?? "start"}"${line}${pos}`, sur);
+      break;
+    }
+    case "octave-shift": {
+      // MusicXML 的 octave-shift 没有 start：起点写 up / down（读入没记方向的按 8va）
+      const ty = dir.spanType === "stop" || dir.spanType === "continue" ? dir.spanType : dir.shift?.dir ?? "down";
+      const size = dir.spanType === "stop" || dir.spanType === "continue" ? "" : ` size="${dir.shift?.size ?? 8}"`;
+      o.leaf(dir.type, ` type="${ty}"${size}${pos}`, sur);
       break;
     }
     default:
@@ -901,7 +908,7 @@ export function scoreDocToMusicXml(doc: ScoreDoc, options: ToXmlOptions = {}): s
     }
     o.open("score-part", ` id="${escapeAttr(p.id)}"`, surfaceOf(p, "score-part"));
     // MuseScore 兼容：`<part-name>` 留空并 print-object="no"（见 MusicXML-导出.md）
-    if (p.name) o.text("part-name", p.name);
+    if (p.name) o.text("part-name", p.name, p.nameSize ? ` font-size="${p.nameSize}"` : "");
     else o.leaf("part-name", ' print-object="no"');
     if (p.abbrev) o.text("part-abbreviation", p.abbrev);
     o.close();

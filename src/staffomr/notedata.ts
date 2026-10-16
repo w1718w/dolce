@@ -742,13 +742,15 @@ export interface StaffNote {
   beam?: BeamState[];
   x: number;
   /** 挂在这个音符上的歌词，按段（verse）。 */
-  lyrics?: { verse: number; text: string; hyphen: boolean; cont: boolean; /** 这个字后面拖着延长线（一字多音，见 `markLyricExtends`）。 */ extend?: boolean }[];
+  lyrics?: { verse: number; text: string; hyphen: boolean; cont: boolean; /** 这个字后面拖着延长线（一字多音，见 `markLyricExtends`）。 */ extend?: boolean; /** 字号（页面单位，见 `SPage.textEm`） */ size?: number; /** 这一行词印在谱表上方（`<lyric placement="above">`） */ above?: boolean }[];
   /** 这些字的歌词延长线到这个音为止（`<extend type="stop"/>`）。记的是那个字本身，段号后来被重排也跟着走。 */
   lyricExtendStop?: { verse: number }[];
   /** 挂在这个音符上的和弦符号（归一后的原文，如 `Am`、`G/B`、`Dm7`）。 */
   chord?: string;
+  /** 和弦的字号（页面单位，见 `SPage.textEm`）。和弦在后处理里挪来挪去时跟着 `chord` 走 */
+  chordSize?: number;
   /** 长音中途换的和弦：`frac` 是它落在这个音时值里的位置（0–1），写出成 `<harmony><offset>`。见 `attachHarmonies`。 */
-  chordLater?: { text: string; frac: number }[];
+  chordLater?: { text: string; frac: number; size?: number }[];
   /** 编辑器的识别对照用：写进 `<note id>` 的 id（`rasteromr/song.ts` 给）。记在音符上而不是旁表——写出前音符会被复制（`{...n}`） */
   omrId?: string;
   /**
@@ -775,11 +777,12 @@ export interface StaffNote {
   /** 力度记号（`mp`/`f`…）。MusicXML 里出成 `<direction>`，排在这个音符之前。 */
   dynamic?: string;
   /** 印在这个音符处的文字指示（rit. / a tempo / cresc. / Fine…）：原文与在谱表上方还是下方。MusicXML 里出成 `<direction><words>`。 */
-  words?: { text: string; above: boolean }[];
+  words?: { text: string; above: boolean; /** 字号（页面单位） */ size?: number }[];
   /** 节拍器记号：拍子单位（`quarter`）、每分钟拍数、`<per-minute>` 的原文（带「约」时 `c. 76`，否则省）。MusicXML 里出成 `<direction><metronome>`。 */
   metronome?: { unit: string; bpm: number; text?: string };
   /** 与节拍器印在同一条的速度文字（`Andante ♩ = c. 76` 的 `Andante`）：与节拍器写进**同一个** `<direction>`，不拆成两个对象。 */
   tempoText?: string;
+  tempoSize?: number;
   /** 松叶从这个音符**起**（`<wedge type="crescendo|diminuendo">`）。见 `attachWedges`。 */
   wedgeStart?: "crescendo" | "diminuendo";
   /** 松叶到这个音符**止**（`<wedge type="stop">`）。 */
@@ -806,12 +809,12 @@ export interface StaffNote {
   slurStopFrom?: Staff;
   /** 这个音起 / 收的是**哪几条**弧（`markSlurNotes` 给的弧号）。写出时按它配对、分配 `<slur number>`（`renumberSlurs`）；
    *  光凭上面两个布尔值，同一行谱上交叠的两条弧（嵌套、上下两声部各一条）配不上对。 */
-  slurStartIds?: number[];
-  slurStopIds?: number[];
+  slurStartIds?: string[];
+  slurStopIds?: string[];
   /** 只认出一端的弧（`markSlurNotes` 按几何定）：`end` = 起在这个音、另一端伸到本行最后一小节或谱表右缘之外（跨行弧的前半），
    *  `begin` = 止在这个音、另一端起在本行第一小节前半（跨行弧的后半），`mid` = 系统中间缺一端。写出时 `renumberSlurs` 只把
    *  同一声部同一行谱上的 `end` 与这个声部下一个出现的系统里的 `begin` 接成一条，接不上的不写。 */
-  slurOrphans?: { id: number; edge: "end" | "begin" | "mid"; above: boolean }[];
+  slurOrphans?: { id: string; edge: "end" | "begin" | "mid"; above: boolean }[];
   tieStart?: boolean;
   tieStop?: boolean;
   /** 起头的那条圆滑线 / 连音线画在音符上方（弧朝上，`SlurArc.above`）还是下方；没认出方向的不写。 */

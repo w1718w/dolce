@@ -1,4 +1,4 @@
-// 转记对话框与源格式写回。模型变换在 `model/transcribe.ts`；这里仅管编辑器配置和各格式的唯一写出端。
+// 转记的编辑器接入、配置、对话框与源格式写回。模型变换在 `model/transcribe.ts`。
 
 import type { ScoreDoc } from "../model/doc";
 import type { DocFormatId } from "./formats";
@@ -12,6 +12,9 @@ import { emitPu } from "../model/topu";
 import { spliceComments } from "../model/relayout";
 import { keySpelling } from "../model/jianpu";
 import type { TranscriptionOptions, TranscriptionSpelling } from "../model/transcribe";
+import { transcribeScore } from "../model/transcribe";
+import { dropEmbeddedLayout, forgetNoteLayout } from "../model/xmlsurface";
+import type { VisualHost } from "./visual/controller";
 import { labeled, showFormDialog } from "./dialogs";
 import { t } from "../i18n";
 
@@ -55,6 +58,65 @@ export function sanitizeTranscriptionPresetId(value: unknown, presets: readonly 
   return typeof value === "string" && [...builtins(), ...presets].some((p) => p.id === value)
     ? value
     : CHROMATIC_PRESET_ID;
+}
+
+interface TranscriptionSettings {
+  transcriptionPresets: TranscriptionPreset[];
+  transcriptionPreset: string;
+}
+
+/** 设置的读取与校验集中在自定义模块，宿主只需把结果并入自身状态。 */
+export function loadTranscriptionSettings(settings: object): TranscriptionSettings {
+  const input = settings as { transcriptionPresets?: unknown; transcriptionPreset?: unknown };
+  const transcriptionPresets = sanitizeTranscriptionPresets(input.transcriptionPresets);
+  return {
+    transcriptionPresets,
+    transcriptionPreset: sanitizeTranscriptionPresetId(input.transcriptionPreset, transcriptionPresets),
+  };
+}
+
+/** 转记入口：控制器只转交宿主和预设状态，执行与写回逻辑留在自定义模块。 */
+export function runTranscription(host: VisualHost, settings: TranscriptionSettings): boolean {
+  showTranscriptionDialog(
+    { presets: settings.transcriptionPresets, selectedId: settings.transcriptionPreset },
+    (state) => {
+      settings.transcriptionPresets = state.presets;
+      settings.transcriptionPreset = state.selectedId;
+      host.saveSettings();
+    },
+    (options) => {
+      host.scorePane.focus({ preventScroll: true });
+      if (!host.syncFresh()) host.reloadNow();
+      const source = host.modelEditing() ? host.freshModel() : host.syncDoc();
+      if (!source) {
+        host.setStatus(t("tx.unreadable"));
+        return;
+      }
+      const doc = host.modelEditing() ? source : structuredClone(source);
+      try {
+        const result = transcribeScore(doc, options, host.modelEditing()
+          ? { forgetStem: forgetNoteLayout, forgetLayout: dropEmbeddedLayout }
+          : {});
+        if (result.notes === 0) {
+          host.setStatus(t("tx.noNotes"));
+          return;
+        }
+        const before = host.view.state.doc.toString();
+        const after = host.modelEditing()
+          ? host.writeModel(doc)
+          : emitTranscribedSource(host.docFormat, before, source, doc);
+        if (after !== before) {
+          host.view.dispatch({ changes: [sourceDiff(before, after)], userEvent: "input.visual", scrollIntoView: false });
+          host.reloadNow();
+        }
+        host.setStatus(t("tx.done", { key: keySpelling({ fifths: options.fifths }) }));
+      } catch (error) {
+        console.error("transcription failed", error);
+        host.setStatus(t("tx.failed", { error: error instanceof Error ? error.message : String(error) }));
+      }
+    },
+  );
+  return true;
 }
 
 /** 当前源格式的模型写回原格式；ABC 家族把不进模型的原注释缝回去。 */

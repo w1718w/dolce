@@ -207,9 +207,9 @@ function readCredits(root: Element): Credit[] {
   return out;
 }
 
-function readPartGroups(partList: Element): { groups: PartGroup[]; names: Map<string, { name?: string; abbrev?: string }> } {
+function readPartGroups(partList: Element): { groups: PartGroup[]; names: Map<string, { name?: string; abbrev?: string; size?: number }> } {
   const groups: PartGroup[] = [];
-  const names = new Map<string, { name?: string; abbrev?: string }>();
+  const names = new Map<string, { name?: string; abbrev?: string; size?: number }>();
   const open: PartGroup[] = [];
   for (const c of Array.from(partList.children)) {
     if (c.tagName === "part-group") {
@@ -234,7 +234,8 @@ function readPartGroups(partList: Element): { groups: PartGroup[]; names: Map<st
       const id = c.getAttribute("id") ?? "";
       const nm = childText(c, "part-name") ?? undefined;
       const ab = childText(c, "part-abbreviation") ?? undefined;
-      names.set(id, { name: nm, abbrev: ab });
+      const sz = Number(child(c, "part-name")?.getAttribute("font-size"));
+      names.set(id, { name: nm, abbrev: ab, ...(sz > 0 ? { size: sz } : {}) });
       for (const g of open) g.parts.push(id);
     }
   }
@@ -265,6 +266,8 @@ function readHarmony(el: Element): Harmony {
     kind: kindEl?.textContent ?? "",
   };
   if (rootEl && alterLeft(rootEl, "root-alter")) h.root.alterLeft = true;
+  const fs = rootEl ? attrNum(child(rootEl, "root-step") ?? rootEl, "font-size") : undefined;
+  if (fs !== undefined && fs > 0) h.fontSize = fs;
   const kt = kindEl?.getAttribute("text");
   // `text=""` 是「不印 kind 后缀」，与缺省不同（混排按 null / "" 分），空串也要留
   if (kt !== null && kt !== undefined) h.kindText = kt;
@@ -304,6 +307,8 @@ function readLyrics(noteEl: Element): Lyric[] {
     if (n !== null && !/^\d+$/.test(n)) lr.numberText = n;
     const name = l.getAttribute("name");
     if (name !== null) lr.name = name;
+    const pl = l.getAttribute("placement");
+    if (pl === "above" || pl === "below") lr.placement = pl;
     const syl = childText(l, "syllabic");
     if (syl) lr.syllabic = syl as Lyric["syllabic"];
     const ext = child(l, "extend");
@@ -514,6 +519,7 @@ function readDirectionPart(first: Element): DirectionPart {
     case "octave-shift": {
       const t = first.getAttribute("type");
       d.spanType = t === "stop" ? "stop" : t === "continue" ? "continue" : "start";
+      if (first.tagName === "octave-shift" && (t === "up" || t === "down")) d.shift = { dir: t, size: Number(first.getAttribute("size")) || 8 };
       if (first.tagName === "pedal" && first.getAttribute("line") !== null) d.line = first.getAttribute("line") === "yes";
       break;
     }
@@ -834,7 +840,7 @@ export function loadScoreDoc(xmlText: string): ScoreDoc {
   const partList = child(root, "part-list");
   const { groups, names } = partList
     ? readPartGroups(partList)
-    : { groups: [], names: new Map<string, { name?: string; abbrev?: string }>() };
+    : { groups: [], names: new Map<string, { name?: string; abbrev?: string; size?: number }>() };
   if (groups.length) song.partGroups = groups;
   const scoreParts = new Map((partList ? children(partList, "score-part") : []).map((sp) => [sp.getAttribute("id") ?? "", sp]));
 
@@ -848,6 +854,7 @@ export function loadScoreDoc(xmlText: string): ScoreDoc {
     const nm = names.get(id);
     if (nm?.name) part.name = nm.name;
     if (nm?.abbrev) part.abbrev = nm.abbrev;
+    if (nm?.size) part.nameSize = nm.size;
     let staves: number | undefined;
     for (const mEl of children(p, "measure")) {
       const m = readMeasure(mEl, ids, marks);

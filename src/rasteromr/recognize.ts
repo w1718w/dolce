@@ -11,13 +11,15 @@
 import type { Binary } from "../omrkit/types";
 import { timeDigit, timeKey, timeStripOf, type TimeStrip } from "./timesig";
 import type { Component, Rect } from "../omrkit/types";
+import { inkTextSize, smallCapsCase, TEXT_INK_EM } from "./textsize";
+import { definePortable } from "./portablefn";
 import { findBarlines, findNoteheads, findStaves, findStems, findTails, makeBars, makeSystems, tagSystemBarlines, unknownObjs } from "../staffomr/page";
 import { isAccidental, isClef, timeSigDigit, type SmuflName } from "../staffomr/glyphs";
 import { buildNotes, checkBars, findClefKeyTime, keyFifths, lastTimeSignature, type BeamShape, type StaffContext, type StaffNote, type StemInfo, type BarCheck } from "../staffomr/notedata";
 import { findRasterArticulations } from "./artic";
 import { markRepeatsAndVoltas } from "./repeats";
 import { findRasterTuplets } from "./tuplet";
-import { attachWordLines, findHeaderStrip, findWordStrips, headerZoneLines, wordKey, type HeaderStrip, type WordStrip } from "./words";
+import { attachWordLines, findHeaderStrip, findNameStrips, findWordStrips, headerZoneLines, partNameLines, wordKey, type HeaderStrip, type WordStrip } from "./words";
 import { headerCredits, type HeaderCredit, type WordLine } from "../omrkit/headertext";
 import { applyTuplet, attachDynamicTexts, attachNotations, attachWedges, findNotations, findTuplets, markLyricExtends } from "../staffomr/notations";
 import type { PObj, SPage, Staff, Sym, Tag } from "../staffomr/model";
@@ -28,7 +30,7 @@ import { bootstrapClefs, matchTemplate, RasterGlyphLookup, type BootStaff } from
 import { sigDistance } from "../omrkit/glyphdict";
 import { completeStaffBars, cutJianpuStrip, eraseInBand, findJianpuBands, jianpuKey, type JianpuStrip } from "./jianpuband";
 import { fuseJianpu, type FuseStats, type JianpuRow } from "./jianpufuse";
-import { CHAR_MAX as LYRIC_CHAR_MAX, findLyricRows, foldLyricChars, isLatinRow, LATIN_MIN_CHAINED, latinCells, mapCharsToCells, splitMixedChars, stripKey, stripOf, stripWithout, type LyricRow, type LyricStrip, type OcrChar } from "./lyric";
+import { CHAR_MAX as LYRIC_CHAR_MAX, findLyricRows, foldLyricChars, isLatinRow, LATIN_MIN_CHAINED, latinCells, lyricLayoutVerdict, mapCharsToCells, splitMixedChars, stripKey, stripOf, stripWithout, type LyricRow, type LyricStrip, type OcrChar } from "./lyric";
 import { candidateMap, findHoles, repairedLayer, traceContours, type Contour, type ContourMap } from "./contour";
 import { buildHeadMasks, buildHollowMasks, headFromStemBlock, scoreAt, scoreAtMasked, solidHeadsAlongStems, splitHeadCluster } from "./headmask";
 import { headProb, trainHeadClassifier } from "./headclass";
@@ -157,6 +159,19 @@ export interface CarryKey {
   clefs?: ClefTally;
 }
 
+/** 一页从前面各页接过来的东西：沿用的拍号、调号，以及前面还没有页眉（这一页要切页眉带）。 */
+export interface PageCarry {
+  carryTime?: { beats: number; beatType: number };
+  carryKey?: CarryKey;
+  wantHeader?: boolean;
+}
+
+/** 一页的来源：栅格化、拼页眉带（曲首页的页眉印在谱图之外时）。串行路由 pdf.js 页对象实现，Worker 里另有实现。 */
+export interface PageSource {
+  raster(): Promise<RasterPage | null>;
+  composeHeader(binW: number): Promise<{ strip: WordStrip; texts: WordLine[] } | null>;
+}
+
 /** 键是「行数:各行高低音谱号的排法」（如 `7:gggffgf`）；`seen` 是见过几个这样的系统，`g8[i]` 是第 i 行读成低八度谱号的次数。 */
 export type ClefTally = Record<string, { seen: number; g8: number[] }>;
 
@@ -192,8 +207,14 @@ const empty = (page: SPage, raster: RasterPage | null, unit: RasterUnit | null, 
   carryKey,
 });
 
+/** 按本页位图量文字墨高（`SPage.inkTextSize`）；可重建，页结果才传得过线程（`pagetransfer.ts`）。 */
+const inkTextSizeOn = definePortable("inkTextSize", (bin: Binary) => (box: { x: number; y: number; w: number; h: number }, text: string) => inkTextSize(bin, box, text));
+
 /** 记账时算「这条段有主」的标记。见 `makeBars` 之后那一段。 */
 const SEG_TAGS: Tag[] = ["Staff", "Leger", "Stem", "BarLine", "SysLine", "Tail", "Beam", "Bracket"];
+
+/** 页面单位合 pt 的系数到这么大（≈80dpi）就当页面尺寸不可信（`SPage.sizeKnown`） */
+const LOW_DPI_SCALE = 0.9;
 
 /** 判别器只看这个尺寸包络内的块（线距的倍数）——比 `findRasterHeads` 的闸宽一圈，
  *  正是要捞被啃窄、被粘宽的那一批；再宽就成了「拿模板去空地里找东西」。 */
@@ -295,8 +316,9 @@ const KEY_OVERLAP = 0.5;
 const LATIN_CHAIN = 3;
 /** 拉丁行靠中文歌词行作保时，那行中文至少这么多个汉字。 */
 const CJK_SEED_MIN = 4;
-/** 表情文字的术语、页脚注的字样（OCR 不出空格，按连写匹配，**别收会落在连写词缝里的短串**：「For all gen-」连写含 rall、「Spirit.」含 rit.）：带这些的拉丁行不是歌词（望十架 p1 页脚「Words: … Tune: …」「Flute part is on page 43」）。 */
-const DIRECTION_TERM_RE = /tempo|cresc|poco|molto|unis\.|dim\.|rall\.|stagger|section|words:|tune:|music:|page\d|copyright|©/i;
+/** 表情文字的术语、页脚注的字样（OCR 不出空格，按连写匹配，**别收会落在连写词缝里的短串**：「For all gen-」连写含 rall、「Spirit.」含 rit.）：带这些的拉丁行不是歌词（望十架 p1 页脚「Words: … Tune: …」「Flute part is on page 43」）。
+ *  页脚注另认：脚注号 `*` 打头、`Tune;`（OCR 常把冒号读成分号）、生卒年 `1844-1927`（望十架 p1「** Beneath the Cross of Jesus - Tune; ST. CHRISTOPHER, by Frederick C. Maker (1844-1927)」被收成男声一行歌词） */
+const DIRECTION_TERM_RE = /tempo|cresc|poco|molto|unis\.|dim\.|rall\.|stagger|section|words[:;]|tune[:;]|music[:;]|page\d|copyright|©|^[*＊]|\d{4}[-–—]\d{4}/i;
 /** 上下贴着的两个头（`isStackedPair`）拆分时每个头的得分门槛。 */
 const PAIR_SCORE_MIN = 0.4;
 /** 两个头盒中心上下差不到这么多格、左右差不到 `DUP_HEAD_DX` 格，就是同一个头被两路各认了一次。
@@ -432,7 +454,7 @@ function mergeLayerLines(ocr: readonly WordLine[], layer: readonly WordLine[]): 
     const y = Math.min(o.y, l.y);
     const r = Math.max(o.x + o.w, l.x + l.w);
     const bot = Math.max(o.y + o.h, l.y + l.h);
-    Object.assign(o, { t: `${a.t} ${b.t}`, x, y, w: r - x, h: bot - y });
+    Object.assign(o, { t: `${a.t} ${b.t}`, x, y, w: r - x, h: bot - y, size: o.size ?? l.size });
   };
   for (const l of [...ocr].sort((a, b) => a.x - b.x)) {
     const o = out.find((m) => near(m, l, 0.3) && Math.max(m.h, l.h) <= Math.min(m.h, l.h) * 1.5);
@@ -475,6 +497,15 @@ export async function recognizeRasterPage(
   opts: {
     carryTime?: { beats: number; beatType: number };
     carryKey?: CarryKey;
+    /**
+     * 跨页沿用（上一页的 `carryTime` / `carryKey`、前面有没有页眉）**晚到**的版本：给了它就不看同名的三个同步字段，
+     * 识别走到第一处要用沿用的地方（`shareOctaveClefs` 之前）才 await。多页并行时前段不等上一页（见 `pagepool.ts`）。
+     */
+    carry?: () => Promise<PageCarry>;
+    /** 这一页在整曲里的序号（从 0 起，跨几份底本连续数）：弧号带上它（「页码.页内序号」），见 `markSlurNotes`。 */
+    pageSeq?: number;
+    /** 页源：给了就不碰 `pdfPage` / `OPS`（Worker 里没有 pdf.js 页对象，见 `pagepool.ts`）。 */
+    source?: PageSource;
     /**
      * 歌词条的 OCR 结果，**按条的内容指纹寻址**（`stripKey`）。
      *
@@ -522,11 +553,19 @@ export async function recognizeRasterPage(
     staffBandOnly?: boolean;
   } = {},
 ): Promise<RasterPageResult> {
-  const raster = opts.raster !== undefined ? opts.raster : await rasterizePage(pdfPage, OPS);
+  const source: PageSource = opts.source ?? { raster: () => rasterizePage(pdfPage, OPS), composeHeader: (binW) => composeHeaderStrip(pdfPage, OPS, binW) };
+  let carryP: Promise<PageCarry> | null = null;
+  const carryOf = (): Promise<PageCarry> => (carryP ??= opts.carry ? opts.carry() : Promise.resolve({ carryTime: opts.carryTime, carryKey: opts.carryKey, wantHeader: opts.wantHeader }));
+  /** 没认出谱的页照样把沿用原样交下去 */
+  const emptyPage = async (page: SPage, raster: RasterPage | null, unit: RasterUnit | null): Promise<RasterPageResult> => {
+    const c = await carryOf();
+    return empty(page, raster, unit, c.carryTime, c.carryKey);
+  };
+  const raster = opts.raster !== undefined ? opts.raster : await source.raster();
   const blank = buildRasterPage({ index, width: raster?.bin.w ?? 1, height: raster?.bin.h ?? 1, unit: { lineThick: 1, space: 1, height: 4 }, staffLines: [], hSegs: [], vSegs: [] });
-  if (!raster) return empty(blank, null, null, opts.carryTime, opts.carryKey);
+  if (!raster) return emptyPage(blank, null, null);
   const unit = estimateUnit(raster.bin);
-  if (!unit) return empty(blank, raster, null, opts.carryTime, opts.carryKey);
+  if (!unit) return emptyPage(blank, raster, null);
   // 整页文字框（找谱线之前就要）：缓存按页指纹查，查不到且要在线检测的把位图带出去
   const live = opts.live;
   const textKey = opts.pageTexts || opts.wantTextBin || live?.textDet ? pageTextKey(raster.bin) : undefined;
@@ -546,7 +585,7 @@ export async function recognizeRasterPage(
   const textLines = new Set(textStaves.flatMap((g) => g.lines));
   const groups = found.groups.filter((g) => !textStaves.includes(g));
   const lines = found.lines.filter((l) => !textLines.has(l));
-  if (!groups.length) return withText(empty(blank, raster, unit, opts.carryTime, opts.carryKey));
+  if (!groups.length) return withText(await emptyPage(blank, raster, unit));
   // 谱线左端顺着线再往左追（弯页左段落在横带外，见 `traceLeft`）。一行谱五条线的左端
   // 本该一致，追的时候中间几条常被谱号挡住（齐来称颂第一行追到 153/209/216/193/153），
   // 取**至少两条吻合的最小左端**统一给五条线——下游一律拿五条线左端的最大值当谱行左缘。
@@ -3701,7 +3740,14 @@ export async function recognizeRasterPage(
     braces: findBraces(nl, prims, unit, staffLefts, groups.map((g) => ({ top: g.lines[0].y, bottom: g.lines[4].y }))).map((c) => c.bbox),
     sysBrackets: groupByLeftInk(raster.bin, groups.map((g) => ({ top: g.lines[0].y, bottom: g.lines[4].y, left: Math.max(...g.lines.map((l) => l.left)) })), unit),
   });
-  if (!findStaves(pg)) return withText(empty(pg, raster, unit, opts.carryTime, opts.carryKey));
+  pg.ptPerUnit = raster.imageRect.w / raster.bin.w;
+  pg.originPt = { x: raster.imageRect.x, y: raster.imageRect.y };
+  pg.sizePt = { w: raster.pageWidth, h: raster.pageHeight };
+  // 一像素合一点以上（不到 80dpi）：多半是图片封的单页 PDF（`jpegToPdf` 一像素记一点），页面尺寸不可信
+  pg.sizeKnown = pg.ptPerUnit < LOW_DPI_SCALE;
+  pg.textEm = 1 / TEXT_INK_EM;
+  pg.inkTextSize = inkTextSizeOn(raster.bin);
+  if (!findStaves(pg)) return withText(await emptyPage(pg, raster, unit));
   // 读音高按该处实测的五线、相邻两线间的相对位置（`Staff.middleStep`）
   for (const stf of pg.staves) {
     if (stf.lineYs.length !== 5) continue;
@@ -3730,7 +3776,9 @@ export async function recognizeRasterPage(
   // 小节线的 x 先交给调号（`keyChanges` 分行首与行中转调要用，这时还没切小节）
   for (const [st, c] of ctx) c.barXs = pg.segs.filter((l) => l.isV && l.hasTag("BarLine") && l.bottom > st.box.top && l.top < st.box.bottom).map((l) => l.cx);
   shareSystemClefs(pg, ctx, unit);
-  const clefTally = shareOctaveClefs(pg, ctx, opts.carryKey?.clefs);
+  // 从这里起要用上一页的沿用（并行时这里才等上一页交出来）
+  const carry = await carryOf();
+  const clefTally = shareOctaveClefs(pg, ctx, carry.carryKey?.clefs);
   dropCourtesyKeys(pg, ctx, unit.space);
   demoteMidKeys(pg, ctx);
   extendKeyChains(pg, ctx);
@@ -3744,11 +3792,11 @@ export async function recognizeRasterPage(
     shareKeySignature(sec, settled);
     carrySystemKeys(pg, sec, settled);
   }
-  extendKeyByCarry(ctx, opts.carryKey, raster.bin, unit.space);
+  extendKeyByCarry(ctx, carry.carryKey, raster.bin, unit.space);
   findMidKeysByTemplate(pg, ctx, raster.bin, unit);
   shareMidKeys(pg, ctx, unit.space);
   dropHeadsInKey(pg, ctx, true);
-  shareTimeSignature(pg, ctx, timeCols, unit, raster.bin, !!opts.carryTime);
+  shareTimeSignature(pg, ctx, timeCols, unit, raster.bin, !!carry.carryTime);
   dropBarsInKey(pg, ctx, unit.space);
   keyFromChords(pg, ctx, harmonies.map((h) => h.text), unit);
   fixFlatReadAsSix(harmonies, ctx);
@@ -3998,7 +4046,7 @@ export async function recognizeRasterPage(
   splitUnisons(notes, stems, beams, raster.bin, unit.space);
   markCrossStaff(pg, notes, stems, unit.space);
   fixDottedPairs(notes, unit.space);
-  fixQuartersByBarSum(pg, ctx, notes, opts.carryTime, unit.space);
+  fixQuartersByBarSum(pg, ctx, notes, carry.carryTime, unit.space);
   findTuplets(pg, beams, stems, notes);
 
   // ── 演奏法与力度 ─────────────────────────────────────────────────────────
@@ -4044,7 +4092,7 @@ export async function recognizeRasterPage(
   // ——分行、拼根音与后缀、挂给**下方 x 最近**的音符，一行不改。
   if (harmonies.length) {
     const objs = harmonies.map((t, i) =>
-      makeTextObj(pg.objs.length + i, { cells: [{ box: t.box, ch: t.text }], sizeDev: t.box.h }));
+      withTextSize(makeTextObj(pg.objs.length + i, { cells: [{ box: t.box, ch: t.text }], sizeDev: t.box.h }), pg, t));
     for (const o of objs) o.addTag("Harmony");
     pg.objs.push(...objs);
     // `merge = false`：记号已经按和弦文法切好了，别再按左右相接拼一次
@@ -4141,8 +4189,18 @@ export async function recognizeRasterPage(
     const latinStrips = new Set<LyricStrip>();
     {
       // 表情文字行（「poco rit.」「a tempo」「unis.」「molto cresc.」）字号与歌词一样、又夹在歌词行之间，种子、链入都会把它收进来；带这些术语的不收
-      const cand = (ocr ? lyricStrips : []).filter((st) => { const ch = ocr!.get(stripKey(st)); return ch && isLatinRow(ch, false, LATIN_MIN_CHAINED) && !DIRECTION_TERM_RE.test(ch.map((c) => c.ch).join("")); });
-      for (const st of cand) if (isLatinRow(ocr!.get(stripKey(st))!)) latinStrips.add(st);
+      // **先按排法判**（`lyricLayoutVerdict`：词距、音节对不对得上音）：成段的文字（脚注、版权、说明）不收；
+      // 按音符拉开、逐个对着音的直接当种子，不必带连字符。排法判不了的再看连字符与字样
+      const noteXsOf = new Map<number, number[]>();
+      const verdict = (st: LyricStrip) => {
+        const si = stripRow.get(st)!.staffIndex;
+        let xs = noteXsOf.get(si);
+        if (!xs) noteXsOf.set(si, (xs = notes.filter((n) => n.staff === pg.staves[si] && !n.rest).map((n) => (n.sym.box.left + n.sym.box.right) / 2)));
+        return lyricLayoutVerdict(st, xs, unit.space);
+      };
+      const verdicts = new Map((ocr ? lyricStrips : []).map((st) => [st, verdict(st)] as const));
+      const cand = (ocr ? lyricStrips : []).filter((st) => { const ch = ocr!.get(stripKey(st)); return ch && verdicts.get(st) !== "text" && isLatinRow(ch, false, LATIN_MIN_CHAINED) && !DIRECTION_TERM_RE.test(ch.map((c) => c.ch).join("")); });
+      for (const st of cand) if (isLatinRow(ocr!.get(stripKey(st))!) || (verdicts.get(st) === "lyric" && isLatinRow(ocr!.get(stripKey(st))!, false))) latinStrips.add(st);
       const yOf = (st: LyricStrip) => Math.min(...stripRow.get(st)!.cells.map((c) => c.y));
       // **紧挨着一行中文歌词的也是种子**（不要连字符，字母仍要够 `isLatinRow` 的下限）：中英对照谱英文行就印在中文行下面，
       // 一整行单音节词常见（望十架 p3「love. Face the cross, He dies to set us free.」两行整行丢了）。
@@ -4272,7 +4330,7 @@ export async function recognizeRasterPage(
   // 缺了它写出来的 MusicXML 就没有 `<time>`。按**第一声部每小节的时值和**取众数推一个 n/4，
   // 造成两个拍号数字放进首行的 ctx——写出端、跨页传递（`lastTimeSignature`）照常走。
   // 只推 2~9 拍的整拍（拍号字形只有一位数），至少要三个小节撑着。
-  if (!opts.carryTime && pg.staves.every((st) => !(ctx.get(st)?.time.length))) {
+  if (!carry.carryTime && pg.staves.every((st) => !(ctx.get(st)?.time.length))) {
     const sums: number[] = [];
     for (const st of pg.staves)
       for (const bar of st.bars) {
@@ -4301,7 +4359,7 @@ export async function recognizeRasterPage(
       const dn = makeSymObj(pg.objs.length + 1, { box: { x, y: Math.round(mid), w, h: Math.round(first.box.bottom - mid) }, code: "timeSig4" }, first.box.bottom - first.box.top);
       c0.time.push(up.sym, dn.sym);
       // 拍号是这里才推出来的：「按小节拍数把四分纠回八分」那一步前面因为没有拍号跳过了，补跑一遍
-      fixQuartersByBarSum(pg, ctx, notes, opts.carryTime, unit.space);
+      fixQuartersByBarSum(pg, ctx, notes, carry.carryTime, unit.space);
     }
   }
 
@@ -4337,13 +4395,16 @@ export async function recognizeRasterPage(
   //
   // 带照固定几何切（两行谱之间的空当），认字靠 `wordOcr` 缓存；歌词行、和弦字母已经另有身份，中心落在它们盒里的行不要。
   const wordStrips = opts.wordOcr || opts.wantWordStrips || live?.word ? findWordStrips(raster.bin, pg.staves, unit) : [];
-  const wordOcr = opts.wordOcr ?? (live?.word ? await live.word(wordStrips) : undefined);
+  // 声部名带（行首缩进与页边）：认字同文字指示带，归位另走（`partNameLines`）
+  const nameStrips = opts.wordOcr || opts.wantWordStrips || live?.word ? findNameStrips(raster.bin, pg.systems, unit) : [];
+  const wordOcr = opts.wordOcr ?? (live?.word ? await live.word([...wordStrips, ...nameStrips]) : undefined);
+  if (wordOcr) pg.partNames = partNameLines(pg, nameStrips, wordOcr);
   // 页眉（曲首页）：标题、词曲作者。认字同文字指示带，缓存另放
-  let headerStrip: HeaderStrip | null = opts.wantHeader ? findHeaderStrip(raster.bin, pg.staves, unit) : null;
+  let headerStrip: HeaderStrip | null = carry.wantHeader ? findHeaderStrip(raster.bin, pg.staves, unit) : null;
   // 谱图里切不出页眉带、谱图又没顶到页顶的（排版软件出的 PDF，标题是另贴的小图块与文字层）：拼出谱图上方那一段（`pagecompose.ts`）
   let layerLines: WordLine[] = [];
-  if (opts.wantHeader && !headerStrip) {
-    const comp = await composeHeaderStrip(pdfPage, OPS, raster.bin.w);
+  if (carry.wantHeader && !headerStrip) {
+    const comp = await source.composeHeader(raster.bin.w);
     if (comp) (headerStrip = comp.strip), (layerLines = comp.texts);
   }
   const headerOcr = opts.headerOcr ?? (headerStrip && live?.header ? await live.header([headerStrip]) : undefined);
@@ -4355,7 +4416,15 @@ export async function recognizeRasterPage(
     headerLines && headerStrip?.creditFrom !== undefined
       ? headerLines.filter((l) => l.y + l.h / 2 > headerStrip!.creditFrom!).map((l) => ({ x: headerStrip!.box.x + l.x, y: headerStrip!.box.y + l.y, w: l.w, h: l.h }))
       : [];
-  const header = headerStrip && headerLines ? headerCredits(headerLines, headerStrip) : [];
+  // 页眉字号按墨迹量（OCR 框高带留白）。在页眉带自己的像素上量：排版软件出的 PDF 页眉不在谱图里（`composeHeaderStrip` 另拼的）
+  const header = (headerStrip && headerLines ? headerCredits(headerLines, headerStrip) : []).map((c) => {
+    const st = headerStrip!;
+    const box = { x: c.box.x - st.box.x, y: c.box.y - st.box.y, w: c.box.w, h: c.box.h };
+    // 小型大写读成的全大写改回首字母大写（`smallCapsCase`），字号照改过的字折
+    const text = smallCapsCase(st, box, c.text);
+    const ink = inkTextSize(st, box, text);
+    return ink ? { ...c, text, size: ink } : { ...c, text };
+  });
   if (wordOcr) {
     const skip: Rect[] = [
       // 认下来的歌词行：从行顶往下两格半（`LyricLine` 只记行顶），左右以首尾音节为界
@@ -4392,7 +4461,7 @@ export async function recognizeRasterPage(
     const placed = attachWordLines(pg, notes, wordStrips, wordOcr, unit, skip, lyricStrips.map((st) => st.box));
     // 文字带里读出来的和弦记号：和弦带那一路（要自己的 OCR 缓存，合唱谱没生成）没认到和弦时才用
     if (!harmonies.length && placed.chords.length) {
-      const objs = placed.chords.map((t, i) => makeTextObj(pg.objs.length + i, { cells: [{ box: t.box, ch: t.text }], sizeDev: t.box.h }));
+      const objs = placed.chords.map((t, i) => withTextSize(makeTextObj(pg.objs.length + i, { cells: [{ box: t.box, ch: t.text }], sizeDev: t.box.h }), pg, t));
       for (const o of objs) o.addTag("Harmony");
       pg.objs.push(...objs);
       attachHarmonies(pg, notes, objs, false);
@@ -4667,7 +4736,9 @@ export async function recognizeRasterPage(
   reconnectSlurs(pg, slurs);
   attachEdgeSlurStarts(slurs, notes, unit.space, new Set(index > 1 ? (pg.systems[0]?.staves ?? []) : []));
   const chordTies = tieChords(slurs, notes, unit.space);
-  markSlurNotes(slurs);
+  // 弧号「页码.页内序号」（页码按 `pageSeq` 数）：只当配对的键用，跨页不能撞号
+  let slurSeq = 0;
+  markSlurNotes(slurs, opts.pageSeq !== undefined ? () => `${opts.pageSeq! + 1}.${++slurSeq}` : undefined);
   for (const [a, b] of chordTies) (a.tieStart = true), (b.tieStop = true);
   markLyricExtends(notes);
 
@@ -4680,7 +4751,7 @@ export async function recognizeRasterPage(
     ctx,
     beams,
     notes,
-    bars: checkBars(pg, ctx, notes, opts.carryTime),
+    bars: checkBars(pg, ctx, notes, carry.carryTime),
     lyricLines,
     contours: cmap,
     ledger,
@@ -4692,7 +4763,7 @@ export async function recognizeRasterPage(
     harmonyTexts,
     labelStrips,
     timeStrips,
-    wordStrips: opts.wantWordStrips ? wordStrips : [],
+    wordStrips: opts.wantWordStrips ? [...wordStrips, ...nameStrips] : [],
     headerStrips: headerStrip ? [headerStrip] : [],
     header,
     textKey,
@@ -4708,9 +4779,9 @@ export async function recognizeRasterPage(
     debugPrims: opts.debug ? prims : undefined,
     debugGroups: opts.debug ? groups.map((g) => ({ top: g.lines[0].y, bottom: g.lines[4].y, space: g.space })) : undefined,
     debugRest: opts.debug ? blobImage(nl, prims, unit, onGrid) : undefined,
-    carryTime: lastTimeSignature(pg, ctx, opts.carryTime),
+    carryTime: lastTimeSignature(pg, ctx, carry.carryTime),
     // 没有调号的页也要把谱号的见证带下去：个数记零（`extendKeyByCarry` 见零不补）
-    carryKey: { ...(lastKey(pg, ctx, opts.carryKey) ?? { code: "accidentalFlat", n: 0 }), clefs: clefTally },
+    carryKey: { ...(lastKey(pg, ctx, carry.carryKey) ?? { code: "accidentalFlat", n: 0 }), clefs: clefTally },
   };
 }
 /**
@@ -4777,3 +4848,10 @@ const EIGHTH_REST_H_PIECES = 1.4;
 const EIGHTH_REST_FILL_PIECES = 0.25;
 /** 延音线中间夹着的音，离两端几个音级以内才算同一声部。 */
 const TIE_BETWEEN_STEPS = 5;
+
+/** 和弦对象记上墨迹量出来的字高（`PObj.textSize`）：`sizeDev` 是框高，判据在用，不动它 */
+function withTextSize(o: PObj, pg: SPage, t: { box: Rect; text: string }): PObj {
+  const h = pg.inkTextSize?.(t.box, t.text);
+  if (h) o.textSize = h;
+  return o;
+}

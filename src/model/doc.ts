@@ -269,6 +269,8 @@ export interface Harmony {
   degrees?: { value: number; alter: number; type: "add" | "alter" | "subtract" }[];
   /** 整段和弦只有文字、解析不出结构时的原文兜底（识别结果常是这种） */
   text?: string;
+  /** [五线谱] 字号（pt，`<root-step font-size>`；识别结果照原谱量的） */
+  fontSize?: number;
   /** `<offset>`：相对所修饰音符起点的 divisions（增时线上的和弦由 `xmlproject.ts` 填） */
   offset?: number;
   /** [五线谱] `<kind use-symbols>` / `<kind parentheses-degrees>` */
@@ -298,6 +300,8 @@ export interface Lyric {
   numberText?: string;
   /** [五线谱] `<lyric name>` */
   name?: string;
+  /** [五线谱] `<lyric placement>`：`above` = 这一行词印在谱表上方（合唱谱两声部共用一行谱，上声部的词印在谱表上方） */
+  placement?: "above" | "below";
   /** `<elision>`：一音多字的连接（123 的 `{多字}` / ABC 的 `~`） */
   elision?: string;
   /** 副歌：这一行词被多遍共用（`Lyric.refrain` 的对应物） */
@@ -631,6 +635,8 @@ export interface Direction {
   spanType?: "start" | "stop" | "continue";
   /** `<wedge type>`：crescendo / diminuendo */
   wedgeType?: "crescendo" | "diminuendo";
+  /** `<octave-shift>` 起点的 `type` 与 `size`：down = 记谱比实际低（8va，印在谱上方）、up = 8vb；size 8 / 15 */
+  shift?: { dir: "up" | "down"; size: number };
   /** 上方还是下方 */
   placement?: "above" | "below";
   /** `<sound>` 的播放语义：dacapo / dalsegno / fine / segno / coda / tempo */
@@ -649,7 +655,7 @@ export interface Direction {
 /** `Direction.more` 的一项：`<direction-type>` 下的一个子元素。 */
 export type DirectionPart = Pick<
   Direction,
-  "type" | "text" | "tempo" | "spanType" | "wedgeType" | "line"
+  "type" | "text" | "tempo" | "spanType" | "wedgeType" | "line" | "shift"
 >;
 
 /** `<print>`：版面指示。123 的 `$`（换行）/ `$$`（换页）落在这里。
@@ -724,6 +730,8 @@ export interface Part {
   id: string;
   name?: string;
   abbrev?: string;
+  /** 声部名的字号（pt，`<part-name font-size>`；识别结果照原谱量的） */
+  nameSize?: number;
   /** [五线谱] 多谱表（钢琴谱） */
   staffCount?: number;
   measures: Measure[];

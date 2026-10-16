@@ -7,11 +7,12 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { sniffDialect, type Dialect } from "../pu";
 import type { ElementId, ScoreDoc } from "../model/doc";
 import { applyBreaks } from "../model/breaks";
+import { locate } from "../model/edit";
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { measureDocument, PaintResources, ScorePainter, type SyncPaintRequest } from "../layout/painter";
 import { computeStyle, sanitizeLayer, upsertRule, type StyleRule } from "../style/cascade";
 import type { Length } from "../style/units";
-import { isPrintStyle, NOTE_FONTS, PRINT_STYLE_DEFAULT, printStyleLayer, type PrintStyle } from "../style/styles";
+import { NOTE_FONTS } from "../style/fonts";
 import { docPageLayer, pageMargins, resolvePaper, songPageDecl } from "../style/paper";
 import { songHeaderFonts, songLyricSize, songStaffSize } from "../model/pagemeta";
 import { headerFontsOf, headerLayerOfSong, type HeaderFonts, type HeaderRole } from "../style/header";
@@ -157,8 +158,6 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
   /** 用户层：每个主题一层规则，**两档各记一套**（用户口径：「区分 展开/原样的字号设置」）。
    *  同一档里各格式共用一套（字号、纸、配色），规则不带限定。 */
   private _userLayers: Record<"projection" | "print" | "staff" | "header", StyleRule[]> = { projection: [], print: [], staff: [], header: [] };
-  /** 原样档的风格（设置面板选；`style/styles.ts`）。持久化。 */
-  printStyle: PrintStyle = PRINT_STYLE_DEFAULT;
   // `header`：页眉四项（标题/副标题/经文/词曲作者）的字体字号，**各档共用一份**，叠在各档用户层之上（`style/header.ts`）
 
   /** 某一档、某把尺子看到的 computed 样式表（内置主题 → 曲内层 → 用户层）。
@@ -166,10 +165,8 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
   styleOf(mode: JianpuLayoutMode): StyleSheet {
     const theme = themeOfMode(mode);
     const page = theme === "print" && !this._userSetsPaper("jianpu") ? this._docLayer() : [];
-    // 风格（设置面板选的）只归原样档：叠在主题之上、歌本样式表之下
-    const style = theme === "print" ? printStyleLayer(this.printStyle) : [];
     return computeStyleForPaper(
-      [THEMES[theme], style, this._bookLayer, page, this._docHeaderLayer(theme === "print", theme !== "print"), this._userLayers[theme], this._userLayers.header],
+      [THEMES[theme], this._bookLayer, page, this._docHeaderLayer(theme === "print", theme !== "print"), this._userLayers[theme], this._userLayers.header],
       { mode, engine: "jianpu" },
     );
   }
@@ -418,7 +415,7 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
     }
   }
 
-  /** 原样档用户层里的音符字体（`NOTE_FONTS` 的 id；空串 = 没设、跟随风格）。 */
+  /** 原样档用户层里的音符字体（`NOTE_FONTS` 的 id；空串 = 没设、按主题默认）。 */
   get noteFont(): string {
     const fam = computeStyle([this._userLayers.print], { mode: "original", engine: "jianpu" }).roles.note?.family;
     return NOTE_FONTS.find((f) => f.family === fam)?.id ?? "";
@@ -565,8 +562,8 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
     /** 五线谱/混排的谱表大小（mm）与歌词字号（pt）；null = 跟随文件 / 出厂。 */
     staffSize?: { mm?: number | null; lyricPt?: number | null };
     fontSize?: number; titleSize?: number; creditSize?: number; color?: number; bgColor?: number;
-    /** 原样档的风格、音符字体（`NOTE_FONTS` 的 id，空串 = 跟随风格）、和弦升降号写在前后（空串 = 照原文）。 */
-    printStyle?: PrintStyle; noteFont?: string; chordAccidental?: "" | "before" | "after";
+    /** 原样档的音符字体（`NOTE_FONTS` 的 id，空串 = 默认）、和弦升降号写在前后（空串 = 照原文）。 */
+    noteFont?: string; chordAccidental?: "" | "before" | "after";
   }): void {
     const mode = this.layoutMode;
     if (opts.pageW || opts.pageH) {
@@ -577,7 +574,6 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
     if (opts.staffPaper && isPaper(opts.staffPaper)) this._userLayers.staff = upsertRule(this._userLayers.staff, undefined, { page: { paper: opts.staffPaper } });
     for (const [engine, choice] of Object.entries(opts.paper ?? {}) as [PaperEngine, PaperChoice][]) this._setPaper(engine, choice);
     if (opts.staffSize) this._setStaffSize(opts.staffSize);
-    if (opts.printStyle !== undefined) this.printStyle = opts.printStyle;
     if (opts.noteFont !== undefined) this._setNoteFont(opts.noteFont);
     if (opts.chordAccidental !== undefined) this._setPrintOverride("accidental-side", opts.chordAccidental || undefined);
     if (opts.color !== undefined) this._setStyle(mode, { page: { ink: opts.color } });
@@ -607,7 +603,6 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
   /** 恢复当前档的主题默认（清掉那一档的用户层）。 */
   resetRenderSettings(): void {
     this._userLayers[themeOfMode(this.layoutMode)] = [];
-    if (this.layoutMode === "original") this.printStyle = PRINT_STYLE_DEFAULT;
     this._applyPageBg();
     this.saveSettings();
     this.reload(this.getText());
@@ -643,7 +638,6 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
       staff: sanitizeLayer(layers.staff),
       header: sanitizeLayer(layers.header),
     };
-    if (isPrintStyle(s.printStyle)) this.printStyle = s.printStyle;
     if (s.zoom) this.zoom = s.zoom;
     if (s.jpProfile === "normal" || s.jpProfile === "pptx") this.jpProfile = s.jpProfile;
     if (s.originalProfile === "print" || s.originalProfile === "slide") this.originalProfile = s.originalProfile;
@@ -672,7 +666,6 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
       omrKind: this.omr.kind,
       jpProfile: this.jpProfile,
       originalProfile: this.originalProfile,
-      printStyle: this.printStyle,
       showFormatMarks: this.visual.showFormatMarks,
       beatCheck: this.visual.beatCheck,
       noteSound: this.visual.noteSound,
@@ -1030,6 +1023,8 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
       const el = this._syncGroupEl(entry);
       if (!el) continue;
       this._syncElOf.set(entry, el);
+      // 和弦名的组标上类名：点亮、方块都按它把和弦从音符里剔出去（`styles.css`、`overlay.ts::musicBox`；SVG 输出本身不带类名）
+      if (entry.kind === "mark" && entry.markKind === "harmony" && el !== this.painter.entryEl(entry.id, 0)) el.classList.add("vis-chord");
       // 展开档里音符与它的歌词共用一个 `<g>`，先来的音符条目占住它（`all()` 已排好序）
       if (!this._syncEls.has(el)) this._syncEls.set(el, entry);
     }
@@ -1128,6 +1123,16 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
     return this._syncEntryAt(target);
   }
 
+  /** Alt+点原图补漏识：点的位置落在哪两个音之间（`OmrController.sourcePoint`） */
+  sourcePoint(ev: MouseEvent): ReturnType<OmrController["sourcePoint"]> {
+    return this.omr.sourcePoint(ev);
+  }
+
+  /** F8 导航：识别核对的可疑项（`OmrController.doubtStops`） */
+  doubtStops(): { at: number; go(): void }[] {
+    return this.omr.doubtStops();
+  }
+
   noteEl(id: ElementId): SVGGraphicsElement | null {
     if (this.mode === "recognize") return this.omr.hitFor("note", id);
     if (this.mode === "mixed") {
@@ -1135,6 +1140,13 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
       return m === undefined ? null : this.painter.noteEls(m)[0] ?? null;
     }
     return this.painter.entryEl(id, 0);
+  }
+
+  chordEls(id: ElementId): SVGGraphicsElement[] {
+    const staff = this.mode === "recognize" ? this.omr.chordHits(id) : null;
+    if (staff?.length) return staff;
+    const one = this.noteEl(id);
+    return one ? [one] : [];
   }
 
   // 五线谱 / 混排上：附点、增时线不是单独的图元（附点是符头旁的点、增时线并进时值），小节线与弧走带身份的叶子
@@ -1210,6 +1222,17 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
   private _recognizeElOf(entry: SyncEntry): SVGGraphicsElement | null {
     if (entry.kind === "note") return this.omr.hitFor("note", entry.id);
     if (entry.kind === "lyric") return this.omr.hitFor("lyric", entry.id, entry.verse ?? 0);
+    // 和弦名：这个音的第几个（音符本身的在前、增时线上的按序在后，同原文顺序）
+    if (entry.kind === "mark" && entry.markKind === "harmony" && !this.omr.hasStaffResult) {
+      const slot = this._sync.marksOf(entry.id).filter((m) => m.markKind === "harmony").indexOf(entry);
+      return slot < 0 ? null : this.omr.hitFor("chord", entry.id, slot);
+    }
+    // 五线谱对照：小节末那条线（条目借本小节最后一个音的 id）按「收尾的是第几小节」对到源图上的那条
+    if (entry.kind === "barline" && entry.edge !== "before" && this.omr.hasStaffResult) {
+      const doc = this.syncDoc();
+      const l = doc ? locate(doc, entry.id) : null;
+      return l ? this.omr.barlineHit(l.mi) : null;
+    }
     return null;
   }
 
@@ -1323,8 +1346,9 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
   private _markPartEl(entry: SyncEntry): SVGGraphicsElement | null {
     const role = entry.markKind === "harmony" || entry.markKind === "deco" || entry.markKind === "annotation" ? entry.markKind : null;
     if (!role) return null;
-    const els = this.painter.partEls(entry.id, role);
-    const same = this._sync.marksOf(entry.id).filter((m) => m.markKind === entry.markKind);
+    // 挂在增时线上的（长音中途换的和弦）不在音符格里，按增时线 id 认；音符格里的只数挂在音符本身的
+    const els = entry.own !== undefined ? this.painter.ownedPartEls(entry.own, role) : this.painter.partEls(entry.id, role);
+    const same = this._sync.marksOf(entry.id).filter((m) => m.markKind === entry.markKind && m.own === entry.own);
     const nth = same.findIndex((m) => m.from === entry.from);
     return els.length === same.length && nth >= 0 ? els[nth] ?? null : null;
   }
@@ -2034,8 +2058,11 @@ export class App implements OmrHost, PlaybackHost, FormatHost, FormatSwitchHost,
   /**
    * 五线谱识别产物落地：与打开 `.musicxml` 同一个模式（无代码区、谱面由 XML 出），默认进混排。
    * 五线谱识别的产物带和弦、多声部、slur，`.jpwabc` 装不下，所以不再转简谱文本。
+   * `rebuild`：同一次识别按新关联 / 系统切分重建的那份——只重认弱起，声部静音独奏照旧（此前落地漏了这一步，弱起一直按开机那份示例谱认）。
    */
-  adoptStaffXml(xml: string): boolean {
+  adoptStaffXml(xml: string, rebuild = false): boolean {
+    if (rebuild) this.visual.documentLoaded();
+    else this._documentLoaded();
     this._setDocFormat("musicxml");
     if (!this.mixed._setMixedXml(xml)) return false;
     this._setMixedAvailable(true);

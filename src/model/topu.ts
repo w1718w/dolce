@@ -34,12 +34,12 @@ import { DYNAMICS, TERMS } from "../pu/glyph";
 import { STEPS, keyAlter, tonicStep } from "../score/jppitch";
 import { PU_LYRIC_PUNCTUATION } from "../common/cjkpunct";
 import { projectForJianpu } from "./jianpuproject";
-import { fillDegreesFromPitch, harmonyText, keySpelling, melodyLane, quarterTempos, topNote } from "./jianpu";
+import { fillDegreesFromPitch, harmonyText, melodyLane, quarterTempos, topNote } from "./jianpu";
 import { ownIds, ownMarks, partRanges, systemRanges, type SystemRange } from "./emitutil";
 import { relayoutDocBreaks } from "./relayout";
 import { decoKey } from "./deconames";
 import { directionMarks } from "./directionmarks";
-import { degreeOfKey, songFifths } from "./keyshift";
+import { degreeOfKey, songFifths, tonicSpelling } from "./keyshift";
 
 // ───────────────────────── 头部 ─────────────────────────
 
@@ -67,7 +67,8 @@ const KEY_DISPLAY: Readonly<Record<"prefix" | "suffix", RegExp>> = {
 function keyText(k: Key | undefined, style: "prefix" | "suffix"): string {
   if (!k) return "C";
   if (k.display && KEY_DISPLAY[style].test(k.display)) return k.display;
-  const sp = k.spelling && k.spelling !== "none" ? k.spelling : keySpelling(k);
+  // 没有拼写的（识别出的小调只记 fifths + 主音唱名）取主音的音名，不取同调号的大调名（此前写成 `6=G`）
+  const sp = k.spelling && k.spelling !== "none" ? k.spelling : tonicSpelling(k);
   const m = /^([#b]?)([A-G])([#b]?)$/.exec(sp);
   if (!m) return keyNameOf(k.fifths, style);
   const sign = m[1] || m[3] || "";
@@ -128,12 +129,15 @@ function headerLines(song: Song, d: DialectSpec, opts: EmitPuOptions): string[] 
   const key = keyText(song.key, h.keyStyle);
   const meter = meterText(song);
   if (h.keyMeter === "split") {
-    L.push(`${h.keyField}:${key}`);
+    // 番茄的 `D:` 只写音名、没有主音唱名：`6=E` 写成 `D:E` 会读成 E 大调，退成同调号的 `1=` 大调名（音高不变，唱名标签丢，见丢失清单）
+    const tonicLost = song.key?.tonicDegree !== undefined && song.key.tonicDegree !== "1";
+    L.push(`${h.keyField}:${tonicLost ? keyText({ fifths: songFifths(song) }, h.keyStyle) : key}`);
     if (meter) L.push(`${h.meterField}:${meter}`);
   } else {
     const tonic = song.key?.tonicDegree ?? "1";
     const note = song.timeNote ? ` ${song.timeNote}` : "";
-    L.push(`${tonic}=${key}${meter}${meter ? note : ""}`);
+    // 诗歌本的小调写小写音名：`6=e`、`6=c#`（读入不分大小写）
+    L.push(`${tonic}=${tonic === "6" ? key.toLowerCase() : key}${meter}${meter ? note : ""}`);
   }
   if (song.tempos?.length) L.push(`${h.tempoField}:${quarterTempos(song).join(" ")}`);
   if (d.emit.pageFields) {

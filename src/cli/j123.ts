@@ -29,6 +29,7 @@ export { emitPu, emitPuSong, keyNameOf, puArcLosses } from "../model/topu";
 export { emitJly } from "../model/tojly";
 export { scanMusicLine, scanWord, JlyLosses, parseJly, isJlyMusicLine, rewrapJlyText } from "../model/fromjly";
 export { projectForJianpu } from "../model/jianpuproject";
+export { songFifths } from "../model/keyshift";
 export { AccidentalCarry } from "../model/jianpu";
 // 文本谱与 `.jpwabc` 读入：迁移工具要拿它们当输入
 export { parsePu, parsePuAst, sniffDialect } from "../pu";
@@ -39,3 +40,5 @@ export { applyBreaks, breaksOf } from "../model/breaks";
 export { phraseCuts, puPhraseLines } from "../pu/phrase";
 // 小节时值自检（私有仓库的对比报告拿它查手工谱各小节满不满）
 export { checkMeasureDurations, describeBeatIssue } from "../model/beatcheck";
+// 模型编辑动作（可视化编辑的 MusicXML 那一路；`ops-actions-check.mjs` 按识别手动操作的口径逐个验）
+export * as modelEdit from "../model/edit";
