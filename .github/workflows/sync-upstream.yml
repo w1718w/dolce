@@ -1,0 +1,87 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'w1718w/dolce'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pending: ${{ steps.sync.outputs.pending }}
+      upstream-sha: ${{ steps.sync.outputs.upstream-sha }}
+      custom-sha: ${{ steps.sync.outputs.custom-sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: custom/main
+          fetch-depth: 0
+
+      - name: Update main and open integration PR
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/lodebar2026/dolce.git refs/heads/main:refs/remotes/upstream/main
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main refs/heads/custom/main:refs/remotes/origin/custom/main
+          if ! git merge-base --is-ancestor origin/main upstream/main; then
+            echo '::error::main has diverged from upstream. Inspect the history before syncing; no force push was attempted.'
+            exit 1
+          fi
+          git push origin refs/remotes/upstream/main:refs/heads/main
+          echo "upstream-sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
+          echo "custom-sha=$(git rev-parse origin/custom/main)" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor upstream/main origin/custom/main; then
+            echo 'pending=false' >> "$GITHUB_OUTPUT"
+            echo 'custom/main already contains upstream.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo 'pending=true' >> "$GITHUB_OUTPUT"
+          pr_url=$(gh pr list --repo "$GITHUB_REPOSITORY" --base custom/main --head main --state open --json url --jq '.[0].url // empty')
+          if [[ -z "$pr_url" ]]; then
+            cat > "$RUNNER_TEMP/upstream-pr.md" <<'BODY'
+          将 main 中的上游更新合入 custom/main，保留自定义功能。
+
+          Sync upstream 工作流会尝试合并并执行网页构建；请查看对应运行结果。存在冲突时需要手动解决。此 PR 不自动合并；合入时请选择 Create a merge commit，不要 squash 或 rebase，以保留上游祖先关系。
+          BODY
+            pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base custom/main --head main --title '同步上游到自定义主线' --body-file "$RUNNER_TEMP/upstream-pr.md")
+          fi
+          echo "Integration PR: $pr_url" >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    needs: sync
+    if: needs.sync.outputs.pending == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.custom-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check merge with upstream
+        env:
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream-sha }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-edit --no-commit "$UPSTREAM_SHA"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
