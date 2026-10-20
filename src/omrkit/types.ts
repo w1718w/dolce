@@ -78,7 +78,8 @@ export interface JpNum {
   endingStart?: string;     // 本音符所在小节开始该房
   endingStop?: string;      // 本音符所在小节结束该房
   // 跳转记号（D.C./D.S./Fine/To Coda…），印在本谱行音符附近 → 小节右线上的记号（导出 MusicXML 时落成 <direction>+<sound>）。
-  jumpMark?: string;
+  // 同一处可以印两个（青年诗歌 4《陪我生活》曲末上方 Fine、下方 D.S.），按 x 序都留。
+  jumpMarks?: string[];
   // segno 𝄋：跳转的**目标**，不是跳转本身，故挂本音符所在小节的**左**线（记号名 `hs`，123 `!segno!`）。
   // 字形由 segno.ts 几何识别，与 OCR 出来的文字记号 jumpMark 分开。
   segno?: boolean;
@@ -184,6 +185,8 @@ export interface RecognizedScore {
   // 谱后单独排版的附段歌词（诗行，不跟音符对齐）：收下的各行原文与源图框，识别模式按原位叠加。
   // 内容已按第 1 段的音位骨架写进各音符的 lyrics[1..]，见 stanzas.ts。
   stanzaRegions?: TextRegion[];
+  // 谱后的注（「注：此首诗辞采自…」，青年诗歌 20）：一条一段，→ `pageText.bottomLeft`（文本谱 `BL:`）
+  footnotes?: string[];
   dotDiam?: number; // 八度点/附点在源图的统计直径（识别模式按原图大小画点，非按字号推算）
   // 给了参照歌词时的词谱互证结果（reflyrics.ts）：改了哪些字、补了哪些字、哪里两边对不上。
   lyricCheck?: LyricCheck;

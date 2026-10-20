@@ -21,9 +21,9 @@ import { detectSegno } from "./segno";
 import { median, overlapX, unionRect } from "../omrkit/geom";
 import { accidentalOf } from "./accidental";
 import { probe } from "./probe";
-import { mergeBrokenHlines, untangleBridged, splitBarDash, splitBarCap, splitDigitDash, splitArcTail, splitLineOverArc, splitLineDot, splitArcEndDots, splitArcInnerDots, splitMordentDot } from "./compsurgery";
+import { mergeBrokenHlines, untangleBridged, splitBarDash, splitBarCap, splitDigitDash, splitArcTail, splitArcFootDigit, splitLineOverArc, splitArcUnderGlyph, splitLineDot, splitArcEndDots, splitArcInnerDots, splitMordentDot } from "./compsurgery";
 import { splitGluedSharp, splitBlock, meterCandidates, groupRows } from "./digitcores";
-import { buildJpNums, resolvePairOctaveDots } from "./jpnums";
+import { buildJpNums, promoteGluedUpDots, resolvePairOctaveDots } from "./jpnums";
 import { rowInk, tightBox, columnInk } from "./inkprobe";
 
 /** 一个数字格：紧包围盒 + 自身下划线条数(div)。 */
@@ -60,7 +60,11 @@ function splitMergedOctaveDot(
   // 数字笔即便是最窄的 "1" 也有可观宽度（≈0.3~0.55字号）。
   // 宽数字粘点（78《马槽歌》Q2 `6̣`，6 与点连成 26×48，字号 30）：块高 ≥1.35 字号、宽不过一字号时也试，只走严格判据。
   const wide = strict && b.h >= numH * 1.35;
-  if (b.h <= numH * 1.05 || b.w < numH * 0.3 || b.w > numH * (wide ? 1 : 0.6)) return null;
+  // 中宽档（青年诗歌 5《第一声呼求》`3̇ 2̇ 5̇` 点贴在数字顶上，26×49、字号 39，谷宽 2px）：块高 ≥1.2 字号、宽不过 0.8 字号，
+  // 只走严格判据，谷放到 0.12 字号、且不过点宽的 0.45（`1̇` 的谷 4px、点宽 10）
+  const mid = strict && !wide && b.h >= numH * 1.2;
+  const maxW = wide ? 1 : mid ? 0.8 : 0.6;
+  if (b.h <= numH * 1.05 || b.w < numH * 0.3 || b.w > numH * maxW) return null;
   const ink = rowInk(bin, b);
   const strokeInk = median(ink.filter((v) => v > 0)) || 1;
   const mk = (y0: number, y1: number): Component | null => {
@@ -73,7 +77,7 @@ function splitMergedOctaveDot(
     for (let y = winLo; y < winHi; y++) if (ink[y] < vMin) { vMin = ink[y]; v = y; }
     if (v < 0 || vMin > strokeInk * 0.6) return null; // 无清晰低墨谷 → 非点+笔（真小节线墨廓均匀）
     // 严格：谷处近乎断开（只剩一个像素粘着）；宽数字那档放到 0.15 字号（同首 `6̣` 点带一截尾巴粘上来，二值图谷宽 4px）
-    if (strict && vMin > (wide ? Math.max(1, numH * 0.15) : 1)) return null;
+    if (strict && vMin > (wide ? Math.max(1, numH * 0.15) : mid ? Math.max(1, numH * 0.12) : 1)) return null;
     const dotSeg = dotAtTop ? mk(0, v) : mk(v + 1, b.h);
     const digSeg = dotAtTop ? mk(v + 1, b.h) : mk(0, v);
     if (!dotSeg || !digSeg) return null;
@@ -81,11 +85,12 @@ function splitMergedOctaveDot(
     // 点须是真墨斑(≥0.13字号见方、≤0.5字号)、数字笔须够高(≥0.55字号)且宽度像数字(≥0.28字号)。
     // 宽度下限把 1~2px 的细小节线/扫描竖纹挡在门外（它们墨廓也会有单像素起伏被误当"谷"）。
     if (dh > numH * 0.5 || dotSeg.bbox.w > numH * 0.5 || dotSeg.bbox.w < numH * 0.13) return null;
-    if (dgh < numH * 0.55 || dgh > numH * 1.7 || digSeg.bbox.w > numH * (wide ? 1 : 0.7) || digSeg.bbox.w < numH * 0.28) return null;
+    if (dgh < numH * 0.55 || dgh > numH * 1.7 || digSeg.bbox.w > numH * (wide ? 1 : mid ? 0.8 : 0.7) || digSeg.bbox.w < numH * 0.28) return null;
     // 严格：点近乎方形、且明显窄于数字——3、5 的顶横扁而与数字等宽，过不了。
     if (strict && (dotSeg.bbox.w > dh * 1.7 || dh > dotSeg.bbox.w * 1.7 || dotSeg.bbox.w > digSeg.bbox.w * 0.8)) return null;
     // 宽数字那档另要点比谷明显宽：「4」的竖笔下端与谷一样粗，会被当成点切下来（同首 Q1 `4̲` 读成 `4̣`）
     if (wide && vMin > dotSeg.bbox.w * 0.55) return null;
+    if (mid && vMin > Math.max(1, dotSeg.bbox.w * 0.45)) return null;
     probe("splitMergedOctaveDot");
     return { dot: dotSeg, digit: digSeg };
   };
@@ -427,7 +432,7 @@ function classify(comps: Component[], bin: Binary): { c: Classified; numH: numbe
   for (const k of comps) {
     const { w, h } = k.bbox;
     const cand = barCand(w, h);
-    if (cand || (w <= numH * 0.6 && h > numH * 1.05) || (w <= numH && h >= numH * 1.35)) {
+    if (cand || (w <= numH * 0.6 && h > numH * 1.05) || (w <= numH * 0.8 && h >= numH * 1.2) || (w <= numH && h >= numH * 1.35)) {
       const sp = splitMergedOctaveDot(bin, k.bbox, numH, !cand);
       if (sp) { c.dots.push(sp.dot); c.blocks.push(sp.digit); continue; }
     }
@@ -676,8 +681,14 @@ function midbandHole(bin: Binary, b: Rect): boolean {
   return rows > 0 && holes * 2 > rows;
 }
 
-/** `refLyrics`：同一首诗歌的歌词文本（已解码），给了就与识别歌词互证纠错（reflyrics.ts），结果在 `lyricCheck`。 */
-export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refLyrics?: string; review?: boolean } = {}): Promise<RecognizedScore> {
+/** 阶段快照点（回归测试按阶段比对用，见 `trace`）。 */
+export type JianpuStage = "comps" | "classified" | "cores" | "rows" | "repeats" | "slurs" | "header" | "lyrics";
+
+/** `refLyrics`：同一首诗歌的歌词文本（已解码），给了就与识别歌词互证纠错（reflyrics.ts），结果在 `lyricCheck`。
+ *  `trace`：各阶段结束时回调一次中间产物（块表、谱行……）。**之后还会被就地改**，要留就在回调里当场序列化；不给就没有任何开销。 */
+export async function recognizeJianpu(bin: Binary, ocr: OcrBackend,
+  opts: { refLyrics?: string; review?: boolean; trace?: (stage: JianpuStage, data: unknown) => void } = {}): Promise<RecognizedScore> {
+  const trace = opts.trace;
   // 去连通：把贯穿全高的小节线（常像"桥"把弧/增时线粘成一团）从像素上擦掉重做连通域，
   // 让弧/小节线/数字各自独立、以干净连通块流入下面的 classify 与 detectSlurs。
   const raw = connectedComponents(bin, 4);
@@ -689,7 +700,9 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
   comps = splitBarCap(bin, comps, numHOf(comps));
   if (isVoicedPage(comps, numHOf(comps))) comps = splitDigitDash(bin, comps, numHOf(comps));
   comps = splitArcTail(bin, comps, numHOf(comps));
+  comps = splitArcFootDigit(bin, comps, numHOf(comps));
   comps = splitLineOverArc(bin, comps, numHOf(comps));
+  comps = splitArcUnderGlyph(bin, comps, numHOf(comps));
   comps = splitLineDot(bin, comps, numHOf(comps), isVoicedPage(comps, numHOf(comps)));
   // 弧端切点在四声部页上也做：这种页的线跨两个声部（≥2.6 字号），进不了「干净页」的尺子；弧又贴着音起笔，
   // 右脚常压在下一个音的高音点上（新编赞美诗·四声部 172 `1̇⌒2̇` 弧连点 58×22，整本漏高音点三百多处）
@@ -700,7 +713,9 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
     comps = splitArcInnerDots(bin, comps, numHOf(comps));
     comps = splitMordentDot(bin, comps, numHOf(comps));
   }
+  trace?.("comps", comps);
   const { c, numH } = classify(comps, bin);
+  trace?.("classified", { numH, ...c });
 
   // 数字块 → 数字格（拆分粘连/连音，并测各自下划线 div）。
   // 与数字粘连的圆滑线弧帽在此切出，作为合成连通块补进 comps 供 detectSlurs 检测。
@@ -767,6 +782,7 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
     }
   }
 
+  trace?.("cores", { allCores, meterMarks });
   const rowsC = groupRows(allCores, numH);
   // 每行的 y 范围 + 穿过的小节线。
   const rowMetaAll = rowsC.map((rd) => {
@@ -903,6 +919,66 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
     }
     return true;
   });
+  // **页眉调号与前奏同排**（青年诗歌 5《第一声呼求》：左边「C/A4/4」，隔开大半行，右边「前奏 5̇5̇5̇ 5̇·5̇ | …」）：
+  // 首行左段读成 `0 1 1 4 1 4`、「前奏」两字读成 `0 0`。认法：首行（不低于第一条像样谱行）核间有一道 ≥6 字号的空当、
+  // 空当以左不过 8 核且没有小节线，右段至少 3 核。左段整块交给页眉（`headExtra`，det 认调号拍号）；
+  // 右段开头近方、又比本段数字高一成半的核是「前奏」字样，一并摘掉。
+  const headExtra: Rect[] = [];
+  let preludeLabel: Rect | undefined;   // 摘下来的「前奏」字样，认出字后挂到本行首音的段落词上
+  {
+    const top = rowMeta.length ? rowMeta.reduce((a, b) => (b.topY < a.topY ? b : a)) : undefined;
+    if (top && top.topY <= firstMusicTop && top.rd.length >= 5) {
+      const rd = [...top.rd].sort((a, b) => a.bbox.x - b.bbox.x);
+      let gi = -1, gmax = 0;
+      for (let i = 0; i + 1 < rd.length; i++) {
+        const g = rd[i + 1]!.bbox.x - rright(rd[i]!.bbox);
+        if (g > gmax) { gmax = g; gi = i; }
+      }
+      const left = rd.slice(0, gi + 1), right = rd.slice(gi + 1);
+      if (gmax >= numH * 6 && left.length <= 8 && right.length >= 3 && top.barlineXs.every((x) => x > right[0]!.bbox.x)) {
+        const hR = median(right.map((k) => k.bbox.h));
+        let k = 0;
+        // 字里的碎块（「前」下半另成一核）中心落在已摘的字框里，跟着摘
+        const inPrev = (q: DigitCore) => k > 0 && right.slice(0, k).some((d) => rcx(q.bbox) >= d.bbox.x && rcx(q.bbox) <= rright(d.bbox));
+        while (k < right.length - 3 && ((squareCore(right[k]!) && right[k]!.bbox.h >= hR * 1.15) || inPrev(right[k]!))) k++;
+        probe("pseudoRow.headWithPrelude");
+        const x0 = Math.min(...left.map((q) => q.bbox.x)), y0 = Math.min(...left.map((q) => q.bbox.y));
+        const x1 = Math.max(...left.map((q) => rright(q.bbox))), y1 = Math.max(...left.map((q) => rbottom(q.bbox)));
+        headExtra.push({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+        if (k > 0) {
+          const lab = right.slice(0, k).map((q) => q.bbox);
+          const lx = Math.min(...lab.map((q) => q.x)), ly = Math.min(...lab.map((q) => q.y));
+          preludeLabel = { x: lx, y: ly, w: Math.max(...lab.map((q) => rright(q))) - lx, h: Math.max(...lab.map((q) => rbottom(q))) - ly };
+        }
+        top.rd = right.slice(k);
+        top.topY = Math.min(...top.rd.map((q) => q.bbox.y));
+        top.botY = Math.max(...top.rd.map((q) => rbottom(q.bbox)));
+      }
+    }
+  }
+  // **行首单独印的「前奏：」**（青年诗歌 15《活神的家》：首谱行「前奏：3 5 1̇ 3̇ | …」，不与页眉同排）读成 `0 1 0.`。
+  // 认法：行首连着两个以上近方、不比本行数字矮的核（字里的碎块中心落在已摘的字框里跟着摘），其后至少三个核、
+  // 其中七成不是近方的（本书数字 28×47，字 51×51）。摘下来交给下面同一段认字（认得出是汉字才挂段落词）。
+  if (!preludeLabel) {
+    for (const m of rowMeta) {
+      const rd = [...m.rd].sort((a, b) => a.bbox.x - b.bbox.x);
+      const hMed = median(rd.map((q) => q.bbox.h));
+      let k = 0, nSq = 0;
+      const inPrev = (q: DigitCore) => k > 0 && rd.slice(0, k).some((d) => rcx(q.bbox) >= d.bbox.x && rcx(q.bbox) <= rright(d.bbox));
+      while (k < rd.length && ((squareCore(rd[k]!) && rd[k]!.bbox.w >= rd[k]!.bbox.h * 0.85 && rd[k]!.bbox.h >= hMed * 0.95 && ++nSq) || inPrev(rd[k]!))) k++;
+      const rest = rd.slice(k);
+      if (nSq < 2 || rest.length < 3 || rest.filter((q) => !squareCore(q)).length < rest.length * 0.7) continue;
+      if (m.barlineXs.some((x) => x < rest[0]!.bbox.x)) continue;
+      probe("prelude.rowHead");
+      const lab = rd.slice(0, k).map((q) => q.bbox);
+      const lx = Math.min(...lab.map((q) => q.x)), ly = Math.min(...lab.map((q) => q.y));
+      preludeLabel = { x: lx, y: ly, w: Math.max(...lab.map((q) => rright(q))) - lx, h: Math.max(...lab.map((q) => rbottom(q))) - ly };
+      m.rd = rest;
+      m.topY = Math.min(...rest.map((q) => q.bbox.y));
+      m.botY = Math.max(...rest.map((q) => rbottom(q.bbox)));
+      break;
+    }
+  }
   // 系统通长线不算：它比普通小节线长好几倍，算进来就把中位数抬上去，只有短线的行过不了下面 withBars 的门（343）
   const medBarH = median(rowMeta.flatMap((m) => m.bars.filter((b) => !m.long.has(b)).map((b) => b.bbox.h)));
   if (medBarH > 0) {
@@ -1099,7 +1175,12 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
       // 26×37），宽度门挡不住它。放宽只给**连谱号括着的声部行**里、**矮、悬在右邻数字上半截**（底比数字底
       // 高 ≥0.2 字高）且形状判据认定是 ♯ 的：光凭形状，密排行里正常高度的数字也会被认成 ♯（92、1727 等
       // 八首各丢几个音），谱后正文里汉字的碎块也有矮而悬高、形似 ♯ 的（1811《心愿》）。
-      if (k.bbox.h > medH * 1.25) continue;
+      // 高悬的大 ♯（青年诗歌 20 `5· ♯4̲`：♯ 28×56 对数字 29×42，顶高出 0.7、底高出 0.4 字高，离数字 0.9 字号）：比数字还高，
+      // 过不了下面的高度门，当音符读成了 0。单声部行上整个悬在右邻数字上方的（顶高出 0.5、底高出 0.3 字高）按形状再认
+      const tallHung = !voicedPage && k.bbox.h > medH * 1.25 && k.bbox.h <= medH * 1.45 && k.bbox.w <= medW * 1.2 &&
+        nx.bbox.h >= medH * 0.85 && nx.bbox.y - k.bbox.y >= medH * 0.5 && rbottom(nx.bbox) - rbottom(k.bbox) >= medH * 0.3 &&
+        nx.bbox.x - rright(k.bbox) >= 0 && nx.bbox.x - rright(k.bbox) <= numH * 1.0;
+      if (k.bbox.h > medH * 1.25 && !tallHung) continue;
       // 「矮」不能只看块高：同书的 ♯ 也有印得和数字差不多高的（97《受难歌》28×32、26×30 对数字 37；101《我有主耶稣歌》`6 ♯5`
       // 的 ♯ 19×21 ~ 18×26 对数字 17×25），高度门一卡就当音符送去 OCR、读成休止 0。门放到 0.9 字高；再高的要整个悬高——
       // **顶比右邻数字高出 0.25、底高出 0.3 字高以上**（101 是 0.28~0.44；同行的数字顶是齐的，歪页上相邻两个数字也会差出 0.2：319 末行 `5 5`）。
@@ -1118,7 +1199,17 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
         }
         return false;
       };
-      const wideSharp = (sysOf.has(m) ? raised : voicedPage && k.bbox.h < medH * 0.8) && hungLow && k.bbox.w <= medW * 1.5 &&
+      // 单声部行上只收**顶底都悬高**的（顶高出 0.25、底高出 0.3 字高）：青年诗歌 14《雲彩》`7 6 ♯5` 的 ♯ 粗印糊成一团 23×40，
+      // 本行数字中位宽 26，差 1px 过不了宽度门，当音符读成了 1
+      const hungBoth = k.bbox.h <= medH * 1.1 && nx.bbox.y - k.bbox.y >= medH * 0.25 && rbottom(nx.bbox) - rbottom(k.bbox) >= medH * 0.3;
+      if (tallHung) {
+        if (accidentalOf(bin, k.bbox) !== "sharp" || underlined(k.bbox)) continue;
+        probe("accidental.tallHung");
+        accidentals.set(nx, "sharp");
+        accCores.add(k);
+        continue;
+      }
+      const wideSharp = (sysOf.has(m) ? raised : voicedPage ? k.bbox.h < medH * 0.8 : hungBoth) && hungLow && k.bbox.w <= medW * 1.5 &&
         accidentalOf(bin, k.bbox) === "sharp" && !underlined(k.bbox);
       if (k.bbox.w > medW * 0.85 && !wideSharp) continue;
       if (k.bbox.h < medH * 0.45 || k.bbox.w < medW * 0.3) continue;         // 太小 → 点/碎片
@@ -1251,7 +1342,10 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
   // 真「1」是一根竖笔（该页 17px 宽），这些 7 与别的数字一样宽（24~27px）。门：宽过本页真 1 中位宽的 1.35 倍，
   // 且顶部两成高度里有一道横贯七成宽度的横笔（7 的顶横；1 顶上只有一小撇）。
   {
-    const ones = allDigits.filter((k) => digitCache.get(k.bbox) === 1).map((k) => k.bbox.w).sort((a, b) => a - b);
+    // 真 1 的宽只取不高过本页数字中位高 1.2 倍的：和弦行里的竖线也读成 1（青年诗歌 12《大好信息》14×58，数字 44 高），
+    // 比衬线 1（22px，带底座、顶撇也有七成宽）窄一大截，混进来分位宽就成了 14，两个真 1 跟着被改成 7。
+    const digitH = median(allDigits.map((k) => k.bbox.h));
+    const ones = allDigits.filter((k) => digitCache.get(k.bbox) === 1 && k.bbox.h <= digitH * 1.2).map((k) => k.bbox.w).sort((a, b) => a - b);
     const oneW = ones.length >= 3 ? ones[Math.floor(ones.length * 0.3)]! : 0;   // 取偏窄的分位，免得被误读的 7 抬高
     const topBar = (b: Rect): boolean => {
       const y1 = b.y + Math.max(2, Math.round(b.h * 0.2));
@@ -1737,7 +1831,9 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
   // 随时可能被 buildJpNums 收成高八度点——认出来后要从 dots 里摘掉。
   // 与真八度点靠**形状**分：三角是上宽下尖，逐行墨宽单调收到一个尖；圆点上下一样宽。
   // 再加填充率（三角 ≈0.5、圆点 ≈0.8）兜一道，免得淡印的圆点因边缘缺墨被当成三角。
-  const staccatoOf = new Map<DigitCore, boolean>();
+  const staccatoOf = new Map<DigitCore, Rect>();
+  // 收成顿音的音符 → 三角的框：和弦认完后与和弦框互斥（见歌词那段之后）
+  const staccatoBoxes = new Map<JpNum, Rect>();
   const staccatoComps = new Set<Component>();
   for (const m of staff) {
     const medH = median(m.rd.map((k) => k.bbox.h)) || numH;
@@ -1766,7 +1862,7 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
       if (rowW[rowW.length - 1] > b.w * 0.4) continue;                     // 底行没收成尖
       if (rowW.some((v, i) => i > 0 && v > rowW[i - 1] + 1)) continue;     // 中途变宽 → 不是三角
       probe("staccato");
-      staccatoOf.set(owner, true);
+      staccatoOf.set(owner, b);
       staccatoComps.add(k);
     }
   }
@@ -1843,7 +1939,8 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
       const a = accidentals.get(k); if (a && nums[j]) nums[j].accidental = a;
       if (fermataOf.get(k) && nums[j]) nums[j].fermata = true;
       const orn = ornamentOf.get(k); if (orn && nums[j]) nums[j].ornament = orn;
-      if (staccatoOf.get(k) && nums[j]) nums[j].articulation = "staccato";
+      const stb = staccatoOf.get(k);
+      if (stb && nums[j]) { nums[j].articulation = "staccato"; staccatoBoxes.set(nums[j], stb); }
       if (accentOf.get(k) && nums[j]) nums[j].articulation = "accent";
       const g = graceOf.get(k); if (g && nums[j]) nums[j].grace = g;
     });
@@ -2092,6 +2189,9 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
     }
   }
 
+  // 粘在弧上的高音点按全页高音点的离数距离裁决（先于认弧：tie 要看两端音高相同）
+  promoteGluedUpDots(bin, useRows, numH);
+
   // 转拍号归行：落在哪一谱行的纵向范围里就归哪一行，并锚到**其右侧第一个音符**上
   // （谱面上转拍号总印在小节线右边、新小节的头一个音符之前）。本行右侧没有音符了
   // （行末换拍）就锚到下一行的第一个音符。
@@ -2113,10 +2213,12 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
   }
   for (const r of useRows) r.meters?.sort((a, b) => a.x - b.x);
 
+  trace?.("rows", useRows);
   // 反复线与一/二房：以冒号点对/顶括线几何识别，锚到相邻音符，建模型时提升为小节线。
   await detectRepeatsAndEndings(bin, comps, c.dots, useRows, numH, ocr);
   // segno 𝄋（跳转目标）：字形识别，锚到下方音符所在小节的左线。
   detectSegno(comps, useRows, numH);
+  trace?.("repeats", useRows);
 
   // 多连音（三连音 ⌒3⌒）：先于 slur 认——括线的两半自己也够得着圆滑线的判据，认出来后
   // 要把它们从 detectSlurs 的输入里摘掉。「几连」靠 OCR 读括线上那个小号数字；
@@ -2149,6 +2251,16 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
         n.tuplet = { actual, normal, start: k === 0, stop: k === cand.notes.length - 1 };
       });
       for (const a of cand.arcs) tupComps.add(a);
+      // 括线跟数字粘着时，切下来的那段是新造的块，原块按 id 一并摘出 detectSlurs 的输入
+      for (const k of comps) if (cand.arcs.some((a) => a.id === k.id)) tupComps.add(k);
+      // 半截括线连着端点的高音点被收成了「音」（青年诗歌 5 前奏读成 7）：落在括线上、比括住的音高出去的摘掉
+      const noteTop = Math.min(...cand.notes.map((n) => n.bbox.y));
+      for (const row of useRows) {
+        const kept = row.nums.filter((n) => !(rcy(n.bbox) < noteTop && cand.arcs.some((a) =>
+          Math.min(rright(a.bbox), rright(n.bbox)) - Math.max(a.bbox.x, n.bbox.x) > n.bbox.w * 0.5 &&
+          Math.min(rbottom(a.bbox), rbottom(n.bbox)) - Math.max(a.bbox.y, n.bbox.y) > 0)));
+        if (kept.length !== row.nums.length) { probe("tuplet.dropArcNote"); row.nums = kept; }
+      }
       // 括线上的数字先前被当成了倚音（方括号式「┌3┐」离数字带近，1218 746 读出一串 `{3}`）：认成多连音后摘掉
       const nb = cand.numeral;
       for (const row of useRows) for (const n of row.nums) {
@@ -2164,6 +2276,7 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
   // comps 之外再补上与数字粘连切出的弧帽（arcComps）。与小节线粘连的弧已在 untangleBridged
   // 去连通阶段还原为 comps 里的独立连通块，这里天然一并检测。
   const slurRefits = detectSlurs(bin, [...comps, ...arcComps].filter((k) => !tupComps.has(k)), useRows, numH);
+  trace?.("slurs", useRows);
 
   // 页眉：标题/作词/作曲/调号/速度（同样仅 PaddleOCR 后端）。
   // **必须排在歌词/和弦识别之前**：第一谱行的「上方带」（和弦所在）与页眉 ROI 在几何上是重叠的，
@@ -2179,7 +2292,7 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
   let headerRegions: RecognizedScore["headerRegions"];
   if (ocr.recognizeTexts && useRows.length) {
     const h = await recognizeHeader(bin, comps, useRows[0].topY, numH, ocr,
-      headerMeters.sort((a, b) => a.bbox.x - b.bbox.x));
+      headerMeters.sort((a, b) => a.bbox.x - b.bbox.x), headExtra);
     title = h.title; subtitle = h.subtitle; number = h.number; numberSide = h.numberSide; credits = h.credits.length ? h.credits : undefined;
     if (h.fifths !== undefined) fifths = h.fifths;
     if (h.minor) minor = true;
@@ -2187,12 +2300,24 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
     meters = h.meters; meterNote = h.meterNote;
     tempo = h.tempo; tempoBeat = h.tempoBeat;
     headerRegions = h.regions.length ? h.regions : undefined;
+    trace?.("header", h);
+  }
+  // 与页眉同排的「前奏」字样：认出来是两三个汉字就当段落词，挂到它右边第一个音上（123 `"^前奏"`）
+  if (preludeLabel && ocr.recognizeRegion) {
+    const pad = numH * 0.3, r = preludeLabel;
+    const dets = await ocr.recognizeRegion(bin, { x: Math.max(0, Math.round(r.x - pad)), y: Math.max(0, Math.round(r.y - pad)),
+      w: Math.round(r.w + pad * 2), h: Math.round(r.h + pad * 2) });
+    const text = dets.map((d) => d.text).join("").replace(/\s+/g, "");
+    const row = useRows.find((ro) => rcy(r) >= ro.topY - numH && rcy(r) <= ro.bottomY + numH);
+    const first = row?.nums.find((n) => n.bbox.x > rright(r));
+    if (/^[\u4e00-\u9fff]{1,4}$/.test(text) && first && !first.sectionMark) { probe("prelude.label"); first.sectionMark = text; }
   }
 
   // 歌词：仅当后端支持中文文本识别(PaddleOCR)时，识别乐谱行下方歌词并按 x 对齐到音符。
   let lyricRegions: RecognizedScore["lyricRegions"];
   let chordRegions: RecognizedScore["chordRegions"];
   let stanzaRegions: RecognizedScore["stanzaRegions"];
+  let footnotes: RecognizedScore["footnotes"];
   let lyricCheck: RecognizedScore["lyricCheck"];
   if (ocr.recognizeTexts) {
     // 连谱号（多声部谱左侧那道 `[`）竖穿歌词带，它的竖笔与钩会被当成行首的字（《圣哉三一歌》第 1、2 系统
@@ -2217,6 +2342,13 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
     const lr = await recognizeLyrics(bin, lyricComps, useRows, numH, ocr, headerRegions);
     lyricRegions = lr.lyrics.length ? lr.lyrics : undefined;
     chordRegions = lr.chords.length ? lr.chords : undefined;
+    // 一块墨只归一样东西：和弦认领了的（`E7` 的下标小 7 顶横宽、下收一笔，逐行墨宽像倒三角，青年诗歌 21 正落在 `4·` 头上）不是顿音
+    for (const [n, b] of staccatoBoxes) {
+      if (n.articulation !== "staccato") continue;
+      if (lr.chords.some((r) => rcx(b) >= r.bbox.x && rcx(b) <= rright(r.bbox) && rcy(b) >= r.bbox.y && rcy(b) <= rbottom(r.bbox))) {
+        probe("staccato.chordOwned"); n.articulation = undefined;
+      }
+    }
     // 标题、副标题里读成繁体的字：歌词整页是简体才按候选改回（署名不动，见 `simplifyHeaderLine`）
     if (lr.simplifiedPage) {
       for (const field of ["title", "subtitle"] as const) {
@@ -2247,7 +2379,8 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
       }
     }
     const st = await recognizeTrailingStanzas(bin, useRows, numH, ocr, lyricRegions);
-    if (st.length) stanzaRegions = st;
+    if (st.regions.length) stanzaRegions = st.regions;
+    if (st.footnotes.length) footnotes = st.footnotes;
     // 参照歌词互证：各段歌词都落位之后、弧裁决与「有词的 0」复原之前——补上的字要喂给那几步。
     // 演唱顺序要从反复/房号/跳转推，那些此时都已认完；页眉字段也已定（拍号决定小节时值）。
     if (opts.refLyrics) {
@@ -2258,6 +2391,7 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
     resolveSlurRefits(slurRefits);
     // 复核歌词字（再跑一遍逐字候选，费时）：`review: false` 时不做（批量回归、只要文本的命令行）
     if (opts.review !== false) await markLyricDoubts(useRows, lr.hooks);
+    trace?.("lyrics", useRows);
   }
   {
     const verses = Math.max(0, ...useRows.flatMap((r) => r.nums.map((n) => n.lyrics?.length ?? 0)));
@@ -2336,6 +2470,6 @@ export async function recognizeJianpu(bin: Binary, ocr: OcrBackend, opts: { refL
 
   const dotDiam = dotSizes.length ? median(dotSizes) : undefined;
 
-  return { key: "C", fifths, minor, beats, beatType, meters, meterNote, rows: useRows, number, numberSide, title, subtitle, credits, tempo, tempoBeat, headerRegions, lyricRegions, chordRegions, stanzaRegions, dotDiam, lyricCheck };
+  return { key: "C", fifths, minor, beats, beatType, meters, meterNote, rows: useRows, number, numberSide, title, subtitle, credits, tempo, tempoBeat, headerRegions, lyricRegions, chordRegions, stanzaRegions, footnotes, dotDiam, lyricCheck };
 }
 

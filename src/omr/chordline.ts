@@ -8,9 +8,11 @@
 // （整行和弦常被连写成 "C#mF#mBmBm7E"）。
 import { blankNonChord, normalizeChord, splitChordTokens } from "../omrkit/chordgrammar";
 import type { JpNum, Rect, StaffRow, TextRegion } from "../omrkit/types";
+import { rright } from "../omrkit/types";
+import { probe } from "./probe";
 
 /** 一个待落位的和弦记号：归一后的文本 + 源图起始 x + 源图框。 */
-export type ChordCand = { tok: string; x: number; bbox: Rect };
+export type ChordCand = { tok: string; x: number; bbox: Rect; /** 块首括号里的（`(C)3`）：可能是与前一块主和弦拆开的备选，见 dropAltChords */ paren?: boolean };
 
 /** 从一行和弦文本里切出记号并换算源图坐标。
  *  `srcX(charIndex)` 把原串字符下标映到源图 x（下标可越界，返回该行右缘）；
@@ -19,13 +21,38 @@ export type ChordCand = { tok: string; x: number; bbox: Rect };
 export function chordCandidates(
   rawText: string, srcX: (charIndex: number) => number, mkBbox: (x0: number, x1: number) => Rect,
 ): ChordCand[] {
-  return splitChordTokens(blankNonChord(rawText), srcX)
+  return splitChordTokens(blankNonChord(blankAltChords(splitFarJump(rawText, srcX, mkBbox(0, 1).h))), srcX)
     .map(({ tok, index }) => {
       const x0 = srcX(index), x1 = srcX(index + tok.length);
-      return { tok: normalizeChord(tok), x: x0, bbox: mkBbox(x0, Math.max(x1, x0 + 1)) };
+      const paren = /^\s*[(（]\s*$/.test(rawText.slice(0, index));
+      return { tok: normalizeChord(tok), x: x0, bbox: mkBbox(x0, Math.max(x1, x0 + 1)), ...(paren ? { paren } : {}) };
     })
     // 归一后仍须是合法根音开头（可带前置升降号，`chordTextSegs`/`harmonyXml` 的最低要求），否则下游只能整段原样排字。
     .filter((c) => /^[#b]?[A-G]/.test(c.tok));
+}
+
+/** 紧跟在和弦后面、括号里的**备选和弦**（青年诗歌 5《第一声呼求》`C(A)` `G7(E7)` `Am(F#m)`：页眉 `C/A4/4`，括号里是移到 A 调的
+ *  另一套）：不抹的话切成两个和弦，备选那个挂到下一个音上。只留主编配（与页眉取 `C/A` 的 C 同一口径），抹成等长空格保住下标。 */
+const blankAltChords = (s: string): string =>
+  s.replace(/(?<=[A-Za-z0-9#♯♭])[(（]\s*[#♯b♭]?[A-G][^()（）]*[)）]/g, (m) => " ".repeat(m.length));
+
+/** 备选和弦与主和弦**互斥**：检测把 `A(C)` 拆成了两块（青年诗歌 21 `A` | `(C)`），括号那块单看分不出是备选还是独立的括号和弦
+ *  （爱是不保留 `(G7)C` 就是后者）。同一行里紧挨在它左边（缝 < 半个字高）已有一个和弦的，这个位置归主和弦，括号的让出。 */
+export function dropAltChords(cands: ChordCand[]): ChordCand[] {
+  return cands.filter((c) => !c.paren || !cands.some((o) => o !== c && !o.paren &&
+    rright(o.bbox) <= c.bbox.x + 2 && c.bbox.x - rright(o.bbox) < c.bbox.h * 1.2 &&
+    Math.min(o.bbox.y + o.bbox.h, c.bbox.y + c.bbox.h) > Math.max(o.bbox.y, c.bbox.y)));
+}
+
+/** 读成 `D·S·` 的两个字母在源图上隔得远（三个字高以上）：不是跳转记号，是和弦 D 与远处的 segno `·S·`
+ *  被 rec 压成了一条（青年诗歌 4《陪我生活》第 2 谱行 `A7 A7 D … ·S·`）。整串当 D.S. 抹掉就丢了 D——
+ *  这里只把 D 之后的那截抹成等长空格，D 留给切词。真 `D.S.` 两字母挨着，不受影响。 */
+function splitFarJump(s: string, srcX: (charIndex: number) => number, h: number): string {
+  if (!(h > 0)) return s;
+  return s.replace(/D(\s*[.,·]\s*[CS]\s*[.,·]?)/g, (m, tail: string, at: number) => {
+    const k = at + 1 + tail.search(/[CS]/);
+    return srcX(k) - srcX(at) > h * 3 ? "D" + " ".repeat(tail.length) : m;
+  });
 }
 
 /** 把一批带源图 x 的和弦落到某谱行的音符上（含拍内偏移）。
@@ -55,7 +82,9 @@ export function placeChords(
   // 凭空算出 0.35~0.40 的假偏移（音符半宽在密排行里就占相邻间距的近四成）。
   const lefts = nums.map((n) => n.bbox.x);
   const extraY = new Map<JpNum, number[]>();   // 每个 extraChords 项的来源 y（并行编配撞车时取低的那排）
-  for (const c of [...cands].sort((a, b) => a.x - b.x)) {
+  const sorted = [...cands].sort((a, b) => a.x - b.x);
+  const placedX = new Map<JpNum, number>();   // 每个音上主和弦的左缘 x
+  for (const [ci, c] of sorted.entries()) {
     const x = c.x;
     let i = 0;
     while (i + 1 < lefts.length && lefts[i + 1] <= x) i++;
@@ -69,14 +98,23 @@ export function placeChords(
       const gap = lefts[i + 1] - lefts[i];
       if (gap > 1) {
         const t = (x - lefts[i]) / gap;
-        if (t >= 0.65) { i += 1; }        // 明显更贴右邻 → 归右邻、正对音符
+        // 两音之间隔着小节线、和弦左缘已到线前 0.3 字号以内：是下一小节的强拍和弦，不是上一小节末音的半拍换和弦。
+        // 青年诗歌 12《大好信息》`4 3̲ 2̲|5̣ 4` 的 E7(D7) 左缘在线后（0.63 处）、`3 2|1 -` 的 A(G) 在线前 10px（0.2 字号，0.57 处），
+        // 括号备选和弦整组居中印在音上，主和弦左缘就探到了前一个音那边。线内的不动（青年诗歌 5 `5·1̲ 2` 的 G 在 1̲ 上）；
+        // 下一小节首音另有自己的和弦也不动（世上所有的民族 `… Dsus4 1̲|D7 5 - - -`，Dsus4 贴着线印在末音上）
+        const bar = row.barlineXs.find((bx) => bx > rright(nums[i].bbox) && bx < lefts[i + 1]);
+        const nx = sorted[ci + 1]?.x ?? Infinity;
+        const nextOwn = i + 2 < lefts.length ? nx < lefts[i + 2] - (lefts[i + 2] - lefts[i + 1]) * 0.35 : nx < Infinity;
+        if (t >= 0.65 || (t >= 0.35 && bar !== undefined && x >= bar - nums[i].bbox.h * 0.3 && !nextOwn)) { i += 1; }        // 明显更贴右邻 → 归右邻、正对音符
         else if (t >= 0.35) frac = t;     // 夹在两音符之间 → 挂左音符 + 拍内偏移
       }
     }
     // 同一音符已有和弦：顺延到右邻空位（限一格）。两个和弦挤在同一音符上多半是印刷字距紧，
     // 直接丢掉会静默少一个记号。但**同名**的不顺延——同一拍点不会连着奏两个相同和弦，那只是
     // OCR 把一个记号读了两遍（跨 rec 块边界时常见），顺延会在谱上凭空多一个 G。
-    if (nums[i].chord === c.tok) continue;
+    // 隔开一个字号以上的同名和弦是两个记号（16《神圣罗曼史》副歌 `2 - - -` 上的 `D D`），照挂到增时线上
+    const prevX = placedX.get(nums[i]);
+    if (nums[i].chord === c.tok && !(prevX !== undefined && x - prevX > nums[i].bbox.h && nums[i].augment > 0)) continue;
     // 已有和弦、而本记号又**明明落在本音符时值之内**（frac>0，多半印在增时线上方）：
     // 那是长音里换和弦（「世上所有的民族」第二行 `1 - - 0` 的第三拍上另有一个 C/G），
     // 不是字距挤在一起。顺延给右邻会把它挪后一整拍，故改挂 extraChords + 拍位。
@@ -101,9 +139,22 @@ export function placeChords(
       }
       continue;
     }
+    // 长音上方挤着几个和弦（青年诗歌 16《神圣罗曼史》副歌 `5 - - -` 上印着 `G D Em`、`3 - - -` 上 `Em D C`、`2 - - -` 上 `D D`）：
+    // 没越过下一个音的，依次挂到本音的增时线上，不顺延给下一个音（那就推到下一小节了）
+    const n0 = nums[i];
+    if (n0.chord !== undefined && n0.augment > 0 && !n0.div && !n0.dot && x > n0.bbox.x && (i + 1 >= nums.length || x < lefts[i + 1]!)) {
+      const extra = n0.extraChords ??= [];
+      if (extra.length < n0.augment) {
+        probe("chord.stackedOnSustain");
+        extra.push({ tok: c.tok, offset: (1 + extra.length) / (1 + n0.augment) });
+        regions.push({ text: c.tok, bbox: c.bbox });
+      }
+      continue;
+    }
     if (nums[i].chord !== undefined && i + 1 < nums.length && nums[i + 1].chord === undefined) { i += 1; frac = 0; }
     if (nums[i].chord !== undefined) continue;
     nums[i].chord = c.tok;
+    placedX.set(nums[i], x);
     if (frac > 0) nums[i].chordOffset = frac;
     regions.push({ text: c.tok, bbox: c.bbox });
   }

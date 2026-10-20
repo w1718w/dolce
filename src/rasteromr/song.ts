@@ -6,7 +6,7 @@
 
 import type { RasterGlyphLookup } from "./rasterglyphs";
 import type { RasterPage } from "./rasterpage";
-import { recognizeRasterPage, type CarryKey, type PageCarry, type RasterLiveOcr, type RasterPageResult } from "./recognize";
+import { recognizeRasterPage, type RasterStage, type CarryKey, type PageCarry, type RasterLiveOcr, type RasterPageResult } from "./recognize";
 import { pageImageOf, type PageImage } from "./rasterpage";
 import { composeHeaderStrip } from "./pagecompose";
 import type { PagePool } from "./pagepool";
@@ -21,6 +21,7 @@ import { pageTextPt, scoreToMusicXml } from "../staffomr/toxml";
 import type { SPage, Staff } from "../staffomr/model";
 import type { LyricLine } from "../staffomr/textanalyze";
 import type { StaffNote } from "../staffomr/notedata";
+import type { WedgeOpen } from "../staffomr/notations";
 import { settleLyricVerses } from "./lyricpost";
 
 /** 离线缓存（回归脚本用）：按条的内容指纹寻址。 */
@@ -60,6 +61,8 @@ export async function recognizeRasterSong(
     pool?: PagePool;
     /** 给每个 `<note>` 写 `id="omr<k>"` 并记下源图框（编辑器的识别对照用；回归脚本不开，产物逐字节不变） */
     noteIds?: boolean;
+    /** 逐页各阶段的中间产物（`recognize.ts::RasterStage`，回归测试的阶段快照）。只在串行时有：Worker 传不过函数 */
+    trace?: (pageSeq: number, stage: RasterStage, data: unknown) => void;
   } = {},
 ): Promise<RasterSongResult> {
   const entries: Parameters<typeof buildScore>[0] = [];
@@ -72,6 +75,9 @@ export async function recognizeRasterSong(
   const pages: RasterSongResult["pages"] = [];
   let carryTime: { beats: number; beatType: number } | undefined;
   let carryKey: CarryKey | undefined;
+  let openWedges: (WedgeOpen | null)[] | undefined;
+  /** 上一页末系统「可能」续出的松叶那截写了止的音：这一页认了续段就撤掉 */
+  let openStops: (StaffNote | null)[] = [];
   const barPages: Parameters<typeof markSplitBars>[0] = [];
   /** 闭合人声谱：两行谱之间印着歌词的上一行（见 `buildScore` 的同名选项） */
   const lyricsBelow = new Set<Staff>();
@@ -90,6 +96,15 @@ export async function recognizeRasterSong(
     if (r.jianpuFix) for (const k of Object.keys(stats.jianpuFix) as (keyof RasterSongStats["jianpuFix"])[]) stats.jianpuFix[k] += r.jianpuFix[k];
     carryTime = r.carryTime;
     carryKey = r.carryKey;
+    for (const row of r.wedgeRows?.took ?? []) {
+      const n = openStops[row];
+      if (!n) continue;
+      delete n.wedgeStop;
+      delete n.wedgeStopAfter;
+      delete n.wedgeStopAt;
+    }
+    openWedges = r.wedgeRows?.open;
+    openStops = r.wedgeRows?.stops ?? [];
     if (r.hasStaff) {
       if (wantHeader) {
         header = r.header;
@@ -130,7 +145,7 @@ export async function recognizeRasterSong(
       const page = await pdf.getPage(pn);
       try {
         const wantHeader = header === null;
-        const r = await recognizeRasterPage(page, OPS, look, pn, { carryTime, carryKey, ...caches, live: opts.live, raster: opts.rastered?.(si, pn), wantHeader, pageSeq: k });
+        const r = await recognizeRasterPage(page, OPS, look, pn, { carryTime, carryKey, openWedges, ...caches, live: opts.live, raster: opts.rastered?.(si, pn), wantHeader, pageSeq: k, trace: opts.trace && ((st, d) => opts.trace!(k, st, d)) });
         consume(r, si, pn, wantHeader);
       } finally {
         page.cleanup?.();
@@ -189,7 +204,7 @@ export async function recognizeRasterSong(
       const r = await running[k];
       const wantHeader = header === null;
       consume(r, order[k].si, order[k].pn, wantHeader);
-      carries[k + 1]?.resolve({ carryTime, carryKey, wantHeader: header === null });
+      carries[k + 1]?.resolve({ carryTime, carryKey, wantHeader: header === null, openWedges });
       done++;
       opts.onPage?.(done, total);
       fill();

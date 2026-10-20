@@ -424,6 +424,107 @@ export function splitArcTail(bin: Binary, comps: Component[], numH: number): Com
   return out;
 }
 
+/** 平顶弧的脚落在**高音点**上、点又粘着**数字**（青年诗歌 5《第一声呼求》`3̇ – ⌒ 3̇`：弧 4~5px 厚的平顶，两只脚竖着垂下来，
+ *  左脚踩在 3̇ 的点上、点底又跟 3 的顶连着两三个像素，整块 190×67、字号 39，读成一个「1」；弧、点、3 全丢）。
+ *  不看页面干不干净（这页不算干净页，splitArcEndDots 不开）。判据：
+ *  · 块宽 ≥2 字号、高 1.2~2.2 字号；块顶 0.15 字号内有几行横贯六成块宽的墨（平顶弧身），厚不过 0.25 字号；
+ *  · 弧身以下按列分成几条「腿」；腿底落到块底（0.15 字号内）、弧身以下高 ≥1.2 字号的腿底下挂着数字：
+ *    数字顶的颈 = 腿底往上 0.85~1.15 字号里最窄的那行（窄过数字中位行宽一半），
+ *    点顶的颈 = 再往上 0.12~0.5 字号里最窄、最靠下的那行；两颈之间是点：宽 0.15~0.45 字号、高 0.12~0.45 字号、比两头的颈宽 1.6 倍。
+ *  切成「数字」「点」「其余（弧）」几块，交给 classify 各归各类。没挂数字、只踩着下一个音的高音点的腿，脚底那个点也切下来
+ *  （不切的话弧被撑到数字块的高度，当成数字读掉）。整块一个数字都没挂的不动。 */
+export function splitArcFootDigit(bin: Binary, comps: Component[], numH: number): Component[] {
+  const out: Component[] = [];
+  let nextId = 5_500_000;   // 6_000_000 段是 REJOINED_ARC_ID，撞上就被当成接回的弧
+  for (const k of comps) {
+    const b = k.bbox;
+    if (isRejoinedArc(k) || b.w < numH * 2 || b.h < numH * 1.2 || b.h > numH * 2.2) { out.push(k); continue; }
+    const sub: Binary = { w: b.w, h: b.h, data: new Uint8Array(b.w * b.h) };
+    for (let yy = 0; yy < b.h; yy++) for (let xx = 0; xx < b.w; xx++) sub.data[yy * b.w + xx] = bin.data[(b.y + yy) * bin.w + b.x + xx];
+    const labels = new Int32Array(b.w * b.h);
+    const self = connectedComponents(sub, 1, labels).filter((p) => p.bbox.w === b.w && p.bbox.h === b.h)
+      .sort((p, q) => q.area - p.area)[0];
+    if (!self) { out.push(k); continue; }
+    const own = (xx: number, yy: number) => labels[yy * b.w + xx] === self.id;
+    const rowN = (yy: number, x0 = 0, x1 = b.w) => { let n = 0; for (let xx = x0; xx < x1; xx++) if (own(xx, yy)) n++; return n; };
+    let y = 0;
+    while (y < b.h && rowN(y) < b.w * 0.6) y++;
+    const bandTop = y;
+    while (y < b.h && rowN(y) >= b.w * 0.6) y++;
+    if (bandTop > numH * 0.15 || y === bandTop || y - bandTop > numH * 0.25) { out.push(k); continue; }
+    // 弧身下沿还有一两行毛边横贯大半块宽，腿从再往下 0.1 字号量起
+    const legTop = y + Math.max(2, Math.round(numH * 0.1));
+    const legs: Array<[number, number]> = [];
+    for (let xx = 0; xx < b.w; xx++) {
+      let has = false;
+      for (let yy = legTop; yy < b.h && !has; yy++) has = own(xx, yy);
+      if (!has) continue;
+      const last = legs[legs.length - 1];
+      if (last && xx - last[1] <= 1) last[1] = xx + 1;
+      else legs.push([xx, xx + 1]);
+    }
+    // digit = false：这条腿只有脚底一个点、没挂数字
+    const cuts: Array<{ a: number; e: number; n2: number; n1: number; digit: boolean }> = [];
+    for (const [a, e] of legs) {
+      const ws: number[] = [];
+      for (let yy = 0; yy < b.h; yy++) ws.push(yy < legTop ? 0 : rowN(yy, a, e));
+      let bottom = b.h - 1;
+      while (bottom > legTop && !ws[bottom]) bottom--;
+      const argmin = (lo: number, hi: number): number => {
+        let best = -1;
+        for (let yy = Math.max(legTop, Math.round(lo)); yy <= Math.min(b.h - 1, Math.round(hi)); yy++) if (best < 0 || ws[yy]! <= ws[best]!) best = yy;
+        return best;
+      };
+      const dotOk = (n2: number, n1: number, below: number) => {
+        const dotW = Math.max(...ws.slice(n2 + 1, n1)), dotH = n1 - n2 - 1;
+        return dotW >= numH * 0.15 && dotW <= numH * 0.45 && dotH >= numH * 0.12 && dotH <= numH * 0.45 &&
+          dotW >= ws[n2]! * 1.6 && dotW >= below * 1.6;
+      };
+      // 没挂数字、脚底只踩着一个点的（下一个音的高音点）：点切下来，弧才不至于被它撑到数字块的高度
+      if (bottom < b.h - 1 - numH * 0.15 || bottom - legTop < numH * 1.1) {
+        const n2 = argmin(bottom - numH * 0.5, bottom - numH * 0.12);
+        if (n2 >= 0 && dotOk(n2, bottom + 1, 0)) cuts.push({ a, e, n2, n1: bottom + 1, digit: false });
+        continue;
+      }
+      const n1 = argmin(bottom - numH * 1.15, bottom - numH * 0.85);
+      if (n1 < 0) continue;
+      const digitW = median(ws.slice(n1 + 1, bottom + 1).filter((v) => v > 0));
+      if (!(ws[n1]! <= digitW * 0.5)) continue;
+      const n2 = argmin(n1 - numH * 0.5, n1 - numH * 0.12);
+      if (n2 < 0 || !dotOk(n2, n1, ws[n1]!)) continue;
+      cuts.push({ a, e, n2, n1, digit: true });
+    }
+    if (!cuts.length) { out.push(k); continue; }
+    // 每个像素归哪块：0 弧，2i+1 第 i 刀的点，2i+2 第 i 刀的数字
+    const ownerOf = (xx: number, yy: number): number => {
+      for (let i = 0; i < cuts.length; i++) {
+        const c = cuts[i]!;
+        if (xx < c.a || xx >= c.e) continue;
+        if (yy > c.n1) return 2 * i + 2;
+        if (yy > c.n2) return 2 * i + 1;
+      }
+      return 0;
+    };
+    const boxes = new Map<number, { x0: number; y0: number; x1: number; y1: number; area: number }>();
+    for (let yy = 0; yy < b.h; yy++) for (let xx = 0; xx < b.w; xx++) {
+      if (!own(xx, yy)) continue;
+      const o = ownerOf(xx, yy);
+      const q = boxes.get(o) ?? { x0: Infinity, y0: Infinity, x1: -1, y1: -1, area: 0 };
+      q.x0 = Math.min(q.x0, xx); q.x1 = Math.max(q.x1, xx); q.y0 = Math.min(q.y0, yy); q.y1 = Math.max(q.y1, yy); q.area++;
+      boxes.set(o, q);
+    }
+    if (!boxes.has(0) || cuts.some((c, i) => !boxes.has(2 * i + 1) || (c.digit && !boxes.has(2 * i + 2)))) { out.push(k); continue; }
+    // 只切下脚底点、没切出数字的：块本身不是这种形（另一路判据管），原样留着
+    if (!cuts.some((c) => c.digit)) { out.push(k); continue; }
+    probe("splitArcFootDigit");
+    for (const q of boxes.values()) {
+      const r = { x: b.x + q.x0, y: b.y + q.y0, w: q.x1 - q.x0 + 1, h: q.y1 - q.y0 + 1 };
+      out.push({ id: nextId++, bbox: r, area: q.area, cx: rcx(r), cy: rcy(r) });
+    }
+  }
+  return out;
+}
+
 /** 减时线上挂着八度点：点紧贴线、连成「┬」（新编赞美诗·四声部 117 第 2 声部 `5̳̣` 的第二条减时线连着低音点 30×12、字号 35），
  *  比横线的高度门高一点，哪一类都不是——那条减时线和点一起丢。线薄的时候整块过得了横线门，点也没了。
  *  判据：块顶（或块底）几行是横贯整块的实线（≥0.8 块宽、连毛边行厚不过 max(3, 0.2 字号)），其余各行的墨都挤在一小段里
@@ -532,6 +633,74 @@ export function splitLineOverArc(bin: Binary, comps: Component[], numH: number):
     if (!line || !below) { out.push(k); continue; }
     probe("splitLineOverArc");
     out.push(line, below);
+  }
+  return out;
+}
+
+/** 弧顶粘着上方的和弦字：`G(Bm)` 的左括号脚落在 `2·3̲` 的弧上（青年诗歌 13《爱使我们相聚一起》块 112×77，字号 48）、
+ *  `Am` 的 m 几只脚立在 `4̇ - 2̇` 的弧上、A 还伸出弧左端（14《雲彩》尾声 160×61，字号 43）。块高过了弧的高度门，整条弧丢了。
+ *  判据：块的**下包络**（每列最低墨点）切成平滑段（相邻列落差 ≤ max(2, 0.06 字号)），最长那段 ≥1.2 字号宽、
+ *  最低那段墨中位厚 ≤0.15 字号、两端比最高处低 ≥0.15 字号（拱形）就是弧——伸出弧外的字母（A 的脚、横笔）在别的高度上断开。
+ *  剩下的墨得整个在弧顶以上 0.3 字号起笔（字立在弧上）。拆成「弧 + 上面的字」两块。 */
+export function splitArcUnderGlyph(bin: Binary, comps: Component[], numH: number): Component[] {
+  const out: Component[] = [];
+  let nextId = 7_100_000;
+  for (const k of comps) {
+    const b = k.bbox;
+    if (b.w < numH * 1.5 || b.h <= numH * 1.05 || b.h > numH * 2) { out.push(k); continue; }
+    const sub: Binary = { w: b.w, h: b.h, data: new Uint8Array(b.w * b.h) };
+    for (let yy = 0; yy < b.h; yy++) for (let xx = 0; xx < b.w; xx++) sub.data[yy * b.w + xx] = bin.data[(b.y + yy) * bin.w + b.x + xx];
+    const labels = new Int32Array(b.w * b.h);
+    const self = connectedComponents(sub, 1, labels).filter((p) => p.bbox.w === b.w && p.bbox.h === b.h)
+      .sort((p, q) => q.area - p.area)[0];
+    if (!self) { out.push(k); continue; }
+    const own = (xx: number, yy: number) => labels[yy * b.w + xx] === self.id;
+    // 每列最低墨点与最低那段的厚度
+    const low: number[] = [], thick: number[] = [];
+    for (let xx = 0; xx < b.w; xx++) {
+      let yy = b.h - 1;
+      while (yy >= 0 && !own(xx, yy)) yy--;
+      low.push(yy);
+      let t = 0;
+      while (yy - t >= 0 && own(xx, yy - t)) t++;
+      thick.push(t);
+    }
+    // 下包络按相邻列落差 ≤ max(2, 0.06 字号) 切成平滑段，最长的一段是弧（字母的脚、横笔在别的高度上断开）
+    const step = Math.max(2, numH * 0.06);
+    let best = { x0: 0, x1: -1 }, x0 = -1;
+    for (let xx = 0; xx <= b.w; xx++) {
+      const ok = xx < b.w && low[xx]! >= 0 && (x0 >= 0 ? Math.abs(low[xx]! - low[xx - 1]!) <= step : true);
+      if (ok && x0 < 0) x0 = xx;
+      else if (!ok && x0 >= 0) {
+        if (xx - 1 - x0 > best.x1 - best.x0) best = { x0, x1: xx - 1 };
+        x0 = xx < b.w && low[xx]! >= 0 ? xx : -1;
+      }
+    }
+    const runW = best.x1 - best.x0 + 1;
+    const inRun = (xx: number) => xx >= best.x0 && xx <= best.x1;
+    const t0 = median(thick.filter((t, xx) => t > 0 && inRun(xx)));
+    let topY = Infinity;
+    for (let xx = best.x0; xx <= best.x1; xx++) topY = Math.min(topY, low[xx]!);
+    const endY = Math.min(low[best.x0]!, low[best.x1]!);
+    if (runW < numH * 1.2 || t0 > numH * 0.15 || endY - topY < numH * 0.15) { out.push(k); continue; }
+    // 弧的像素：段内每列最低墨点往上一个中位厚（加一像素余量）；立在弧上的字脚高出这一截，归字
+    const cap = Math.ceil(t0) + 1;
+    const arcPx = (xx: number, yy: number) => inRun(xx) && yy <= low[xx]! && yy > low[xx]! - cap;
+    const box = (pick: (xx: number, yy: number) => boolean): Component | null => {
+      let x0 = Infinity, yy0 = Infinity, x1 = -1, yy1 = -1, area = 0;
+      for (let yy = 0; yy < b.h; yy++) for (let xx = 0; xx < b.w; xx++) {
+        if (!own(xx, yy) || !pick(xx, yy)) continue;
+        area++; x0 = Math.min(x0, xx); x1 = Math.max(x1, xx); yy0 = Math.min(yy0, yy); yy1 = Math.max(yy1, yy);
+      }
+      if (!area) return null;
+      const r = { x: b.x + x0, y: b.y + yy0, w: x1 - x0 + 1, h: yy1 - yy0 + 1 };
+      return { id: nextId++, bbox: r, area, cx: rcx(r), cy: rcy(r) };
+    };
+    const arc = box(arcPx), glyph = box((xx, yy) => !arcPx(xx, yy));
+    // 字得从弧顶以上起笔（字脚压在弧上，字身在上面）
+    if (!arc || !glyph || glyph.bbox.y > arc.bbox.y - numH * 0.3) { out.push(k); continue; }
+    probe("splitArcUnderGlyph");
+    out.push(arc, glyph);
   }
   return out;
 }

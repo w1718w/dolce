@@ -790,7 +790,7 @@ export interface StaffNote {
   /** 印在这个音符处的文字指示（rit. / a tempo / cresc. / Fine…）：原文与在谱表上方还是下方。MusicXML 里出成 `<direction><words>`。 */
   words?: { text: string; above: boolean; /** 字号（页面单位） */ size?: number; /** 基线（页面单位），写源谱版面时出成 `default-y` */ baseY?: number }[];
   /** 节拍器记号：拍子单位（`quarter`）、每分钟拍数、`<per-minute>` 的原文（带「约」时 `c. 76`，否则省）。MusicXML 里出成 `<direction><metronome>`。 */
-  metronome?: { unit: string; bpm: number; text?: string };
+  metronome?: { unit: string; bpm: number; text?: string; /** 印在圆括号里（「(♩ = 82)」）→ `<metronome parentheses="yes">` */ parentheses?: boolean };
   /** 与节拍器印在同一条的速度文字（`Andante ♩ = c. 76` 的 `Andante`）：与节拍器写进**同一个** `<direction>`，不拆成两个对象。 */
   tempoText?: string;
   tempoSize?: number;
@@ -800,8 +800,10 @@ export interface StaffNote {
   wedgeStart?: "crescendo" | "diminuendo";
   /** 起在这个音上的松叶在原图上的样子（页面单位）：左端 x、中线 y、开口高 */
   wedgeAt?: { x0: number; cy: number; spread?: number };
-  /** 松叶到这个音符**止**（`<wedge type="stop">`）。 */
+  /** 松叶画到这个音**止**（`<wedge type="stop">` 写在它之前：止点时刻 = 它的起点，画到它所在的横坐标）。 */
   wedgeStop?: boolean;
+  /** 止写在这个音**之后**（= 它的终点）：右端越过了小节里最后一个音、收在小节线前的那条，挂在末音上 */
+  wedgeStopAfter?: boolean;
   /** 止在这个音上的松叶在原图上的右端 x 与（渐强时）开口高（页面单位） */
   wedgeStopAt?: { x1: number; spread?: number };
   /** 连音（三连音之类）：`actual` 个音占 `normal` 个音的时值。`start` / `stop`：这一组最左、最右的那个音（和弦各音都记），

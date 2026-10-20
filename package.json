@@ -36,7 +36,8 @@
     "tauri": "tauri",
     "release": "bash scripts/release.sh",
     "build:cli": "vite build --config vite.cli.config.ts",
-    "pack:omr": "node scripts/pack-omr.mjs"
+    "pack:omr": "node scripts/pack-omr.mjs",
+    "test": "node -e \"require('fs').existsSync('../dev/vitest.config.ts')||(console.error('识别回归用例在同级的本地私有仓库 ../dev（语料有版权，不随公开仓库分发），没有它就没有可跑的测试'),process.exit(1))\" && vitest run --config ../dev/vitest.config.ts"
   },
   "dependencies": {
     "@codemirror/commands": "^6.11.1",
@@ -64,6 +65,7 @@
     "pdf-lib": "^1.17.1",
     "playwright": "^1.64.1",
     "typescript": "~5.6.2",
-    "vite": "^6.4.4"
+    "vite": "^6.4.4",
+    "vitest": "^3.2.7"
   }
 }
