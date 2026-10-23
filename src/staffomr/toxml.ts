@@ -5,7 +5,7 @@
 import { barlineXml, escapeXml, scorePartXml, workXml, wrapPartwise } from "../score/xmlutil";
 import { harmonyXml } from "../score/harmonyxml";
 import type { StaffNote } from "./notedata";
-import { clefFor, fifthsAt, timeSignatures, type StaffContext } from "./notedata";
+import { clefFor, fifthsAt, timeSignatures, timeXml, type StaffContext } from "./notedata";
 import { Bar, type SPage, type Staff } from "./model";
 import type { StaffScore } from "./score";
 
@@ -25,7 +25,10 @@ export interface StaffXmlOptions {
   noteId?: (n: StaffNote) => string | undefined;
   /** 页眉各条（位图路 OCR 读出的标题、词曲作者），写成曲首页的 `<credit>`；`size` 是字号（pt），
    *  `box` 是它在首个系统那一页上的位置（页面单位），写源谱版面时折成 `default-x` / `default-y` */
-  credits?: { text: string; type?: string; justify?: string; size?: number; box?: { x: number; y: number; w: number; h: number } }[];
+  /** 小节号印在哪（`<measure-numbering>`，写在第一声部首小节的 `<print>` 里），见 `score.ts::measureNumbering` */
+  measureNumbering?: "system";
+  /** `page`：第几页（缺省 1，页脚每页一份） */
+  credits?: { text: string; type?: string; justify?: string; size?: number; box?: { x: number; y: number; w: number; h: number }; page?: number }[];
   /** 写源谱版面（`<defaults>` 的纸与谱表大小、各系统首小节的 `<print>`），缺省写。见 `sourceLayout` */
   layout?: boolean;
   /** 跨页的弧按「同音高、紧挨着」判延音线（配对优先配它；只找到一半的，相邻系统同声部紧挨着的音同音高也补成延音线）。
@@ -203,9 +206,9 @@ export function toMusicXml(lines: StaffLineResult[], opts: StaffXmlOptions = {})
       }
       while (tc < timeChanges.length && timeChanges[tc].x < bar.right) {
         const t = timeChanges[tc++];
-        const key = `${t.beats}/${t.beatType}`;
+        const key = `${t.beats}/${t.beatType}${t.symbol ?? ""}`;
         if (key !== prevTime) {
-          attrs += `<time><beats>${t.beats}</beats><beat-type>${t.beatType}</beat-type></time>`;
+          attrs += timeXml(t);
           prevTime = key;
         }
       }
@@ -377,7 +380,8 @@ function emitVoices(inBar: StaffNote[], ticks: (d: number) => number, staffNo: n
       }
       for (const w of n.words ?? []) {
         const wy = withSourceLayout && w.baseY !== undefined ? ` default-y="${staffY(n.staff, n.sym.box.left, w.baseY)}"` : "";
-        body += `<direction placement="${w.above ? "above" : "below"}"><direction-type><words${wy}${fontAttr(textPt(n, w.size))}>${escapeXml(w.text)}</words></direction-type>${dirStaff}</direction>`;
+        const el = w.rehearsal ? "rehearsal" : "words";
+        body += `<direction placement="${w.above ? "above" : "below"}"><direction-type><${el}${w.rehearsal ? ' enclosure="square"' : ""}${wy}${fontAttr(textPt(n, w.size))}>${escapeXml(w.text)}</${el}></direction-type>${dirStaff}</direction>`;
       }
       if (n.dynamic) body += dynamicXml(n, dirStaff);
       // 松叶：**止排在起之前**——同一个音符上前一条松叶收尾、下一条起头是常事，
@@ -505,15 +509,20 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
   // 连音组只在头尾两个音上写起止（和弦写在打头那个音上）；读入端按起止配对，只有 start 的会一路顶掉、整组丢
   if (n.tuplet?.start && !n.chordExtra) nots.push(`<tuplet type="start"/>`);
   if (n.tuplet?.stop && !n.chordExtra) nots.push(`<tuplet type="stop"/>`);
-  // `<notations>` 里子元素有固定次序：tied / slur / tuplet / ornaments / articulations / fermata / arpeggiate
+  // `<notations>` 里子元素有固定次序：tied / slur / tuplet / ornaments / technical / articulations / fermata / arpeggiate
   const arts: string[] = [];
   const orns: string[] = [];
   let fermata = "";
   let arpeggiate = false;
+  const tech: string[] = [];
   for (const m of n.marks ?? []) {
     const a = ARTICULATION[m];
     if (a) {
       arts.push(a);
+      continue;
+    }
+    if (m === "stringsUpBow" || m === "stringsDownBow") {
+      tech.push(m === "stringsUpBow" ? "<up-bow/>" : "<down-bow/>");
       continue;
     }
     if (m === "arpeggiato") arpeggiate = true;
@@ -521,6 +530,7 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
     else if (m.startsWith("ornamentTrill") || m.startsWith("wiggleTrill")) orns.push(`<trill-mark/>`);
   }
   if (orns.length) nots.push(`<ornaments>${orns.join("")}</ornaments>`);
+  if (tech.length) nots.push(`<technical>${tech.join("")}</technical>`);
   if (arts.length) nots.push(`<articulations>${arts.join("")}</articulations>`);
   if (fermata) nots.push(fermata);
   if (arpeggiate) nots.push(`<arpeggiate/>`);
@@ -652,6 +662,7 @@ export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = fal
   const alias = new Map<string, string>(); // 后半截的弧号 → 接上的前半截弧号
   const orphan = new Set<string>();
   const pending = new Map<string, Tok[]>(); // 谱表号 → 还没接上的 `end` 半截
+  const pairedTies = new Set<string>(); // 矢量路几条同处断开时先配上的延音线（前半截弧号）
   for (const t of toks) {
     if (t.type === "start" && !stops.has(t.arc)) {
       orphan.add(t.arc);
@@ -665,7 +676,10 @@ export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = fal
       const q = (pending.get(t.staff) ?? []).filter((p) => (sysOfBar ? sysOfBar[t.bar - 1] === nextSys(p.bar) : t.bar - p.bar <= 1));
       // 先配延音线（同音高、紧挨着），再按朝向配：行尾行首各有一条延音线、一条圆滑线的半截时，
       // 按朝向先到先得会配串（破碎 p2→p3 m16–17 钢琴右手：E4 延音线的后半截排在圆滑线前面，抢走了朝向相同的圆滑线前半截）
-      const hit = (crossTies ? q.find((p) => tieLike(p, t)) : undefined) ?? q.find((p) => p.above === t.above) ?? q[0];
+      // 矢量路：同一行同一处断开的不止一条（一条延音线外面罩着一条圆滑线）时也先配延音线，配上的记下来、写成延音线（见下 `tieArcs`）
+      const tieHit = crossTies || q.length >= 2 ? q.find((p) => tieLike(p, t)) : undefined;
+      if (tieHit && !crossTies) pairedTies.add(tieHit.arc);
+      const hit = tieHit ?? q.find((p) => p.above === t.above) ?? q[0];
       pending.set(t.staff, q.filter((p) => p !== hit));
       if (hit) {
         alias.set(t.arc, hit.arc);
@@ -677,10 +691,22 @@ export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = fal
   // **接上的两个半截两头同音高、紧挨着的是延音线**（页内跨行的已在 `slur.ts::reconnectSlurs` 按音级判过，这里是跨页的：
   // 破碎 p2→p3 m16–17、p5→p6 m59–60、p10→p11 m93–94 钢琴右手）
   const tieArcs = new Set<string>();
+  // 矢量路不开 `crossTies`（同音高相邻两音间也有记圆滑线的），但**起音上同时起着两个跨行半截**的，其中接到同音高下一音的那条是延音线：
+  // 同两个音之间不会有两条圆滑线（牵我的手 W m36→37 F4）
+  const twoOn = (a: Tok) => toks.some((o) => o !== a && o.type === a.type && o.edge === a.edge && orphan.has(o.arc) === orphan.has(a.arc) && noteStart(o.at) === noteStart(a.at));
   for (const [stopArc, startArc] of alias) {
     const a = toks.find((t) => t.type === "start" && t.arc === startArc), b = toks.find((t) => t.type === "stop" && t.arc === stopArc);
-    if (crossTies && a && b && tieLike(a, b)) tieArcs.add(startArc);
+    if (a && b && tieLike(a, b) && (crossTies || twoOn(a) || pairedTies.has(startArc))) tieArcs.add(startArc);
   }
+  // **页内跨行接上的同音两截**（位图路 `pagefinish.ts` 先一律当圆滑线写）：起音是这个声部本系统最后一个音、止音是它下一系统第一个音、
+  // 同音高——时间上紧挨着，是延音线；中间隔着别的音的是跨行的长圆滑线（宁静 p8 m97→m103 女高 E5…E5）
+  if (crossTies && sysOfBar)
+    for (const a of toks) {
+      if (a.type !== "start" || orphan.has(a.arc) || alias.has(a.arc)) continue;
+      const b = toks.find((t) => t.type === "stop" && t.arc === a.arc);
+      if (!b || sysOfBar[b.bar - 1] !== nextSys(a.bar)) continue;
+      if (tieLike(a, b)) tieArcs.add(a.arc);
+    }
   // **只找到一半的跨系统弧**：另一半没认出来，但相邻系统同声部紧挨着的那个音同音高，就当延音线，那一头补上
   //（行尾的延音线头常只有半格多宽、贴着谱线，行首那截又常与圆滑线起笔粘在一起）
   /** 补到别的音上的延音线：插入点（原文位置）→ 文本 */
@@ -749,7 +775,7 @@ export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = fal
       const d = out.indexOf("</duration>", k);
       if (d >= 0) out = out.slice(0, d + 11) + `<tie type="${t.type}"/>` + out.slice(d + 11);
       // 弧的上下方照抄成延音线的朝向（读入端照 `orientation` 定方向，不写就由排版去猜）
-      const ori = t.type === "start" ? ` orientation="${t.above ? "over" : "under"}"` : "";
+      const ori = t.type === "start" ? ` orientation="${t.above || t.rest.includes('placement="above"') ? "over" : "under"}"` : "";
       out += `<tied type="${t.type}"${ori}/>`;
       continue;
     }
@@ -848,6 +874,13 @@ function scoreToMusicXmlRaw(
   const partList: string[] = [];
   const bodies: string[] = [];
   const layout = opts.layout === false ? null : sourceLayout(score);
+  /** 系统首小节的 `<print>`：源谱版面那份，第一声部首小节再带上 `<measure-numbering>`（子元素次序里排在 `staff-layout` 之后） */
+  const printXml = (si: number, pi: number): string => {
+    const p = layout ? layout.print(si, pi) : "";
+    if (si !== 0 || pi !== 0 || !opts.measureNumbering) return p;
+    const mn = `<measure-numbering>${opts.measureNumbering}</measure-numbering>`;
+    return p ? p.replace(/<\/print>$/, `${mn}</print>`) : `<print>${mn}</print>`;
+  };
   const defaults = (layout?.defaults ?? "") + fontDefaults(score, notesOf);
   score.parts.forEach((part, pi) => {
     const id = `P${pi + 1}`;
@@ -934,9 +967,9 @@ function scoreToMusicXmlRaw(
         }
         while (bar0 && tc < timeChanges.length && timeChanges[tc].x < bar0.right) {
           const t = timeChanges[tc++];
-          const k = `${t.beats}/${t.beatType}`;
+          const k = `${t.beats}/${t.beatType}${t.symbol ?? ""}`;
           if (k !== prevTime) {
-            attrs += `<time><beats>${t.beats}</beats><beat-type>${t.beatType}</beat-type></time>`;
+            attrs += timeXml(t);
             prevTime = k;
           }
         }
@@ -953,7 +986,7 @@ function scoreToMusicXmlRaw(
           }
         }
         attrs += staffDetails(Array(nStaves).fill(false));
-        const [beats, beatType] = (prevTime ?? "4/4").split("/").map(Number);
+        const [beats, beatType] = (prevTime ?? "4/4").split("/").map((v) => parseInt(v));
         const pickup = pickupTicks(entry, bi, ticks(beats / beatType));
         const dur = pickup ?? ticks(beats / beatType);
         let notes = "";
@@ -961,7 +994,7 @@ function scoreToMusicXmlRaw(
           if (k) notes += `<backup><duration>${dur}</duration></backup>`;
           notes += `<note><rest measure="yes"/><duration>${dur}</duration><voice>${k * 4 + 1}</voice>${nStaves > 1 ? `<staff>${k + 1}</staff>` : ""}</note>`;
         }
-        out += `<measure number="${measureNo}"${pickup ? ' implicit="yes"' : ""}>${bi === 0 && layout ? layout.print(si, pi) : ""}${attrs ? `<attributes>${attrs}</attributes>` : ""}${notes}</measure>`;
+        out += `<measure number="${measureNo}"${pickup ? ' implicit="yes"' : ""}>${bi === 0 ? printXml(si, pi) : ""}${attrs ? `<attributes>${attrs}</attributes>` : ""}${notes}</measure>`;
       }
       return out;
     };
@@ -993,9 +1026,9 @@ function scoreToMusicXmlRaw(
         }
         while (bar0 && tc < timeChanges.length && timeChanges[tc].x < bar0.right) {
           const t = timeChanges[tc++];
-          const k = `${t.beats}/${t.beatType}`;
+          const k = `${t.beats}/${t.beatType}${t.symbol ?? ""}`;
           if (k !== prevTime) {
-            attrs += `<time><beats>${t.beats}</beats><beat-type>${t.beatType}</beat-type></time>`;
+            attrs += timeXml(t);
             prevTime = k;
           }
         }
@@ -1016,10 +1049,10 @@ function scoreToMusicXmlRaw(
         }
         // 被系统换行劈开的小节的后半截：系统里任一行谱配得上就算（一行认漏了音、凑不满，别的行照样配得上，232 主也爱我歌）
         const splitTail = entry.sys.staves.some((st) => st.bars[bi]?.splitTail);
-        const [beats, beatType] = (prevTime ?? "4/4").split("/").map(Number);
+        const [beats, beatType] = (prevTime ?? "4/4").split("/").map((v) => parseInt(v));
         const pickup = pickupTicks(entry, bi, ticks(beats / beatType));
         body += `<measure number="${measureNo}"${splitTail || pickup ? ' implicit="yes"' : ""}>`;
-        if (bi === 0 && layout) body += layout.print(si, pi);
+        if (bi === 0) body += printXml(si, pi);
         if (attrs) body += `<attributes>${attrs}</attributes>`;
         if (bar0)
         body += barlineXml("left", {
@@ -1197,14 +1230,14 @@ function fontDefaults(score: StaffScore, notesOf: (staff: Staff) => StaffNote[])
   return (word.length ? `<word-font font-size="${median(word)}"/>` : "") + (lyric.length ? `<lyric-font font-size="${median(lyric)}"/>` : "");
 }
 
-/** 页眉 → `<credit page="1">`，一条一个。 */
+/** 页眉页脚 → `<credit page>`，一条一个（页眉在第 1 页，页脚每页一份）。 */
 function creditsXml(credits: StaffXmlOptions["credits"], layout?: SourceLayout | null): string {
   return (credits ?? [])
     .map((c) => {
       // 写源谱版面时照原图的位置（框底对齐：OCR 的框底比字的基线更稳）
       const pos = layout && c.box ? layout.creditPos(c.box, c.justify) : null;
       const at = pos ? ` default-x="${pos.x}" default-y="${pos.y}" valign="bottom"` : "";
-      return `<credit page="1">${c.type ? `<credit-type>${escapeXml(c.type)}</credit-type>` : ""}<credit-words${at}${c.justify ? ` justify="${c.justify}"` : ""}${fontAttr(c.size ? roundPt(c.size) : undefined)}>${escapeXml(c.text)}</credit-words></credit>`;
+      return `<credit page="${c.page ?? 1}">${c.type ? `<credit-type>${escapeXml(c.type)}</credit-type>` : ""}<credit-words${at}${c.justify ? ` justify="${c.justify}"` : ""}${fontAttr(c.size ? roundPt(c.size) : undefined)}>${escapeXml(c.text)}</credit-words></credit>`;
     })
     .join("");
 }

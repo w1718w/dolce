@@ -210,6 +210,7 @@ export async function recognizeRasterSong(
       fill();
     }
   }
+  settleEdgeSlurStarts(entries.map((e) => e.page), notesByStaff);
   // 自检：凑满拍的，加上结构上的半截小节（弱起、乐句中间劈开的两半，见 `notedata.ts::markSplitBars`）
   markSplitBars(barPages);
   for (const { bars } of barPages) stats.full += bars.filter((b) => b.full || b.split).length;
@@ -271,5 +272,41 @@ function markLyricsBelow(page: SPage, lines: readonly LyricLine[], out: Set<Staf
       const down = rows[k + 1];
       if (lines.some((l) => l.syllables.length && l.top > up.box.bottom && l.top < down.box.top)) out.add(up);
     }
+  }
+}
+
+/**
+ * 页上第一个系统行首起笔、只挂了止端的弧（`StaffNote.slurEdgeCands`，见 `slurattach.ts::attachEdgeSlurStarts`）：
+ * 上一页末系统同一行谱（两系统行数相同才按行序对，不同的不补）没有行尾的半截（`slurOrphans` 里 `edge: "end"`）可接，就是从首音起的弧，补上起端；
+ * 有的留给写出端跨页接（`toxml.ts::renumberSlurs`）。宁静的伯利恒 p4 m47、p6 m75 钢琴右手。
+ */
+function settleEdgeSlurStarts(pages: SPage[], notesByStaff: Map<Staff, StaffNote[]>): void {
+  for (let k = 1; k < pages.length; k++) {
+    const ps = pages[k - 1].systems.filter((sy) => sy.staves.length);
+    const prev = ps[ps.length - 1], cur = pages[k].systems.filter((sy) => sy.staves.length)[0];
+    if (!cur) continue;
+    const dangles = (st: Staff) => (notesByStaff.get(st) ?? []).some((n) => n.slurOrphans?.some((o) => o.edge === "end"));
+    // 上一页末系统整个没有行尾半截：这一页行首的弧都不是接过来的，照补；有的话按行对，对上的那行没有行尾半截才补
+    const anyDangle = !!prev && prev.staves.some(dangles);
+    // 行数不同按从下往上对（多出、隐藏的多是最上面的人声谱表，钢琴总在最下）
+    const shift = prev ? cur.staves.length - prev.staves.length : 0;
+    cur.staves.forEach((st, i) => {
+      const ns = notesByStaff.get(st) ?? [];
+      const firsts = ns.filter((n) => n.slurEdgeCands?.length);
+      if (!firsts.length) return;
+      if (anyDangle) {
+        const pst = prev!.staves[i - shift];
+        if (!pst || dangles(pst)) return;
+      }
+      for (const f of firsts)
+        for (const c of f.slurEdgeCands!) {
+          const to = ns.find((n) => n.slurOrphans?.some((o) => o.id === c.id && o.edge === "begin"));
+          if (!to) continue;
+          to.slurOrphans = to.slurOrphans!.filter((o) => o.id !== c.id);
+          f.slurStart = true;
+          f.slurAbove ??= c.above;
+          f.slurStartIds = [...(f.slurStartIds ?? []), c.id];
+        }
+    });
   }
 }

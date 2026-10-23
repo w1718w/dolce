@@ -254,13 +254,20 @@ export function timeSignature(time: Sym[], sp?: number): { beats: number; beatTy
   return all.length ? { beats: all[0].beats, beatType: all[0].beatType } : null;
 }
 
+/** 一处拍号。`symbol`：印的是 C / ¢ 记号而不是数字（MusicXML `<time symbol>`）。 */
+export interface TimeSig { x: number; beats: number; beatType: number; symbol?: "common" | "cut" }
+
+/** 一处拍号的 MusicXML `<time>`。 */
+export const timeXml = (t: TimeSig): string =>
+  `<time${t.symbol ? ` symbol="${t.symbol}"` : ""}><beats>${t.beats}</beats><beat-type>${t.beatType}</beat-type></time>`;
+
 /** 一行谱上的**全部**拍号，按 x 从左到右。曲中变拍时会有好几处。 */
-export function timeSignatures(time: Sym[], sp?: number): { x: number; beats: number; beatType: number }[] {
+export function timeSignatures(time: Sym[], sp?: number): TimeSig[] {
   if (!time.length) return [];
-  const out: { x: number; beats: number; beatType: number }[] = [];
+  const out: TimeSig[] = [];
   const marks = time.filter((s) => s.code === "timeSigCommon" || s.code === "timeSigCutCommon");
   for (const m of marks) {
-    out.push(m.code === "timeSigCommon" ? { x: m.px, beats: 4, beatType: 4 } : { x: m.px, beats: 2, beatType: 2 });
+    out.push(m.code === "timeSigCommon" ? { x: m.px, beats: 4, beatType: 4, symbol: "common" } : { x: m.px, beats: 2, beatType: 2, symbol: "cut" });
   }
   const digits = time.filter((s) => timeSigDigit(s.code) >= 0).sort((a, b) => a.px - b.px);
   if (digits.length) {
@@ -490,6 +497,9 @@ export function buildStems(pg: SPage, sp: number): StemInfo[] {
   for (const seg of pg.segsWithTag("Stem")) {
     const notes: Sym[] = [];
     for (const nt of heads) {
+      // 形状已确认是全音符的头不挂干（`Sym.shapeWhole`）：贴着别的声部带干的头时，会被当成同一根干上的和弦音、读成二分
+      //（爱是从神而来 p5 m63 钢琴右手 F4 二分朝上的干，下面贴着 B♭3/D4 全音符）
+      if (nt.shapeWhole) continue;
       // 纵向差一像素也算相交，与 `findStems` 同口径
       if (seg.bottom < nt.box.top - 1 || nt.box.bottom < seg.top - 1) continue;
       let dx0 = Math.abs(nt.box.left - seg.cx);
@@ -504,10 +514,14 @@ export function buildStems(pg: SPage, sp: number): StemInfo[] {
       notes.push(nt);
     }
     if (!notes.length) continue;
-    // `Stem::up`：符干伸到符头**上方**就是朝上
-    const top = Math.min(...notes.map((n) => n.box.top));
-    const bottom = Math.max(...notes.map((n) => n.box.bottom));
-    const up = seg.top < top ? true : seg.bottom > bottom ? false : false;
+    // `Stem::up`：符干伸到符头**上方**就是朝上。高出头顶不到 `STEM_UP_SLACK` 格的不算：干端齐着头顶、
+    // 扫描件上高出一两个像素的朝下干会被当成朝上（是爱 p2 m30 女低 F4 二分，干上端比头顶高 1px、往下伸 2.5 格，
+    // 分声部时上方 C5 全音符的「上下两声部」豁免因此不成立，三个音排成了一串）。
+    // 改成「往哪头伸得多」更差：穿过两声部交叉处的干（望十架 p3 m26）方向跟着翻
+    // 两头都没伸出头去的短干（破碎扫描 p9 m93，夹在二度两个头之间）照旧：上端高过头顶就算朝上
+    const above = Math.min(...notes.map((n) => n.box.top)) - seg.top;
+    const below = seg.bottom - Math.max(...notes.map((n) => n.box.bottom));
+    const up = above > sp * STEM_UP_SLACK || (above > 0 && below <= sp * STEM_UP_SLACK);
     let flags = 0;
     for (const f of flagSyms) {
       if (Math.abs(f.box.left - seg.cx) > sp / 4) continue;
@@ -788,7 +802,7 @@ export interface StaffNote {
   /** 力度记号（`mp`/`f`…）。MusicXML 里出成 `<direction>`，排在这个音符之前。 */
   dynamic?: string;
   /** 印在这个音符处的文字指示（rit. / a tempo / cresc. / Fine…）：原文与在谱表上方还是下方。MusicXML 里出成 `<direction><words>`。 */
-  words?: { text: string; above: boolean; /** 字号（页面单位） */ size?: number; /** 基线（页面单位），写源谱版面时出成 `default-y` */ baseY?: number }[];
+  words?: { text: string; above: boolean; /** 字号（页面单位） */ size?: number; /** 基线（页面单位），写源谱版面时出成 `default-y` */ baseY?: number; /** 加框的排练号（`<rehearsal enclosure="square">`） */ rehearsal?: boolean }[];
   /** 节拍器记号：拍子单位（`quarter`）、每分钟拍数、`<per-minute>` 的原文（带「约」时 `c. 76`，否则省）。MusicXML 里出成 `<direction><metronome>`。 */
   metronome?: { unit: string; bpm: number; text?: string; /** 印在圆括号里（「(♩ = 82)」）→ `<metronome parentheses="yes">` */ parentheses?: boolean };
   /** 与节拍器印在同一条的速度文字（`Andante ♩ = c. 76` 的 `Andante`）：与节拍器写进**同一个** `<direction>`，不拆成两个对象。 */
@@ -835,6 +849,8 @@ export interface StaffNote {
    *  `begin` = 止在这个音、另一端起在本行第一小节前半（跨行弧的后半），`mid` = 系统中间缺一端。写出时 `renumberSlurs` 只把
    *  同一声部同一行谱上的 `end` 与这个声部下一个出现的系统里的 `begin` 接成一条，接不上的不写。 */
   slurOrphans?: { id: string; edge: "end" | "begin" | "mid"; above: boolean }[];
+  /** 页上第一个系统行首起笔的弧（`SlurArc.edgeFirst`）可以从这个音起：上一页末系统同一行谱没有行尾半截时，整曲拼页时补成起端。 */
+  slurEdgeCands?: { id: string; above: boolean }[];
   tieStart?: boolean;
   tieStop?: boolean;
   /** 起头的那条圆滑线 / 连音线画在音符上方（弧朝上，`SlurArc.above`）还是下方；没认出方向的不写。 */
@@ -1128,6 +1144,9 @@ function attachDots(notes: StaffNote[], dots: Sym[], sp: number): void {
 const STEM_JOIN_X = 0.3;
 /** 同上，两段之间允许的断口（线距的倍数）。 */
 const STEM_JOIN_GAP = 1.0;
+/** 干上端高出头顶不到这么多格（线距的倍数）不算朝上（见 `findStems` 那一段 `Stem::up`）。 */
+const STEM_UP_SLACK = 0.15;
+
 /** 断成两段的干，断口不过这个数（线距的倍数）才统一两段的时值（见 `inheritDur`）。 */
 const STEM_SPLIT_DUR_GAP = 0.4;
 
@@ -1303,8 +1322,9 @@ function initChords(notes: StaffNote[], stems: StemInfo[], sp: number): StaffCho
   const orphan = notes.filter((n) => !byNote.has(n) && !n.rest);
   // **真字体的全音符头不并**：矢量路的符头直接来自字形，`noteheadWhole` 就是全音符，不会是「干没挂上的二分」。
   // 并进去的话下面「带干的和弦里没有全音符」那条还会把它改成二分——宣主荣耀钢琴右手 m16 上声部 D4 全音符
-  // 并进了下声部的二分，成了「D4+F3 二分」一个和弦。位图路的符号挂在合成字体（`#raster`）上，照旧并
-  const glyphWhole = (n: StaffNote) => n.sym.code === "noteheadWhole" && !(n.sym.parent.run?.font ?? "#").startsWith("#");
+  // 并进了下声部的二分，成了「D4+F3 二分」一个和弦。位图路的符号挂在合成字体（`#raster`）上，照旧并——
+  // 除非形状已按本页样本确认是全音符（`shapeWhole`，爱是从神而来 p2 m23 钢琴右手 D4 全音符被并成 A4/D4 二分）
+  const glyphWhole = (n: StaffNote) => n.sym.code === "noteheadWhole" && (n.sym.shapeWhole || !(n.sym.parent.run?.font ?? "#").startsWith("#"));
   for (const n of orphan) {
     if (glyphWhole(n)) continue;
     let best: StaffChord | null = null;
@@ -2011,3 +2031,4 @@ export function lastTimeSignature(
   }
   return out;
 }
+

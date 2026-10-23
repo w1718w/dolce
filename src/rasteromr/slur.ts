@@ -545,3 +545,341 @@ export function extendArcEnds(arcs: SlurArc[], nl: Binary, onLine: (y: number) =
     }
   }
 }
+
+// ── 陡着收不住的弧端 ─────────────────────────────────────────────────────────
+//
+// 钢琴跨谱表的大弧从低音谱表陡着升上去、在高音谱表顶上拱过、落到右手和弦上（宁静的伯利恒 p1–p2 钢琴几乎每小节一条）。
+// 去线后拱顶那段压着、擦着高音谱表的线，碎成短块认不成弧，只剩下截（陡的那段），右端停在半空，`attachSlurs` 就近挂到中途某个右手音上。
+// 弧上方（∩）的右端还在陡升、左端还在陡降（弧下方反过来），说明弧在这儿没完：在**原图**上顺切线一步一像素往外追，
+// 垂直于走向 `TRACE_PERP` 格内找离预计位置最近的一段墨：细的（不过 `TRACE_THICK` 格）跟上、修切线；粗的（擦过音头、符杠，
+// 或平着贴在谱线上）照切线穿过去，连续不过 `TRACE_OCCLUDE` 格；没墨连续不过 `TRACE_MISS` 格。弯向要一路朝一侧弯
+//（∩ 往右走斜率只增不减，回头超过 `TRACE_BEND` 就停：那是顺着符干上去了）。追出 `TRACE_MIN` 格以上才改端点；
+// 追过的路上原先认出的别的截弧（拱顶那截有时认得出来）并掉。
+
+/** 端头算「陡」的切线竖向分量下限（单位向量）。 */
+const TRACE_STEEP = 0.6;
+/** 收尾往回陡下的上限（单位向量竖向分量）。 */
+const TRACE_STEEP_BACK = 0.85;
+/** 垂直于走向找墨的半宽（格）。 */
+const TRACE_PERP = 0.5;
+/** 细墨段的长度上限（格，沿垂线量）。 */
+const TRACE_THICK = 0.6;
+/** 连续穿过粗墨的上限（格）。 */
+const TRACE_OCCLUDE = 1.5;
+/** 连续没墨的上限（格）。 */
+const TRACE_MISS = 0.6;
+/** 斜率回头的容差。 */
+const TRACE_BEND = 0.8;
+/** 线带里的墨竖向比线宽多出几像素才算弧。 */
+const TRACE_ON_LINE = 2;
+/** 追出多远才算数（格）。 */
+const TRACE_MIN = 1.5;
+/** 一端最多追多远（格）。 */
+const TRACE_MAX = 30;
+
+export function traceSteepArcEnds(arcs: SlurArc[], bin: Binary, onLine: (y: number) => boolean, lineThick: number, sp: number): void {
+  const raw = (x: number, y: number) => x >= 0 && y >= 0 && x < bin.w && y < bin.h && bin.data[y * bin.w + x] === 1;
+  const vRun = (x: number, y: number) => {
+    let a = y, b = y;
+    while (raw(x, a - 1) && y - a < sp) a--;
+    while (raw(x, b + 1) && b - y < sp) b++;
+    return b - a + 1;
+  };
+  // 谱线行上的墨只在竖向比线粗（`TRACE_ON_LINE` 倍线宽）时算：斜穿谱线时线的那一小截也是细墨，跟上去就顺着线走了；
+  // 弧顶贴在线上的那段（宁静 p2 m16 钢琴 A2→C5 拱顶压着高音谱表第二线）线加弧比线粗
+  const ink = (x: number, y: number) => raw(x, y) && (!onLine(y) || vRun(x, y) >= lineThick + TRACE_ON_LINE);
+  const W = Math.max(3, Math.round(sp * TRACE_PERP));
+  for (const sl of [...arcs]) {
+    if (!arcs.includes(sl) || sl.dashed) continue;
+    const len = Math.hypot(sl.rx - sl.lx, sl.ry - sl.ly);
+    if (len < sp * 1.5) continue;
+    for (const dir of [-1, 1] as const) {
+      // 起步切线取整截的弦（陡的那截近乎直）
+      let vx = dir * (sl.rx - sl.lx), vy = dir * (sl.ry - sl.ly);
+      const n0 = Math.hypot(vx, vy);
+      vx /= n0;
+      vy /= n0;
+      // 往外（离开音符那侧）陡走：∩ 往上（vy<0）、∪ 往下
+      const out = sl.above ? -vy : vy;
+      if (out < TRACE_STEEP) continue;
+      let x = dir < 0 ? sl.lx : sl.rx, y = dir < 0 ? sl.ly : sl.ry;
+      // 起步切线按端头往里 `k` 列处的墨心（弦是整截的走向，端头那截常已拐平：拱顶前的那段）
+      {
+        const k = Math.max(3, Math.round(sp * 0.6)), bx = Math.round(x - dir * k), b = sl.obj.box;
+        let yIn: number | null = null;
+        for (let yy = Math.round(b.top); yy <= Math.round(b.bottom); yy++) if (ink(bx, yy) && (yIn === null || Math.abs(yy - y) < Math.abs(yIn - y))) yIn = yy;
+        if (yIn !== null) {
+          vx = dir * k;
+          vy = y - yIn;
+          const n1 = Math.hypot(vx, vy);
+          vx /= n1;
+          vy /= n1;
+        }
+      }
+      /** 走向上的「弯度」：∩ 往右走 vy/vx 只增，往左走 vy/(-vx) 只增；∪ 反过来。统一成只增的量 */
+      const bendOf = (ax: number, ay: number) => (sl.above ? 1 : -1) * (ay / Math.max(1e-3, Math.abs(ax)));
+      let maxBend = -Infinity;
+      let miss = 0, occl = 0, lineGap = 0, walked = 0;
+      const sx = x, sy = y, lag = Math.max(3, Math.round(sp * 0.3));
+      let last: { x: number; y: number; at: number } | null = null;
+      const path: { x: number; y: number }[] = [];
+      while (walked < sp * TRACE_MAX) {
+        const px = x + vx, py = y + vy;
+        walked++;
+        // 垂线上的墨段
+        const runs: { a: number; b: number }[] = [];
+        let cur: { a: number; b: number } | null = null;
+        for (let d = -W; d <= W; d++) {
+          if (ink(Math.round(px - vy * d), Math.round(py + vx * d))) {
+            if (cur && cur.b === d - 1) cur.b = d;
+            else runs.push((cur = { a: d, b: d }));
+          }
+        }
+        // 段要延到窗口边上的，量真长度（粗墨块常比窗口宽）
+        const extent = (r: { a: number; b: number }) => {
+          let a = r.a, b = r.b;
+          if (a === -W) while (a > -sp && ink(Math.round(px - vy * (a - 1)), Math.round(py + vx * (a - 1)))) a--;
+          if (b === W) while (b < sp && ink(Math.round(px - vy * (b + 1)), Math.round(py + vx * (b + 1)))) b++;
+          return { a, b };
+        };
+        const near = runs.map(extent).sort((p, q) => Math.min(Math.abs(p.a), Math.abs(p.b), p.a <= 0 && p.b >= 0 ? 0 : 99) - Math.min(Math.abs(q.a), Math.abs(q.b), q.a <= 0 && q.b >= 0 ? 0 : 99))[0];
+        if (!near) {
+          // 落在谱线行上：照切线走过去（同 `extendArcEnds` 的 `EXT_GAP`）
+          if (onLine(Math.round(py))) {
+            if (++lineGap > sp * EXT_GAP) break;
+            x = px;
+            y = py;
+            continue;
+          }
+          if (++miss > Math.max(2, sp * TRACE_MISS)) break;
+          x = px;
+          y = py;
+          continue;
+        }
+        miss = 0;
+        lineGap = 0;
+        if (near.b - near.a + 1 > sp * TRACE_THICK) {
+          if (++occl > sp * TRACE_OCCLUDE) break;
+          x = px;
+          y = py;
+          continue;
+        }
+        occl = 0;
+        const c = (near.a + near.b) / 2;
+        const hx = px - vy * c, hy = py + vx * c;
+        // 走向按几步之前那个墨点量（一步一像素，垂线上取中的半像素抖动会把单步方向甩到后头去）
+        const back = path[path.length - lag] ?? { x: sx, y: sy };
+        const ax = hx - back.x, ay = hy - back.y;
+        const an = Math.hypot(ax, ay) || 1;
+        let nvx = vx * 0.7 + (ax / an) * 0.3, nvy = vy * 0.7 + (ay / an) * 0.3;
+        const nn = Math.hypot(nvx, nvy);
+        nvx /= nn;
+        nvy /= nn;
+        // 往回（朝音符那侧）陡下去的是顺着符干、头的边走了：弧尾收得没这么陡
+        if (Math.sign(nvx) !== dir || (sl.above ? nvy : -nvy) > TRACE_STEEP_BACK) break;
+        // 弯度只在走出起步那一小段（`lag` 的两倍）之后才记：起步处端头墨心不准，切线左右晃
+        const bend = bendOf(nvx, nvy);
+        if (path.length > 2 * lag) {
+          if (bend < maxBend - TRACE_BEND) break;
+          maxBend = Math.max(maxBend, bend);
+        } else maxBend = bend;
+        vx = nvx;
+        vy = nvy;
+        x = hx;
+        y = hy;
+        last = { x: hx, y: hy, at: walked };
+        path.push(last);
+      }
+      if (!last || last.at < sp * TRACE_MIN) continue;
+      const b = sl.obj.box as { left: number; right: number; top: number; bottom: number };
+      if (dir < 0) (sl.lx = Math.round(last.x)), (sl.ly = Math.round(last.y));
+      else (sl.rx = Math.round(last.x)), (sl.ry = Math.round(last.y));
+      for (const p of path) {
+        b.left = Math.min(b.left, p.x);
+        b.right = Math.max(b.right, p.x);
+        b.top = Math.min(b.top, p.y);
+        b.bottom = Math.max(b.bottom, p.y);
+      }
+      // 路上原先认出的别的截：两端都贴着追过的路（半格内）的并掉
+      const onPath = (qx: number, qy: number) => path.some((p) => Math.hypot(p.x - qx, p.y - qy) <= sp * 0.5);
+      for (let i = arcs.length - 1; i >= 0; i--) {
+        const o = arcs[i];
+        if (o !== sl && o.above === sl.above && !o.dashed && onPath(o.lx, o.ly) && onPath(o.rx, o.ry)) arcs.splice(i, 1);
+      }
+    }
+  }
+}
+
+// ── 长弧末端的细尾 ─────────────────────────────────────────────────────────
+//
+// 长弧两头收成发丝细的尾巴，二值化后断成几截，过谱线那几列还被去线抹掉，认出的端点停在尾巴前头，挂到前一个音上
+//（宁静 p1 m6–8 钢琴右手 A4 起的长弧，尾巴过第一线后画到 m8 F4 前，认出的右端停在 E4 上方）。
+// 宽过 `TAIL_LONG` 格的弧，两端都在原图上顺切线往外追：垂直于走向 `TAIL_PERP` 格内找细墨（线行上的墨照 `traceSteepArcEnds` 的规矩），
+// 碰上粗墨（过 `TAIL_THICK` 格，头、干、符杠）就停；断口容 `TAIL_GAP` 格，断着时按最近的转弯速度续着弯；最多追 `TAIL_MAX` 格。
+
+/** 长弧的宽度下限（格）。 */
+const TAIL_LONG = 3.5;
+/** 找墨的半宽（格）；起步一格内的半宽。 */
+const TAIL_PERP = 0.3;
+const TAIL_PERP_START = 0.7;
+/** 细墨的上限（格）。 */
+const TAIL_THICK = 0.4;
+/** 断口上限（格）。 */
+const TAIL_GAP = 0.8;
+/** 最多追多远、至少追出多远（格）。 */
+const TAIL_MAX = 4;
+const TAIL_MIN = 0.4;
+/** 长延伸最多追多远、落点离另一行谱音头的上限（格）。 */
+const TAIL_MAX_CROSS = 15;
+const TAIL_CROSS_HEAD = 1.5;
+/** 续尾连续穿过粗墨的上限（格）。 */
+const TAIL_OCCLUDE = 1;
+/** 端头离音头多近就不追、追到离音头多近就停（格）。 */
+const TAIL_AT_HEAD = 0.4;
+const TAIL_STOP_HEAD = 0.5;
+/** 判像不像延音线时，弧端找最近音头的范围（格）。 */
+const TAIL_TIE_NEAR = 1.5;
+
+export function traceLongArcTails(arcs: SlurArc[], bin: Binary, onLine: (y: number) => boolean, heads: readonly { left: number; right: number; top: number; bottom: number }[], staves: readonly { top: number; bottom: number }[], sp: number): void {
+  const headDist = (x: number, y: number) => Math.min(Infinity, ...heads.map((h) => Math.hypot(Math.max(0, h.left - x, x - h.right), Math.max(0, h.top - y, y - h.bottom))));
+  const raw = (x: number, y: number) => x >= 0 && y >= 0 && x < bin.w && y < bin.h && bin.data[y * bin.w + x] === 1;
+  // 谱线行上的墨一概不用：尾巴斜着过线，线加弧那几列竖向一长条，会把走向拽成竖直往下；过线当断口照切线走过去
+  const ink = (x: number, y: number) => raw(x, y) && !onLine(y);
+  const staffAt = (y: number) => staves.findIndex((b) => y >= b.top - sp * 2 && y <= b.bottom + sp * 2);
+  const W = Math.max(2, Math.round(sp * TAIL_PERP));
+  const nearestHead = (x: number, y: number) => {
+    let best: (typeof heads)[number] | undefined, bd = sp * TAIL_TIE_NEAR;
+    for (const h of heads) {
+      const d = Math.hypot(Math.max(0, h.left - x, x - h.right), Math.max(0, h.top - y, y - h.bottom));
+      if (d <= bd) (bd = d), (best = h);
+    }
+    return best;
+  };
+  for (const sl of [...arcs]) {
+    if (!arcs.includes(sl) || sl.dashed || sl.rx - sl.lx < sp * TAIL_LONG) continue;
+    // 像延音线的不追：两端各自最近的音头同高（延音线两头同音高，是爱 p3 m37、p4 m47 长延音线追过了头）
+    const hl = nearestHead(sl.lx, sl.ly), hr = nearestHead(sl.rx, sl.ry);
+    if (hl && hr && hl !== hr && Math.abs((hl.top + hl.bottom) / 2 - (hr.top + hr.bottom) / 2) <= sp * 0.3) continue;
+    for (const dir of [-1, 1] as const) {
+      let x = dir < 0 ? sl.lx : sl.rx, y = dir < 0 ? sl.ly : sl.ry;
+      // 端头已贴着音头的不追（长延音线两头本就挨着头，再追就越过头、挂不上了，是爱 p3 m37、p5 m65）
+      if (headDist(x, y) <= sp * TAIL_AT_HEAD) continue;
+      // 起步切线：端头往里 k 列处离端头最近的墨
+      const k = Math.max(3, Math.round(sp * 0.6)), bx = Math.round(x - dir * k), b = sl.obj.box;
+      let yIn: number | null = null;
+      for (let yy = Math.round(b.top); yy <= Math.round(b.bottom); yy++) if (raw(bx, yy) && (yIn === null || Math.abs(yy - y) < Math.abs(yIn - y))) yIn = yy;
+      if (yIn === null) continue;
+      let ang = Math.atan2(y - yIn, dir * k), turn = 0;
+      let miss = 0, walked = 0, occl = 0, crossed = false;
+      /** 第一次穿粗墨前的落点（验收不过退回这里） */
+      let preCross: { x: number; y: number; at: number } | null = null, preCrossPts = 0;
+      let last: { x: number; y: number; at: number } | null = null;
+      /** 追满 `TAIL_MAX` 格时的落点：往后的长延伸只有落到另一行谱的音头跟前才采用，否则退回这里 */
+      let check: { x: number; y: number; at: number } | null | undefined;
+      let checkPts = 0;
+      const home = staffAt(y);
+      // 不越过本行谱第一个音头左边、最后一个音头右边半格（行首行尾往外追会进谱号调号、行尾小节线；跨行的半截另有配对）
+      const hb = home >= 0 ? heads.filter((h) => staffAt((h.top + h.bottom) / 2) === home) : [];
+      const xLo = hb.length ? Math.min(...hb.map((h) => h.left)) - sp * 0.5 : -Infinity;
+      const xHi = hb.length ? Math.max(...hb.map((h) => h.right)) + sp * 0.5 : Infinity;
+      const pts: { x: number; y: number; ang: number }[] = [];
+      while (walked < sp * TAIL_MAX_CROSS) {
+        if (check === undefined && walked >= sp * TAIL_MAX) (check = last), (checkPts = pts.length);
+        if (miss) ang += turn;
+        const vx = Math.cos(ang), vy = Math.sin(ang);
+        const px = x + vx, py = y + vy;
+        walked++;
+        // 粗细沿走向的垂线量（近竖的线按竖向游程量是一长条），线行的墨不算（垂线近水平时，斜穿谱线会顺着线量成一长条）
+        const pRun = (d0: number) => {
+          let a = d0, b = d0;
+          while (b - a < sp && ink(Math.round(px - vy * (a - 1)), Math.round(py + vx * (a - 1)))) a--;
+          while (b - a < sp && ink(Math.round(px - vy * (b + 1)), Math.round(py + vx * (b + 1)))) b++;
+          return b - a + 1;
+        };
+        let best: number | null = null, thick = false;
+        // 起步一格内窗口放宽：端头往里那段常已拐平，起步切线是平的，真弧在端头处陡着往下（宁静 p2 m22 钢琴跨谱表大弧上截的左端）
+        const Wn = walked <= sp ? Math.max(W, Math.round(sp * TAIL_PERP_START)) : W;
+        for (let d = 0; d <= Wn && best === null; d++)
+          for (const sg of d ? [-1, 1] : [1]) {
+            const qx = Math.round(px - vy * d * sg), qy = Math.round(py + vx * d * sg);
+            if (!ink(qx, qy)) continue;
+            if (pRun(d * sg) > sp * TAIL_THICK) thick = true;
+            else best = d * sg;
+            break;
+          }
+        if (best === null) {
+          // 粗墨（擦过音头、符干）照切线穿过去，连续不过 `TAIL_OCCLUDE` 格；穿过粗墨的延伸要按长延伸验收
+          if (thick) {
+            if (++occl > sp * TAIL_OCCLUDE) break;
+            if (!crossed) (preCross = last), (preCrossPts = pts.length);
+            crossed = true;
+            x = px;
+            y = py;
+            continue;
+          }
+          if (++miss > sp * TAIL_GAP) break;
+          x = px;
+          y = py;
+          continue;
+        }
+        miss = 0;
+        occl = 0;
+        const hx = px - vy * best, hy = py + vx * best;
+        if (staffAt(hy) === home && (hx < xLo || hx > xHi)) break;
+        // 追到了音头跟前：尾巴到了它的音，停
+        if (headDist(hx, hy) <= sp * TAIL_STOP_HEAD) break;
+        const na = Math.atan2(hy - y, hx - x);
+        // 方向慢慢跟，转弯速度按近几步量
+        const a2 = ang + 0.3 * Math.atan2(Math.sin(na - ang), Math.cos(na - ang));
+        pts.push({ x: hx, y: hy, ang: a2 });
+        if (pts.length > 4) turn = (a2 - pts[pts.length - 5].ang) / 4;
+        ang = a2;
+        // 不许回头：横向掉过头来就是沿着弧自己往回爬了（宁静 p2 m22 下截左端追到 C3 又绕回右手谱表）
+        if (Math.cos(ang) * dir < -0.2) break;
+        x = hx;
+        y = hy;
+        last = { x: hx, y: hy, at: walked };
+      }
+      // 长延伸（跨谱表大弧近竖的下半截一路下到低音谱表）要落到另一行谱的音头跟前（`TAIL_CROSS_HEAD` 格内）才算，
+      // 否则多半是追进了谱号调号、符杠，退回 `TAIL_MAX` 格时的落点
+      if (last && ((check !== undefined && last.at > sp * TAIL_MAX) || crossed)) {
+        const other = staffAt(last.y);
+        const ok = other >= 0 && other !== home && headDist(last.x, last.y) <= sp * TAIL_CROSS_HEAD;
+        if (!ok) {
+          // 退回 4 格时的落点、第一次穿粗墨前的落点里较早的那个
+          const useCross = crossed && (check === undefined || (preCross?.at ?? 0) <= (check?.at ?? Infinity));
+          last = useCross ? preCross : check ?? null;
+          pts.length = useCross ? preCrossPts : checkPts;
+        }
+      }
+      if (!last || last.at < sp * TAIL_MIN) continue;
+      const bb = sl.obj.box as { left: number; right: number; top: number; bottom: number };
+      if (dir < 0) (sl.lx = Math.round(last.x)), (sl.ly = Math.round(last.y));
+      else (sl.rx = Math.round(last.x)), (sl.ry = Math.round(last.y));
+      for (const p of pts) {
+        bb.left = Math.min(bb.left, p.x);
+        bb.right = Math.max(bb.right, p.x);
+        bb.top = Math.min(bb.top, p.y);
+        bb.bottom = Math.max(bb.bottom, p.y);
+      }
+      // 追过的路上碰到另一截同向弧的近端（半格内）：同一条弧被切成的几截，并进来（宁静 p2 m22 钢琴跨谱表大弧：下截右端追上去越过了上截的左端，
+      // 原先靠 `bridgeArcPieces` 并的就并不上了）
+      const onPath = (qx: number, qy: number) => pts.some((p) => Math.hypot(p.x - qx, p.y - qy) <= sp * 0.5);
+      for (let i = arcs.length - 1; i >= 0; i--) {
+        const o = arcs[i];
+        if (o === sl || o.above !== sl.above || o.dashed) continue;
+        if (dir > 0 && onPath(o.lx, o.ly) && o.rx > sl.rx) {
+          (sl.rx = o.rx), (sl.ry = o.ry);
+        } else if (dir < 0 && onPath(o.rx, o.ry) && o.lx < sl.lx) {
+          (sl.lx = o.lx), (sl.ly = o.ly);
+        } else if (!(onPath(o.lx, o.ly) && onPath(o.rx, o.ry))) continue;
+        const ob = o.obj.box;
+        bb.left = Math.min(bb.left, ob.left);
+        bb.right = Math.max(bb.right, ob.right);
+        bb.top = Math.min(bb.top, ob.top);
+        bb.bottom = Math.max(bb.bottom, ob.bottom);
+        arcs.splice(i, 1);
+      }
+    }
+  }
+}

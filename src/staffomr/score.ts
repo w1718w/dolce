@@ -563,6 +563,8 @@ function nameParts(systems: StaffScore["systems"], parts: Part[]): void {
       if (!part.name) {
         part.name = best.text;
         part.nameSize = { page, size: best.size };
+        // 首系统里没印（这个声部的谱表在首系统隐藏了：牵我的手 W / M 两行人声）、到后面才露面的，印的就是缩写，两处都写
+        if (si > 0) part.abbr = best.text;
       } else if (!part.abbr && best.text !== part.name) part.abbr = best.text;
     }
   }
@@ -654,3 +656,29 @@ export function restructureSystems(pages: readonly { page: SPage }[], op: System
   reindex(a.page);
   return true;
 }
+
+/**
+ * 小节号印在哪（`<measure-numbering>`）：首系统之外的各系统，行首（首行谱左缘四格内）、某行谱顶线上方四格内有纯数字的过半，
+ * 是「每个系统行首印」（`system`，牵我的手、宣主荣耀，Finale 的缺省）。只认这一种；没印、或印法别样的不写（读入端缺省）。
+ * 首系统不算：曲首常不印小节号。字体不看（同一本书里小节号换过斜体、正体）。
+ */
+export function measureNumbering(score: StaffScore): "system" | undefined {
+  const rest = score.systems.slice(1);
+  if (rest.length < 2) return undefined;
+  let hit = 0;
+  for (const { page, sys } of rest) {
+    if (!sys.staves.length) continue;
+    const sp = page.normalStaffSpace || page.space;
+    const left = Math.min(...sys.staves.map((st) => st.box.left));
+    const found = page.objs.some((o) => {
+      if (!o.run || !/^\d+$/.test(o.run.glyphs.map((g) => g.unicode).join("").trim())) return false;
+      if (["Lyric", "Harmony", "Tempo", "TextFrame", "Tuplet"].some((t) => o.hasTag(t as never))) return false;
+      if (Math.abs(o.box.left - left) > sp * 4) return false;
+      const cy = (o.box.top + o.box.bottom) / 2;
+      return sys.staves.some((st) => cy <= st.box.top && cy >= st.box.top - sp * 4);
+    });
+    if (found) hit++;
+  }
+  return hit * 2 > rest.length ? "system" : undefined;
+}
+
