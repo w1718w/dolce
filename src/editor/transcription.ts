@@ -2,14 +2,14 @@
 
 import type { ScoreDoc } from "../model/doc";
 import type { DocFormatId } from "./formats";
-import { emit123 } from "../j123/emit";
+import { emit123 } from "../abcfamily/emit123.entry";
 import { emitAbc } from "../abcfamily/emitabc.entry";
 import { emitJcx } from "../abcfamily/emitjcx.entry";
-import { parse123, parseAbc, parseJcx } from "../j123/parse";
-import { emitJpwabc } from "../model/tojpw";
-import { emitJly } from "../model/tojly";
-import { emitPu } from "../model/topu";
-import { spliceComments } from "../model/relayout";
+import { parse123, parseAbc, parseJcx } from "../abcfamily/parse";
+import { emitJpwabc } from "../convert/jpwabc";
+import { emitJly } from "../jly/tojly";
+import { emitFanqie } from "../fanqie/tofanqie";
+import { spliceComments } from "../jianpu/docrelayout";
 import { keySpelling } from "../model/jianpu";
 import type { TranscriptionOptions, TranscriptionSpelling } from "../model/transcribe";
 import { transcribeScore } from "../model/transcribe";
@@ -126,7 +126,7 @@ export function emitTranscribedSource(format: DocFormatId, oldText: string, oldD
     if (out === null) throw new Error(t("err.noLines"));
     return out;
   }
-  if (format === "pu") return emitPu(doc, doc.puDialect === "tomato" ? "tomato" : "shige");
+  if (format === "fanqie") return emitFanqie(doc, doc.fanqieDialect === "tomato" ? "tomato" : "shige");
   if (format === "jly") return emitJly(doc).text;
   const family = format === "123"
     ? { emit: emit123, parse: parse123 }
