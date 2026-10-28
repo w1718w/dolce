@@ -20,11 +20,13 @@ import { midiOf, NotePreview } from "./preview";
 import type { EditDialect, NoteDuration } from "./dialect";
 import {
   addSustain, clearBeams, deleteEntries, double, dropInlineSustain, type EditCtx, type EditOutcome, groupEnd, halve, insertNote, insertToken,
-  attachedTextOf, chordEntryOf, DYNAMICS, chordNameOf, insertLetter, isError, noteCtx, setAttachedText, setChordName, shiftSemitones, toggleTupletText, spacedInsert, noteSpans, notesIn, setAccidental, setDegree, setLetter, shiftOctave, stepDegree, stepSemitone, toggleDeco, toggleDot, toggleSlur, toggleTie,
+  attachedTextOf, chordEntryOf, DYNAMICS, chordNameOf, insertLetter, isError, noteCtx, retargetToken, setAttachedText, setChordName, shiftSemitones, toggleTupletText, spacedInsert, noteSpans, notesIn, setAccidental, setDegree, setLetter, shiftOctave, stepDegree, stepSemitone, toggleDeco, toggleDot, toggleSlur, toggleTie,
 } from "./ops";
 import { keyHit, VISUAL_ACTIONS, type VisualAction, type VisualMode } from "./keys";
 import { type Clip, clipFor, itemsToText, setClip } from "./clipboard";
 import { beamGroupOf, clipOfChords, directionTextOf, locate, measureCtx } from "../../model/edit";
+import { pitchAt } from "../omrlinks";
+import { showConfirmDialog } from "../dialogs";
 import { moveAttachedText, moveSlurText, shiftLyricText } from "./moves";
 import { harmonyText } from "../../model/jianpu";
 import { showTransposeDialog, transposeText } from "./transpose";
@@ -83,6 +85,10 @@ export interface VisualHost {
   modelEditing(): boolean;
   /** 按代码区当前原文新读一份模型（模型那一路在它上面改） */
   freshModel(): ScoreDoc | null;
+  /** ABC / 123 借道改模型：当前原文读成 MusicXML 形状的模型（元素 id 与索引的相同）；别的格式为 null */
+  bridgeModel?(): ScoreDoc | null;
+  /** 借道改完的模型整份写回当前格式；写不出为 null */
+  bridgeWrite?(doc: ScoreDoc): string | null;
   /** 模型 → 原文（唯一写出端） */
   writeModel(doc: ScoreDoc): string;
   /** 建索引用的那份模型（与 `sync` 同一版） */
@@ -120,9 +126,15 @@ function textsOf(el: Element): SVGTextElement[] {
 /** 方向键能停的条目：音符、增时线、小节线、原文里有符号的换行 */
 const NAVIGABLE = new Set<SyncEntry["kind"]>(["note", "sustain", "barline", "break"]);
 
-/** 只有 `.musicxml`（改模型那一路）做得了的：简谱各格式没有谱号、渐强渐弱、八度线与这几种奏法装饰的写法 */
+/** 改模型那一路的动作（谱号、渐强渐弱、八度线、倚音、奏法装饰、和弦加音、换声部）：`.musicxml` 直接改；
+ *  ABC / 123 借道（`BRIDGED`）——原文读成 MusicXML 形状的模型、照样改、再整份写回这种格式（`VisualHost.bridgeModel`），
+ *  八度线两种格式都没有写法，只给 `.musicxml` */
 const XML_ONLY = new Set(["meas.clef", "meas.clefReread", "wedge.cresc", "wedge.dim", "ottava.up", "ottava.down", "grace.toggle",
   "deco.staccato", "deco.tenuto", "deco.marcato", "deco.staccatissimo", "deco.fermataInv", "deco.trill", "deco.mordent", "deco.turn"]);
+const BRIDGED = new Set([...XML_ONLY, "chord.add", "voice.set"].filter((id) => !id.startsWith("ottava.")));
+/** 123 / ABC 的大谱表（`V:2 part=1`，两条谱表各写一个 `V:`）：小节的增删、拆并、换调号拍号要两条谱表一起改，也借道
+ *  （文本那一路只改选区所在的那个 `V:`，`measureops.ts`） */
+const STAFF_BRIDGED = new Set(["meas.append", "meas.insert", "meas.delete", "meas.key", "meas.keyReread", "meas.time", "bar.insert"]);
 
 export class VisualEditController {
   /** 谱面上显示换行/换页符号。持久化。 */
@@ -166,8 +178,9 @@ export class VisualEditController {
   private textEditing = false;
   /** 插入模式的「当前时值」：新插的音符用它 */
   curDur: NoteDuration = { halvings: 0, dots: 0 };
-  /** 声部输入：插入模式新插的音落在第几声部（`.musicxml` 用；Ctrl+Alt+1–4） */
-  curVoice = 1;
+  /** 声部输入：插入模式新插的音落在光标所在谱表的第几声线（`.musicxml` 用；Ctrl+Alt+1–4）。
+   *  null = 没指定过，跟光标前那个音的声线；换文档回到 null */
+  curVoice: number | null = null;
   /** Alt+点击单独选中的和弦音（从低到高第几个）；`sel` 是选中时的选区，选区一动就作废 */
   private pickedNote: { id: ElementId; index: number; from: number; to: number } | null = null;
 
@@ -366,6 +379,8 @@ export class VisualEditController {
   /** 换了一份文档（打开、导入、识别落地）：弱起重新认。 */
   documentLoaded(): void {
     this.pickups = null;
+    this.curVoice = null;
+    this.bridgeAsked = false;
   }
 
   /** 重排之后（索引重建了）：把换行符号的原文位置交给代码区，再重画谱面叠加层。 */
@@ -408,7 +423,7 @@ export class VisualEditController {
     }
     if (this.modeEl) {
       this.modeEl.hidden = !on;
-      this.modeEl.textContent = this.mode === "edit" ? tr("vis.modeEdit") : tr("vis.modeInsert", { dur: durName(this.curDur) }) + (this.curVoice > 1 ? tr("vis.modeVoice", { n: this.curVoice }) : "");
+      this.modeEl.textContent = this.mode === "edit" ? tr("vis.modeEdit") : tr("vis.modeInsert", { dur: durName(this.curDur) }) + (this.curVoice !== null ? tr("vis.modeVoice", { n: this.curVoice }) : "");
       this.modeEl.dataset.mode = this.mode;
     }
     if (this.paletteEl) {
@@ -732,7 +747,7 @@ export class VisualEditController {
       const at = nl ?? this.host.view.state.selection.main.head;
       this.select(at, at);
       this.pickedBreak = { after: brk.after, sel: at };
-      this.host.setStatus(tr("vis.puBreakSelected"));
+      this.host.setStatus(tr("vis.fanqieBreakSelected"));
       this.refresh();
       return true;
     }
@@ -863,7 +878,7 @@ export class VisualEditController {
   /** 当前格式能不能做这个动作（菜单不列、面板灰掉）。 */
   available(a: VisualAction): boolean {
     const model = this.host.modelEditing();
-    if (a.id === "chord.add" || a.id === "voice.set" || XML_ONLY.has(a.id)) return model;
+    if (a.id === "chord.add" || a.id === "voice.set" || XML_ONLY.has(a.id)) return model || (BRIDGED.has(a.id) && !!this.host.bridgeModel);
     if (a.group === "meas") return model || !!this.host.editDialect()?.measure;
     return true;
   }
@@ -1109,15 +1124,23 @@ export class VisualEditController {
     if (!c) return true;
     const ref = this.selectedEntries().find((e) => e.kind === "note");
     if (!ref) return this.status(tr("ve.altClickNeedsNote"));
-    // 照抄选中的音（连同它的增时线）：简谱的音高从位置推不出来，PhotoScore 的 Alt+点也是复制选中的那一样
-    const tok = c.state.doc.sliceString(ref.from, this.groupEnd(ref));
+    // 照抄选中的音（连同它的增时线）：简谱的音高从位置推不出来，PhotoScore 的 Alt+点也是复制选中的那一样。
+    // 五线谱识别的对照（原文换成了 ABC / 123）给了音高：音头改成点的那个音高，时值照抄
+    let tok = c.state.doc.sliceString(ref.from, this.groupEnd(ref));
     const pos = after ? this.groupEnd(after) : before ? before.from : null;
     if (pos === null) return this.status(tr("ve.cantInsert"));
+    const doc = this.host.syncDoc();
+    const refPitch = sp.pitch && doc ? pitchAt(doc, ref.id) : undefined;
+    if (sp.pitch && refPitch) {
+      const head = retargetToken(c, ref.from, c.state.doc.sliceString(ref.from, ref.to), refPitch, sp.pitch);
+      if (typeof head !== "string") return this.status(head.error);
+      tok = head + tok.slice(ref.to - ref.from);
+    }
     const out = insertToken(c, pos, tok);
     if (isError(out)) return this.apply(out);
     // 选中刚补的那个音（跳过前面补的空格；补丁就这一处，落点就是 `pos`）
     const lead = /^\s*/.exec(out.changes[0]!.insert)?.[0].length ?? 0;
-    return this.apply({ ...out, anchor: pos + lead, head: pos + lead + (ref.to - ref.from) });
+    return this.apply({ ...out, anchor: pos + lead, head: pos + lead + (tok.length - (this.groupEnd(ref) - ref.to)) });
   }
 
   private status(text: string): true {
@@ -1403,7 +1426,7 @@ export class VisualEditController {
     }
     this.select(v.nl, v.nl);
     this.pickedBreak = { after: v.b.after, sel: v.nl };
-    this.host.setStatus(tr("vis.puBreakSelected"));
+    this.host.setStatus(tr("vis.fanqieBreakSelected"));
     this.refresh();
   }
 
@@ -1456,8 +1479,32 @@ export class VisualEditController {
 
   /** 模型那一路（`.musicxml`）向控制器要的东西 */
   private readonly modelCtx: ModelActionCtx = this.makeModelCtx();
+  /** ABC / 123 借道改模型用的上下文：读写换成 `bridgeModel` / `bridgeWrite` */
+  private readonly bridgeCtx: ModelActionCtx = this.makeModelCtx({
+    freshModel: () => this.host.bridgeModel?.() ?? null,
+    writeModel: (doc) => this.host.bridgeWrite?.(doc) ?? this.host.view.state.doc.toString(),
+    // 改完按模型位置认回选区：同一种 MusicXML 形状里认（元素 id 与索引的相同）
+    syncDoc: () => this.host.bridgeModel?.() ?? null,
+  });
+  /** 这份文档借道整份重写已经问过（原文不是标准写法时问一次：注释、手排的换行空格会按标准写法重排） */
+  private bridgeAsked = false;
 
-  private makeModelCtx(): ModelActionCtx {
+  /** 文本格式里有大谱表（某个声部是另一个声部的下一条谱表） */
+  private grandStaffText(): boolean {
+    return !!this.host.syncDoc()?.songs.some((s) => s.parts.some((p) => p.staffOf));
+  }
+
+  private async runBridged(a: VisualAction, key: string): Promise<void> {
+    if (!this.bridgeAsked) {
+      const doc = this.host.bridgeModel?.();
+      const same = doc ? this.host.bridgeWrite?.(doc) === this.host.view.state.doc.toString() : false;
+      if (!same && !(await showConfirmDialog(tr("ve.bridgeTitle"), tr("ve.bridgeBody")))) return;
+      this.bridgeAsked = true;
+    }
+    runModelAction(this.bridgeCtx, a, key);
+  }
+
+  private makeModelCtx(over: Partial<Pick<ModelActionCtx, "freshModel" | "writeModel" | "syncDoc">> = {}): ModelActionCtx {
     const ctl = this;
     return {
       get view() {
@@ -1483,9 +1530,9 @@ export class VisualEditController {
           resolve(value);
         }, hint);
       }),
-      freshModel: () => ctl.host.freshModel(),
-      writeModel: (doc) => ctl.host.writeModel(doc),
-      syncDoc: () => ctl.host.syncDoc(),
+      freshModel: over.freshModel ?? (() => ctl.host.freshModel()),
+      writeModel: over.writeModel ?? ((doc) => ctl.host.writeModel(doc)),
+      syncDoc: over.syncDoc ?? (() => ctl.host.syncDoc()),
       reloadNow: () => ctl.host.reloadNow(),
       setStatus: (t) => ctl.host.setStatus(t),
       select: (f, t) => ctl.select(f, t),
@@ -1557,6 +1604,10 @@ export class VisualEditController {
     if (this.host.modelEditing()) {
       const r = runModelAction(this.modelCtx, a, key);
       if (r !== null) return r;
+    } else if (this.host.bridgeModel && (BRIDGED.has(a.id) || (this.grandStaffText() && (STAFF_BRIDGED.has(a.id)
+      || (a.id.startsWith("del.") && this.selectedEntries().some((e) => e.kind === "barline")))))) {
+      void this.runBridged(a, key);
+      return true;
     }
     switch (a.id) {
       case "note.digit": return this.digit(Number(key));
@@ -2500,8 +2551,9 @@ export class VisualEditController {
     const lyrics = this.host.sync.range(sel.from, sel.to).filter((e) => e.kind === "lyric");
     const ly = exact?.kind === "lyric" ? exact : lyrics[0];
     if (ly && !byMeasure && !endOnly) {
-      const count = lyrics.filter((e) => e.verseNo === ly.verseNo).length;
-      return this.apply(shiftLyricText(c, ly, delta, count > 1 ? count : undefined));
+      // 选中几个字就只挪这几个（打谱软件的方向键都只动选中的东西），选一个字往回挪也只收它自己，与往后挪互逆
+      const count = Math.max(1, lyrics.filter((e) => e.verseNo === ly.verseNo).length);
+      return this.apply(shiftLyricText(c, ly, delta, count));
     }
     if (exact?.kind === "mark" && exact.markKind === "slur" && !byMeasure) return this.apply(moveSlurText(c, exact, which, delta));
     if (exact?.kind === "mark" && exact.markKind !== "slur" && !endOnly && !byMeasure) return this.apply(moveAttachedText(c, exact, delta));

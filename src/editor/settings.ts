@@ -11,12 +11,12 @@ const KEY = "dolce-render-settings";
 /** 存下来的东西。全部可选——旧版本存的数据缺字段是正常的。
  *  取值一律当 unknown 校验（存量数据可能是任何东西）。 */
 export interface PersistedSettings {
-  /** 样式用户层（`App._userLayers`：每个主题一组 `StyleRule`）。交 `sanitizeLayer` 校验。 */
+  /** 样式用户层（`StyleState.layers`：每个主题一组 `StyleRule`）。交 `sanitizeLayer` 校验。 */
   styleLayers?: unknown;
   zoom?: number;
   mixedHideBarNumber?: boolean;
   mixedShowJianpuLayer?: boolean;
-  /** 打开单声部 MusicXML 时：`ask` / `musicxml` / 转换目标（`model/convert.ts`）。App 自己校验 */
+  /** 打开单声部 MusicXML 时：`ask` / `musicxml` / 转换目标（`convert/targets.ts`）。App 自己校验 */
   musicXmlImport?: unknown;
   /** 诗集样式表的手动指定：目录 → 路径（空串 = 不用）。App 自己校验 */
   bookSheets?: unknown;

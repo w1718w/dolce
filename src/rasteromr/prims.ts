@@ -15,7 +15,7 @@
 import type { Binary, Component, Rect } from "../omrkit/types";
 import { SIG_N } from "../omrkit/glyphdict";
 import { connectedComponents } from "../omrkit/ccl";
-import type { RasterUnit } from "./staffline";
+import { lineYAt, type LineGrid, type LineRef, type RasterUnit } from "./staffline";
 import { median } from "../omrkit/geom";
 
 /** 一条直线段（像素坐标）。 */
@@ -57,6 +57,22 @@ const LEFTINK_FRAC = 0.9;
  * ——**两档同向**，与「收竖笔画的宽度闸」那条正好相反。
  */
 const VSEG_MIN_H = 1.4;
+
+/** 竖段在原图上有墨的行至少占这么多（见 `inkCover`）。 */
+const VSEG_INK = 0.6;
+
+/** 竖笔块的盒里，原图上有墨的行占几成（不按中心线取列：干上端连着斜的头边，中心线是斜的，逐行偏出干一两像素）。 */
+function inkCover(bin: Binary, b: Rect): number {
+  let n = 0;
+  for (let y = b.y; y < b.y + b.h; y++) {
+    for (let x = Math.max(0, b.x); x < Math.min(bin.w, b.x + b.w); x++)
+      if (bin.data[y * bin.w + x]) {
+        n++;
+        break;
+      }
+  }
+  return n / Math.max(1, b.h);
+}
 
 /** 一条符杠：拟合出来的中心线加包围盒。 */
 /** 谱表外不到这么多格宽的「杠」要两端都连着干才算（见 `findPrims` 里符杠那一段）。 */
@@ -103,15 +119,17 @@ function runLengths(bin: Binary, vertical: boolean): Uint16Array {
 
 /** 逐像素的纵向游程长度。 */
 const vRuns = (bin: Binary): Uint16Array => runLengths(bin, true);
+/** 竖段放宽横宽的竖向游程下限（格，见「又长又直的墨按 0.3 格收」）：谱表高 4 格，留点断口余量。 */
+const VBAR_LEN = 3.8;
 
 /** 本页谱线的实测厚度：各谱线 y 上逐列（每隔三列）取竖游程，取九成分位（只取不到 0.4 格的，压着符号的不算）。
  *  不取中位数：扫描件的线粗细不匀（望十架 2~3 像素，中位数 2）。 */
-function measuredLineThick(bin: Binary, vr: Uint16Array, lineYs: number[], unit: RasterUnit): number {
+function measuredLineThick(bin: Binary, vr: Uint16Array, lines: LineRef[], unit: RasterUnit): number {
   const ts: number[] = [];
-  for (const ly of lineYs) {
-    const y = Math.round(ly);
-    if (y < 0 || y >= bin.h) continue;
+  for (const l of lines) {
     for (let x = 0; x < bin.w; x += 3) {
+      const y = Math.round(lineYAt(l, x));
+      if (y < 0 || y >= bin.h) continue;
       const t = vr[y * bin.w + x];
       if (t > 0 && t <= unit.space * 0.4) ts.push(t);
     }
@@ -272,6 +290,13 @@ function narrowPart(mask: Uint8Array, w: number, c: Component, lw: number, unit:
   return { x0: x, y0: best[0], x1: x, y1: best[1] - 1, lw: maxW, maxLw: maxW };
 }
 
+/** 窄竖段按墨迹裁端时一端最多裁掉这么多格（见 `findPrimitives` 竖笔画那段）。 */
+const TIP_TRIM = 1;
+/** 裁掉的那截与留下的之间至少空这么多格（见同处）。 */
+const TIP_GAP = 0.25;
+/** 断口宽、断口外那截不直的，裁得更长：远端那截至多这么多格（见 `cutFarTip`） */
+const TIP_TRIM_FAR = 2.5;
+
 /**
  * 竖段按**原图墨迹**收拢：闭运算会跨过空白把干接到别的笔画上——两端补出来的空白行裁掉
  * （主使我喜乐 m8 干顶上方的和弦字母「A」），断口外离谱表 2 格以外的那截墨也裁掉
@@ -408,47 +433,6 @@ function strictlyIsolated(bin: Binary, s: LineSeg): boolean {
   return n > 0 && a <= n * 0.25;
 }
 
-/** 一行谱的线距与全页的相对差在这个范围里，加线网格才用它自己的线距（见 `ledgerGrid`）。 */
-const LEDGER_OWN_SPACE = [0.04, 0.3];
-
-/**
- * 「这个 y 落在谱线网格的延长线上吗」——判加线用。
- *
- * 加线是谱表的延长：只可能出现在第一线**上方**或第五线**下方**整数个线距处。
- * 容差取四分之一线距（谱线本身实测偏差不到 0.2px，位图上加线也贴着网格画）。
- */
-export function ledgerGrid(lineYs: number[], unit: RasterUnit): (y: number) => boolean {
-  if (lineYs.length < 5) return () => false;
-  // 逐行谱取它的第一线与第五线（`lineYs` 是全页的线，五条一组）
-  const anchors: number[] = [];
-  const sorted = [...lineYs].sort((a, b) => a - b);
-  for (let i = 0; i + 4 < sorted.length; i += 5) {
-    anchors.push(sorted[i], sorted[i + 4]);
-  }
-  return (y: number) => {
-    for (let i = 0; i < anchors.length; i += 2) {
-      const top = anchors[i];
-      const bottom = anchors[i + 1];
-      // **线距取这一行谱自己的**，不取全页的：一页上谱表大小可以不一样（望十架人声谱表线距 10.4px、钢琴 11.6px），
-      // 拿全页的线距往外推，小谱表的第二条加线就偏出两三像素、出了容差——骑在上面的头不算骑着加线，
-      // 加线也补不出来，谱表外的音整批挂不上谱表。只在这一行的线距与全页的差出 4% 以上时才换：差得小的是量线位的
-      // 半像素误差（一行只有五条线，全页的中位数更准；一律用自己的，以马内利来临歌、高举主大能各错一两个音），
-      // 差到三成以上的是谱行找错了。
-      const own = (bottom - top) / 4;
-      const d = Math.abs(own - unit.space) / unit.space;
-      const sp = d > LEDGER_OWN_SPACE[0] && d < LEDGER_OWN_SPACE[1] ? own : unit.space;
-      const tol = sp * 0.25;
-      if (y < top) {
-        const k = Math.round((top - y) / sp);
-        if (k >= 1 && k <= 6 && Math.abs(top - k * sp - y) <= tol) return true;
-      } else if (y > bottom) {
-        const k = Math.round((y - bottom) / sp);
-        if (k >= 1 && k <= 6 && Math.abs(bottom + k * sp - y) <= tol) return true;
-      }
-    }
-    return false;
-  };
-}
 
 /** 正好盖满谱表的竖段续出去的那截里，横向墨至少这么宽（格）才算续进了符头，见 `extendVSegs`。 */
 const EXACT_HEAD_W = 0.6;
@@ -472,14 +456,16 @@ const EXACT_HEAD_W = 0.6;
  * 续的时候看中心线左右各一列（符干只有一两个像素宽，中心线是拟合出来的，
  * 只看一列会被半像素的偏差卡住）。碰到白就停——不跨空隙，所以续不出别的符号。
  */
-export function extendVSegs(bin: Binary, segs: LineSeg[], cap: number, staffBands: [number, number][] = [], lineThick = 1): LineSeg[] {
+export function extendVSegs(bin: Binary, segs: LineSeg[], cap: number, staffBands: ((x: number) => [number, number])[] = [], lineThick = 1): LineSeg[] {
   // **正好从第五线画到第一线的**（`barlineCore` / `bandColumns` 取出的）续出去的那截要**进了符头**才留：
   // 连线收尾弯进小节线下端，续出 5px（0.35 格）就过不了 `findBarlines` 的「出界端须落谱线」
   //（我一生要赞美你第六、七行各漏一刀）；而和弦的长符干正要靠续进上下两端的头伸出谱表，
   // 才不被收成小节线（一律封顶 0.2 格，万古磐石歌多切两刀）。续出段里（谱线那几行不算）
   // 有一行横向墨宽过 `EXACT_HEAD_W` 算进了头；或者**笔直延续**（符杠下的长符干，同曲 x=1602 上下各伸出半格）
   // 也留。连线收尾只有一笔宽、又斜着偏开。
-  const bandOf = (s: LineSeg) => staffBands.find(([t, b]) => Math.abs(Math.min(s.y0, s.y1) - t) <= 1 && Math.abs(Math.max(s.y0, s.y1) - b) <= 1);
+  // 谱表首末线按段所在 x 取（弯、斜的谱线：`bandColumns` 取出的段两端就是该列的首末线）
+  const bandOf = (s: LineSeg) =>
+    staffBands.map((f) => f((s.x0 + s.x1) / 2)).find(([t, b]) => Math.abs(Math.min(s.y0, s.y1) - t) <= 1 && Math.abs(Math.max(s.y0, s.y1) - b) <= 1);
   return segs.map((s) => {
     const out = { ...s };
     extendIntoInk(bin, out, cap);
@@ -497,6 +483,42 @@ export function extendVSegs(bin: Binary, segs: LineSeg[], cap: number, staffBand
 }
 
 /** 从 `from` 到 `to`（含，任一方向）每行都有墨、墨段中心离 `x` 不过 1px 且不漂、宽不过线宽加 2：竖笔笔直往外延续。 */
+/**
+ * 竖段两端**隔着半格以上空白接上的、不笔直的一截**裁掉（离端 `TIP_TRIM_FAR` 格以内找断口）：闭运算跨过空白把小节线下端
+ * 接上了小节号「3」（望十架预览 p1 m2/m3，出界端落不到谱线、读成符干，两小节并成一个）。
+ * 断口外那截笔直的（小节线在两行之间的一段、扫描断开的长干）不裁。只给盖满一行谱的段用（见调用处）。
+ */
+function cutFarTip(bin: Binary, s: LineSeg, unit: RasterUnit): LineSeg {
+  const { w, data } = bin;
+  const x = Math.round((s.x0 + s.x1) / 2);
+  const half = Math.ceil(s.maxLw / 2);
+  const on = (y: number) => {
+    for (let xx = Math.max(0, x - half); xx <= Math.min(w - 1, x + half); xx++) if (data[y * w + xx]) return true;
+    return false;
+  };
+  const out = { ...s };
+  const top = Math.round(Math.min(s.y0, s.y1));
+  const bot = Math.round(Math.max(s.y0, s.y1));
+  const reach = Math.round(unit.space * TIP_TRIM_FAR);
+  const minGap = unit.space * 0.5;
+  for (const dir of [1, -1] as const) {
+    const end = dir > 0 ? bot : top;
+    // 远端那截：从端点往回连着墨的几行
+    let y = end;
+    while (Math.abs(y - end) < reach && on(y)) y -= dir;
+    const farEnd = y + dir;
+    if (Math.abs(farEnd - end) >= reach || farEnd === end + dir) continue;
+    let gap = 0;
+    while (Math.abs(y - end) < reach * 2 && !on(y)) (gap++, (y -= dir));
+    if (gap < minGap || Math.abs(y - end) >= reach * 2) continue;
+    if (straight(bin, x, end, farEnd, s.maxLw)) continue;
+    // y 是断口内侧第一行墨
+    if (dir > 0) (s.y1 >= s.y0 ? (out.y1 = y) : (out.y0 = y));
+    else (s.y0 <= s.y1 ? (out.y0 = y) : (out.y1 = y));
+  }
+  return out;
+}
+
 function straight(bin: Binary, x: number, from: number, to: number, lw: number): boolean {
   const { w, h, data } = bin;
   const cx = Math.round(x);
@@ -594,7 +616,8 @@ function barlineCore(mask: Uint8Array, w: number, c: Component, bands: [number, 
 function bandColumns(
   bin: Binary,
   vMask: Uint8Array,
-  bands: [number, number][],
+  /** 各行谱在 x 处的上下界（谱线弯、斜时随 x 变） */
+  bands: ((x: number) => [number, number])[],
   have: LineSeg[],
   maxW: number,
   staffLefts: number[],
@@ -602,11 +625,12 @@ function bandColumns(
 ): LineSeg[] {
   const { w, data } = bin;
   const out: LineSeg[] = [];
-  for (const [t, bt] of bands) {
-    const top = Math.round(t), bot = Math.round(bt);
-    const need = (bot - top + 1) * 0.95;
-    const thinNeed = (bot - top + 1) * 0.75;
+  for (const bandAt of bands) {
     const full = (x: number) => {
+      const [t, bt] = bandAt(x);
+      const top = Math.round(t), bot = Math.round(bt);
+      const need = (bot - top + 1) * 0.95;
+      const thinNeed = (bot - top + 1) * 0.75;
       let n = 0;
       let m = 0;
       for (let y = top; y <= bot; y++) {
@@ -622,6 +646,8 @@ function bandColumns(
       const cx = (x0 + x) / 2;
       const width = x - x0 + 1;
       if (width > maxW) continue;
+      const [t, bt] = bandAt(cx);
+      const top = Math.round(t), bot = Math.round(bt);
       if (staffLefts.some((l) => cx >= l - unit.space && cx <= l + unit.space * 4)) continue;
       const near = have.some(
         (s) => Math.abs((s.x0 + s.x1) / 2 - cx) <= unit.space * 0.5 && Math.min(s.y0, s.y1) <= bot && Math.max(s.y0, s.y1) >= top,
@@ -663,7 +689,8 @@ function bandColumns(
 export function findPrimitives(
   bin: Binary,
   unit: RasterUnit,
-  staffLineYs: number[] = [],
+  /** 全页谱线网格（不给 = 没有谱线：加线、跨谱表判据都不成立） */
+  grid: LineGrid | null = null,
   /** 各谱行的左缘 x。**系统线按位置豁免孤立性判据**——它就画在谱行左缘，
    *  紧贴它的花括号会让「两侧有没有邻墨」判它属于某个符号，
    *  于是整页的系统线一条都抽不出来，十行谱碎成十个系统
@@ -673,23 +700,20 @@ export function findPrimitives(
   faint = false,
 ): RasterPrims {
   const { w, h } = bin;
-  const onGrid = ledgerGrid(staffLineYs, unit);
+  const onGrid = (y: number, x?: number) => !!grid && grid.ledger(y, x);
   const atStaffLeft = (x: number) => staffLefts.some((l) => Math.abs(x - l) <= Math.max(3, unit.lineThick * 2));
   // **正好从一行谱的第一线画到第五线**（两端各 ±0.5 格）、又不在行首四格里的竖段：这是小节线的样子，
   // 不查孤立性。反复记号的细线右边紧挨着一道粗线（网纹印的粗线还过不了「细」这一闸），
   // 孤立性判它属于某个符号，整条抽不出来，两小节并成一个（《向主唱新歌》第 14 小节末）。
   // 谱号的中央竖笔上下都伸出谱表，升号、拍号的竖笔没有一整个谱表高，都不沾这一条。
-  const staffBands: [number, number][] = [];
-  {
-    const ys = [...staffLineYs].sort((a, b) => a - b);
-    for (let i = 0; i + 4 < ys.length; i += 5) staffBands.push([ys[i], ys[i + 4]]);
-  }
+  // 各行谱在 x 处的上下界（谱线弯、斜时随 x 变）
+  const bandsAt = (x: number): [number, number][] => (grid ? grid.bands(x) : []);
   const spansStaff = (sg: LineSeg) => {
     const x = (sg.x0 + sg.x1) / 2;
     if (staffLefts.some((l) => x >= l - unit.space && x <= l + unit.space * 4)) return false;
     const t = Math.min(sg.y0, sg.y1);
     const b = Math.max(sg.y0, sg.y1);
-    return staffBands.some(([top, bot]) => Math.abs(t - top) <= unit.space * 0.5 && Math.abs(b - bot) <= unit.space * 0.5);
+    return bandsAt(x).some(([top, bot]) => Math.abs(t - top) <= unit.space * 0.5 && Math.abs(b - bot) <= unit.space * 0.5);
   };
   const vr = vRuns(bin);
   const hr = hRuns(bin);
@@ -714,14 +738,14 @@ export function findPrimitives(
     // 试过把水平闭运算的半径从 0.6 格放到 1.0/1.5 格把两截接起来，**更差**
     //（音符 28.5% → 25.2% / 21.8%）：半径一大，别处不相干的横笔画也被连成一条。
     const cy = c.bbox.y + c.bbox.h / 2;
-    if (c.bbox.w < (onGrid(cy) ? unit.space / 3 : unit.space)) continue;
+    if (c.bbox.w < (onGrid(cy, c.bbox.x + c.bbox.w / 2) ? unit.space / 3 : unit.space)) continue;
     if (c.bbox.h > thin * 2) continue; // 太厚：不是单条横线（是几条粘在一起或别的东西）
     const seg = centerLine(hMask, w, c, true);
     // **加线免检**：加线总有个符头压在上面，孤立性判据一律判它「属于某个符号」，
     // 于是既抽不出来（`findLegers` 没得用）、也抹不掉（符头连着加线，
     // 宽度从 1.3 格涨到 1.77 格，字典里凭空多出两个三百多实例的「符头」大类）。
     // 加线有一条更硬的判据：它只出现在**谱线网格的延长线**上。
-    if (!onGrid((seg.y0 + seg.y1) / 2) && !isolated(bin, seg, false)) continue;
+    if (!onGrid((seg.y0 + seg.y1) / 2, (seg.x0 + seg.x1) / 2) && !isolated(bin, seg, false)) continue;
     hSegs.push(seg);
   }
 
@@ -732,7 +756,27 @@ export function findPrimitives(
   // 只认 `faint`，不按线宽/线距比判：干净位图你要等候也是 1px/18.75px，照放宽的话
   // 符头、符尾的竖边混进竖段，合唱谱干净档小节自检 59.5 → 58.4（该曲 35.6 → 31.3）。
   const thinV = faint ? Math.max(thin, unit.space * 0.3) : thin;
-  for (let i = 0; i < vMask0.length; i++) if (hr[i] && hr[i] <= thinV) vMask0[i] = 1;
+  // **又长又直的墨按 0.3 格收**：竖向游程过一个谱表高（`VBAR_LEN` 格）的，横宽放到 0.3 格。线宽量成 2 的细线页上「细」只有 4px，
+  // 5~6px 的小节线进不了竖段（新编 f04、205 整系统丢小节线）；推平时代线宽量成 3、上限 6px，同一根线收得进来。
+  // 头、杠、字那几行横宽远过 0.3 格，长度条件又挡住了符头、符尾的竖边。
+  // 还要**整段都粗**：上下各 1.5 格里八成的行也不窄于「细」的上限——干只在接符尾的几行变粗，放进来干尖残墨就成了假头（当我们回到天家 m3 多出 D5）；
+  // 0.75 格时两个叠着的空心头圈沿连着干也凑得够（父恩广大 m14 低音 C3/E3 二分丢了干读成全音符），窗口要罩得到圈沿外的细干
+  const thinBar = Math.max(thinV, unit.space * 0.3);
+  const barLen = unit.space * VBAR_LEN;
+  const reachY = Math.round(unit.space * 1.5);
+  const thickAround = (i: number): boolean => {
+    const x = i % w, y = (i - x) / w;
+    let n = 0, k = 0;
+    // 只数有墨的行：窗口伸出小节线两端的白行不算
+    for (let yy = Math.max(0, y - reachY); yy <= Math.min(h - 1, y + reachY); yy++) {
+      const r = hr[yy * w + x];
+      if (!r) continue;
+      n++;
+      if (r >= thinV && r <= thinBar) k++;
+    }
+    return k >= n * 0.8;
+  };
+  for (let i = 0; i < vMask0.length; i++) if (hr[i] && (hr[i] <= thinV || (hr[i] <= thinBar && vr[i] >= barLen && thickAround(i)))) vMask0[i] = 1;
   const vMask = close1d(vMask0, w, h, Math.round(unit.lineThick * 2), false);
   const vSegs: LineSeg[] = [];
   /** 叠头和弦的短干（见下），单独交出去 */
@@ -740,33 +784,58 @@ export function findPrimitives(
   for (const c of comps(vMask, w, h, Math.max(3, unit.lineThick * 2))) {
     if (c.bbox.h < unit.space * VSEG_MIN_H) continue;
     if (c.bbox.w > thinV * 2) {
-      const core = barlineCore(vMask, w, c, staffBands, thinV * 2, unit);
+      const cbands = bandsAt(c.bbox.x + c.bbox.w / 2);
+      const core = barlineCore(vMask, w, c, cbands, thinV * 2, unit);
       if (core && !atStaffLeft(core.x0) && !staffLefts.some((l) => core.x0 >= l - unit.space && core.x0 <= l + unit.space * 4)) vSegs.push(core);
       else if (!core) {
         // 竖向闭运算跨过符杠，把上方和弦字母的斜笔接到了符干上（主使我喜乐 m8 那个「A」下的 A4）：取窄的那一段
         // 行宽按这块自己的众数放宽（按细笔上限放的话，贴干的头边也收进来，干粗到 8px：高举主大能 m7 F3 丢了）
-        const narrow = inkRun(bin, narrowPart(vMask, w, c, modalRowWidth(vMask, w, c), unit), unit, staffBands);
+        const narrow = inkRun(bin, narrowPart(vMask, w, c, modalRowWidth(vMask, w, c), unit), unit, cbands);
         if (narrow && !atStaffLeft(narrow.x0) && isolated(bin, narrow, true)) vSegs.push(narrow);
         else if (!narrow) {
           // 不到 `NARROW_STEM` 的（叠头和弦的干，头以下只剩 2.9 格）要有一截光杆（`cleanTail`）
-          const short = inkRun(bin, narrowPart(vMask, w, c, modalRowWidth(vMask, w, c), unit, CLEAN_TAIL), unit, staffBands);
+          const short = inkRun(bin, narrowPart(vMask, w, c, modalRowWidth(vMask, w, c), unit, CLEAN_TAIL), unit, cbands);
           if (short && !atStaffLeft(short.x0) && cleanTail(bin, short, unit)) shortStems.push(alongInk(bin, short, unit.space * CLEAN_TAIL));
         }
       }
       continue;
     }
     const seg = centerLine(vMask, w, c, false);
+    // **原图上这一列大半是白的不是笔画**：竖向闭运算跨过了几处断口，几条加线左端毛边上的短横墨（横游程不过细线上限）
+    // 被接成一根「干」（是爱 p5 m69 F6 头左下三条加线的左端，33px 里有墨的只 14 行），挂上头就多出一个朝下的声部。
+    // 盖满谱表的（虚线小节线）不管
+    if (!spansStaff(seg) && inkCover(bin, c.bbox) < VSEG_INK) continue;
     // 谱行左缘那条（系统线）免检，其余要判孤立性——谱号的中央竖笔、升号的竖笔不是原语
     if (!atStaffLeft((seg.x0 + seg.x1) / 2) && !spansStaff(seg) && !isolated(bin, seg, true)) {
       // 只在原窗里有一根盖满谱表的整列（小节线）时按窄段重判：只因某一行偏宽、原本被别的邻墨判不孤立的块
       // 也放进来的话，破碎干净版满拍自检 64.8 → 58.2
       const narrow = narrowPart(vMask, w, c, seg.lw, unit);
-      if (narrow && isolated(bin, narrow, true) && barColumnNear(bin, (seg.x0 + seg.x1) / 2, seg.maxLw, staffBands)) vSegs.push(narrow);
+      if (narrow && isolated(bin, narrow, true) && barColumnNear(bin, (seg.x0 + seg.x1) / 2, seg.maxLw, bandsAt((seg.x0 + seg.x1) / 2))) vSegs.push(narrow);
       continue;
     }
-    vSegs.push(seg);
+    // 窄块也按原图墨迹裁两端，只裁短的一截（连断口在内 `TIP_TRIM` 格以内）：闭运算跨过断口把弧尾接到加线上方二分头的干顶
+    // （望十架 p7 m57 长笛 C6，头离干端过远挂不上、读成全音符）；长的那截多是小节线在两行之间的一段，裁了小节线就丢（破碎扫描 p3 m30）
+    // 断口要够宽（`TIP_GAP` 格）：谱表外的长干扫描时断一两个像素，裁了干就短一截（齐来谢主歌 P2 m7 低音 F2 跟着丢）
+    const sbands = bandsAt((seg.x0 + seg.x1) / 2);
+    const ink = inkRun(bin, seg, unit, sbands);
+    const blankRows = (y0: number, y1: number) => {
+      const x = Math.round(seg.x0);
+      const half = Math.ceil(seg.maxLw / 2);
+      let n = 0;
+      for (let y = Math.round(y0); y < Math.round(y1); y++) {
+        let on = false;
+        for (let xx = Math.max(0, x - half); xx <= Math.min(w - 1, x + half) && !on; xx++) on = bin.data[y * w + xx] === 1;
+        if (!on) n++;
+      }
+      return n;
+    };
+    const trimOk = (cut: number, a: number, b: number) => cut <= 0 || (cut <= unit.space * TIP_TRIM && blankRows(a, b) >= unit.space * TIP_GAP);
+    const kept = ink && trimOk(ink.y0 - seg.y0, seg.y0, ink.y0) && trimOk(seg.y1 - ink.y1, ink.y1 + 1, seg.y1 + 1) ? ink : seg;
+    // 只裁盖满一行谱的（小节线候选）：符干动了会改歌词条的取图
+    const spans = sbands.some(([t, b]) => Math.min(kept.y0, kept.y1) <= t + unit.space * 0.5 && Math.max(kept.y0, kept.y1) >= b - unit.space * 0.5);
+    vSegs.push(spans ? cutFarTip(bin, kept, unit) : kept);
   }
-  vSegs.push(...bandColumns(bin, vMask, staffBands, vSegs, thinV, staffLefts, unit));
+  vSegs.push(...bandColumns(bin, vMask, grid ? grid.staves.filter((st) => st.length >= 5).map((st) => (x: number): [number, number] => [lineYAt(st[0], x), lineYAt(st[4], x)]) : [], vSegs, thinV, staffLefts, unit));
 
   // ── 符杠 ──
   const bMask = new Uint8Array(w * h);
@@ -848,25 +917,46 @@ export function findPrimitives(
     // 只管谱表外、不到两格半的：谱表里的短杠照旧，长杠不会是一个头。
     // 只在线宽过线距两成的页判：细线页的加线过不了厚度闸、不会并进来，而那里干抽不全的真短杠会被这一条误杀
     //（不限线宽时独唱谱时值 97.52 → 96.96%、合唱谱干净档小节自检 88.62 → 86.34%）。
-    if (!shortBeam && unit.lineThick > unit.space * LEDGER_BEAM_THICK && c.bbox.w < unit.space * LEDGER_BEAM_W && !staffBands.some(([t, b]) => c.bbox.y + c.bbox.h / 2 > t - unit.space * 0.3 && c.bbox.y + c.bbox.h / 2 < b + unit.space * 0.3)) {
+    // 细线页上手写的加线也会画得粗（是爱 p1 m1、p3 m31/m46 加一线上的 A5：线 3px、加线 5~6px，头连加线收成一截 1.6 格的杠，头被抹掉）：
+    // 那里要**两头外**都接着细横墨（厚不过线宽两倍），比粗线页那一档（一头就够）多一道证据
+    const thickPage = unit.lineThick > unit.space * LEDGER_BEAM_THICK;
+    if (!shortBeam && c.bbox.w < unit.space * LEDGER_BEAM_W && !bandsAt(c.bbox.x + c.bbox.w / 2).some(([t, b]) => c.bbox.y + c.bbox.h / 2 > t - unit.space * 0.3 && c.bbox.y + c.bbox.h / 2 < b + unit.space * 0.3)) {
       const xa = stemNear(c.bbox.x, c.bbox, tol);
       const xb = stemNear(c.bbox.x + c.bbox.w - 1, c.bbox, tol);
       // 还要看得见加线：块的左端或右端往外三成格处有一道细横墨（厚不过谱线的一倍半）。真短杠两头之外是白的
       //（只看干时救主降生一条干没抽全的短杠被误杀，音符 98.5 → 96.9%）
       const d = Math.max(2, Math.round(unit.space * 0.3));
       // 那道细横墨还得落在谱线网格的延长线上、离谱表不过四格半（歌词带里的横笔两头也是细的）
-      const nearStaff = staffBands.some(([t, b]) => c.bbox.y + c.bbox.h > t - unit.space * 4.5 && c.bbox.y < b + unit.space * 4.5);
-      const thinAt = (x: number) => {
+      const nearStaff = bandsAt(c.bbox.x + c.bbox.w / 2).some(([t, b]) => c.bbox.y + c.bbox.h > t - unit.space * 4.5 && c.bbox.y < b + unit.space * 4.5);
+      const thinAt = (x: number, k = 1.5) => {
         if (x < 0 || x >= w || !nearStaff) return false;
         for (let y = Math.max(0, c.bbox.y - 1); y <= Math.min(h - 1, c.bbox.y + c.bbox.h); y++)
-          if (bin.data[y * w + x] && vr[y * w + x] <= unit.lineThick * 1.5 && onGrid(y)) return true;
+          if (bin.data[y * w + x] && vr[y * w + x] <= unit.lineThick * k && onGrid(y, x)) return true;
         return false;
       };
-      const ledgerTail = thinAt(c.bbox.x - d) || thinAt(c.bbox.x + c.bbox.w - 1 + d);
+      const ledgerTail = thickPage
+        ? thinAt(c.bbox.x - d) || thinAt(c.bbox.x + c.bbox.w - 1 + d)
+        : [-1, 1].every((dir) => {
+            // 手写加线探出头外常只有两三像素：端外 2 像素到 0.3 格之间任一列有就算
+            const end = dir < 0 ? c.bbox.x : c.bbox.x + c.bbox.w - 1;
+            for (let k = 2; k <= d; k++) if (thinAt(end + dir * k, 2)) return true;
+            return false;
+          });
       // 块自己得比一条线厚（四成格以上；头贴着加线的那一块量得半格上下）：只有线那么薄的是一道横线（歌词的延长线、单独一截粗加线），不是「头连着加线」。
       // 高举主大能有一道 26×3 的横线过了前面几条，不再算符杠之后留在歌词条里，那一行歌词读坏（中文 94 → 70%，
       // 当时被旧的 OCR 缓存盖住没显出来）
-      if (c.bbox.h >= unit.space * 0.4 && ledgerTail && (xa === null || xb === null || xb - xa < unit.space * 0.7)) continue;
+      // 细线页上块里厚过 0.4 格的列合起来不过一个半格（一个头那么宽）：头连加线是中间鼓的一个头；谱表外一截真短杠一路一样厚
+      //（新编赞美诗 186 m4 谱表下 B3、A3 两个八分的杠，两端碰着加线，厚段 1.68 格；是爱手写头连加线 0.9~1.2 格）
+      const headWide = () => {
+        let n = 0;
+        for (let x = c.bbox.x; x < c.bbox.x + c.bbox.w; x++) {
+          let k = 0;
+          for (let y = c.bbox.y; y < c.bbox.y + c.bbox.h; y++) if (bin.data[y * w + x]) k++;
+          if (k >= unit.space * 0.4) n++;
+        }
+        return n <= unit.space * 1.5;
+      };
+      if (c.bbox.h >= unit.space * 0.4 && ledgerTail && (thickPage || headWide()) && (xa === null || xb === null || xb - xa < unit.space * 0.7)) continue;
     }
     const line = centerLine(bMaskC, w, c, true);
     // **杠厚要匀**：低分辨率页上一串八分的头沿谱线挨个粘成一条（有一位神 m4 五个 B4），过得了宽度与长宽比，
@@ -874,7 +964,7 @@ export function findPrimitives(
     //（去掉 1.5 格以上的干列），中位厚过 `BEAM_EVEN_MED` 格、而第一成分位不到中位的 `BEAM_EVEN_LO` 的不收。
     // 网点灰的真杠纹理也有洞（下分位 0.3~0.6），但中位厚正常（0.54 格），靠中位那一条放过。只在谱表上下三格内判：
     // 页眉的粗体字也有这种剖面，剔掉后它的墨改走别的路，连带把拍号数字认成符头（齐来崇拜）。
-    if (!shortBeam && staffBands.some(([t, b]) => c.bbox.y + c.bbox.h / 2 > t - unit.space * 3 && c.bbox.y + c.bbox.h / 2 < b + unit.space * 3)) {
+    if (!shortBeam && bandsAt(c.bbox.x + c.bbox.w / 2).some(([t, b]) => c.bbox.y + c.bbox.h / 2 > t - unit.space * 3 && c.bbox.y + c.bbox.h / 2 < b + unit.space * 3)) {
       const ts: number[] = [];
       const trim = Math.round(unit.space * 0.3);
       for (let x = c.bbox.x + trim; x < c.bbox.x + c.bbox.w - trim; x++) {
@@ -888,6 +978,33 @@ export function findPrimitives(
     }
     beams.push({ ...line, box: c.bbox });
   }
+  // 陡杠的斜率按相对谱线算：弯、斜的页上杠跟着谱线一起歪。取离杠中点最近那行谱中线在这一处的斜率，平直的页上是 0
+  const staffSlope = (x: number, y: number) => {
+    if (!grid?.curved) return 0;
+    let best = 0;
+    let bd = Infinity;
+    for (const st of grid.staves) {
+      if (st.length < 5) continue;
+      const d = Math.abs(lineYAt(st[2], x) - y);
+      if (d < bd) {
+        bd = d;
+        best = (lineYAt(st[2], x + unit.space) - lineYAt(st[2], x - unit.space)) / (2 * unit.space);
+      }
+    }
+    return best;
+  };
+  steepBeams(vr, bLo, bHi, w, h, beams, unit, staffSlope, (x, y) => {
+    const tol = Math.max(2, unit.lineThick * 2);
+    // 干端常停在谱线上（去线时断开），杠端在线下半格内
+    const gap = Math.max(2, unit.space * 0.5);
+    if (vSegs.some((v) => Math.abs((v.x0 + v.x1) / 2 - x) <= tol && Math.min(v.y0, v.y1) <= y + gap && Math.max(v.y0, v.y1) >= y - gap)) return true;
+    // 手写干这时常还没抽成竖段（被头团、杠切开，要到 `beamStems` 才从杠上补出来）：杠端旁有一道 `STEEP_STEM_RUN` 格以上的竖墨也算
+    //（是爱 p3 m46 钢琴右手十六分，组里四根干只有第一根抽出了竖段）
+    const run = unit.space * STEEP_STEM_RUN;
+    for (let yy = Math.max(0, Math.round(y - gap)); yy <= Math.min(h - 1, Math.round(y + gap)); yy++)
+      for (let xx = Math.max(0, Math.round(x - tol)); xx <= Math.min(w - 1, Math.round(x + tol)); xx++) if (vr[yy * w + xx] >= run) return true;
+    return false;
+  });
   // **网点灰的杠被纹理横着切成上下两条**（当我们回到天家 m12：一条杠读成高 3、高 4 两条），被当成两层，
   // 附点八分读成十六分。x 范围基本重合、上下间隙不过一个线宽、合起来不过一根杠厚（0.8 格）的并成一条
   // 独唱谱时值 92.21 → 92.31%（当我们回到天家 +3.2），合唱谱扫描档音符 +0.11、小节自检 +0.27。
@@ -912,10 +1029,92 @@ export function findPrimitives(
     }
   dropHeadEndBeams(beams, vSegs, unit);
   beams.push(...partialBeams(bin, beams, unit, vSegs));
-  vSegs.push(...beamStems(bin, beams, vSegs, unit, staffLineYs));
+  vSegs.push(...beamStems(bin, beams, vSegs, unit, grid));
   // 杠上补出的干也能揭出头那一端的假杠，再剔一遍
   dropHeadEndBeams(beams, vSegs, unit);
   return { hSegs, vSegs, beams, shortStems };
+}
+
+/** 陡斜杠：沿这几种斜率量游程（横一格的落差，格/格）；比 `STEEP_SLOPES[0]` 平的杠横向游程够长，走上面那一路。 */
+const STEEP_SLOPES = [0.3, 0.4, 0.5, 0.65, 0.8];
+/** 陡斜杠沿斜向的游程横跨至少这么多格。 */
+const STEEP_RUN = 1.5;
+/** 陡斜杠的端头没有竖段时，旁边的竖墨至少这么多格才算干（见 `steepBeams` 的 `stemAt`）。 */
+const STEEP_STEM_RUN = 1.5;
+/** 陡斜杠中心线的斜率下限：再平的上面那一路收得到。 */
+const STEEP_MIN = 0.25;
+
+/**
+ * **陡斜的杠**（手写刻谱：是爱 p5 m69 钢琴右手八度双音，上下两组杠斜率 0.35~0.4、厚 0.4 格）：
+ * 横向游程只有一格上下，一半的行过不了「≥ 一格」那道闸，杠碎成几截，过不了宽度闸，
+ * 杠就被当成左边那根干的八分符尾，右边那个音没了杠读成四分；碎成上下两截的还被当成两层，八分读成十六分。
+ *
+ * 杠厚的像素（`vr` 在杠厚范围里）沿 `STEEP_SLOPES` 几种斜率逐条斜线量游程，横跨 `STEEP_RUN` 格以上的收进掩模，
+ * 连通块要宽 1.5 格以上、中心线相对所在谱行的谱线够陡（`STEEP_MIN`）、平均厚像杠，且**两端都搭着干**——弧线、歌词笔画也会斜着长，
+ * 两头都落在干上的只有杠。收下的杠把压在它上面的碎截（横向那一路收的）换掉。
+ */
+function steepBeams(vr: Uint16Array, bLo: number, bHi: number, w: number, h: number, beams: BeamQuad[], unit: RasterUnit, staffSlope: (x: number, y: number) => number, stemAt: (x: number, y: number) => boolean): void {
+  const sp = unit.space;
+  const cand = new Uint8Array(w * h);
+  for (let i = 0; i < cand.length; i++) if (vr[i] >= bLo && vr[i] <= bHi) cand[i] = 1;
+  const mask = new Uint8Array(w * h);
+  const minRun = sp * STEEP_RUN;
+  const xs = new Int32Array(w);
+  const ys = new Int32Array(w);
+  for (const s of STEEP_SLOPES)
+    for (const sign of [1, -1]) {
+      const k = s * sign;
+      const reach = Math.ceil(s * w);
+      for (let r0 = sign > 0 ? -reach : 0; r0 < (sign > 0 ? h : h + reach); r0++) {
+        let n = 0;
+        for (let x = 0; x <= w; x++) {
+          const y = x < w ? r0 + Math.round(k * x) : -1;
+          if (x < w && y >= 0 && y < h && cand[y * w + x]) {
+            xs[n] = x;
+            ys[n] = y;
+            n++;
+            continue;
+          }
+          if (n && xs[n - 1] - xs[0] + 1 >= minRun) for (let i = 0; i < n; i++) mask[ys[i] * w + xs[i]] = 1;
+          n = 0;
+        }
+      }
+    }
+  for (const c of comps(mask, w, h, Math.round(sp * sp * 0.2))) {
+    const b = c.bbox;
+    if (b.w < sp * 1.5 || b.h > sp * 3) continue;
+    const line = centerLine(mask, w, c, true);
+    const slope = (line.y1 - line.y0) / Math.max(1, line.x1 - line.x0);
+    if (Math.abs(slope - staffSlope((line.x0 + line.x1) / 2, (line.y0 + line.y1) / 2)) < STEEP_MIN) continue;
+    const thick = (c.area / b.w) / Math.sqrt(1 + slope * slope);
+    if (thick < bLo * 0.8 || thick > sp * 0.8) continue;
+    if (!stemAt(line.x0, line.y0) || !stemAt(line.x1, line.y1)) continue;
+    // 横向那一路收下的、中心落在这条杠上的（整条或碎截）都换成这一条：碎成上下两截的不然算两层
+    const yAt = (x: number) => line.y0 + slope * (x - line.x0);
+    const on = (q: BeamQuad) => {
+      const cx = q.box.x + q.box.w / 2;
+      return cx >= b.x && cx <= b.x + b.w && Math.abs(q.box.y + q.box.h / 2 - yAt(cx)) < sp * 0.35;
+    };
+    for (let i = beams.length - 1; i >= 0; i--) if (on(beams[i])) beams.splice(i, 1);
+    // 横向那一路收下的同一层另一截（中心在本杠外、横向叠着、交叠处贴着本杠延长线）：本杠在叠着的那头剪到它的端点，
+    // 不然两截在交叠处挂同一根干、算成两层（是爱 p3 m46 内层杠被干切成几截，陡杠这一路收左两截、横向那一路收右段，F5/A5 读成三十二分）。
+    // 不并成一条：把长杠按陡杠的斜率拉长会错挂别的干
+    let { x0, x1 } = line;
+    for (const q of beams) {
+      const lo = Math.max(q.box.x, x0);
+      const hi = Math.min(q.box.x + q.box.w, x1);
+      if (hi <= lo) continue;
+      const xm = (lo + hi) / 2;
+      const qy = q.y0 + ((q.y1 - q.y0) * (xm - q.x0)) / Math.max(1, q.x1 - q.x0);
+      if (Math.abs(qy - yAt(xm)) >= sp * 0.35) continue;
+      // 只剪部分相叠的（对方伸出本杠另一头），剪掉的不过本杠一半
+      if (hi - lo > (line.x1 - line.x0) / 2) continue;
+      if (q.box.x > x0 && q.box.x + q.box.w > x1) x1 = Math.min(x1, q.box.x - 1);
+      else if (q.box.x < x0 && q.box.x + q.box.w < x1) x0 = Math.max(x0, q.box.x + q.box.w);
+    }
+    const box = x0 === line.x0 && x1 === line.x1 ? b : { ...b, x: Math.round(x0), w: Math.round(x1 - x0) + 1 };
+    beams.push({ ...line, x0, y0: yAt(x0), x1, y1: yAt(x1), box });
+  }
 }
 
 /**
@@ -1036,31 +1235,72 @@ function partialBeams(bin: Binary, beams: BeamQuad[], unit: RasterUnit, vSegs: L
  * 且偏移超过 1px 才修正。符干、符头的长游程不参与估计，缺证据则沿用全行中心。
  * 这里只定位，不擦像素；保护交叉符号仍由下面的上下邻墨检查负责。
  */
-function localLineCenters(bin: Binary, runs: Uint16Array, cy: number, unit: RasterUnit): Float64Array {
+function localLineCenters(bin: Binary, runs: Uint16Array, line: LineRef, unit: RasterUnit): Float64Array {
   const { w, h, data } = bin;
   const radius = Math.max(2, Math.round(unit.space * 0.35));
-  const lo = Math.max(0, Math.floor(cy) - radius);
-  const hi = Math.min(h - 1, Math.ceil(cy) + radius);
   const cap = Math.max(unit.lineThick * 2, unit.lineThick + 2);
-  const samples = new Int32Array(w).fill(-1);
-  for (let x = 0; x < w; x++) {
+  /** 第 x 列、名义中心 cy 附近离 cy 最近的短竖游程中心（没有返回 NaN） */
+  const nearest = (x: number, cy: number): number => {
+    const lo = Math.max(0, Math.floor(cy) - radius);
+    const hi = Math.min(h - 1, Math.ceil(cy) + radius);
     let dist = radius + 1;
+    let best = NaN;
     for (let y = lo; y <= hi; y++) {
       const len = runs[y * w + x];
       if (!len || len > cap) continue;
       let end = y + 1;
       while (end < h && data[end * w + x]) end++;
       const mid = end - (len + 1) / 2;
-      if (mid >= lo && mid <= hi && Math.abs(mid - cy) < dist) {
-        dist = Math.abs(mid - cy);
-        samples[x] = Math.round((mid - lo) * 2);
-      }
+      if (mid >= lo && mid <= hi && Math.abs(mid - cy) < dist) (dist = Math.abs(mid - cy)), (best = mid);
       y = end - 1;
     }
-  }
-  const centers = new Float64Array(w).fill(cy);
-  const hist = new Int32Array((hi - lo) * 2 + 1);
+    return best;
+  };
   const window = Math.max(4, Math.round(unit.space));
+  if (!line.curve) {
+    const cy = line.y;
+    const lo = Math.max(0, Math.floor(cy) - radius);
+    const hi = Math.min(h - 1, Math.ceil(cy) + radius);
+    const samples = new Int32Array(w).fill(-1);
+    for (let x = 0; x < w; x++) {
+      const mid = nearest(x, cy);
+      if (!Number.isNaN(mid)) samples[x] = Math.round((mid - lo) * 2);
+    }
+    const centers = new Float64Array(w).fill(cy);
+    const hist = new Int32Array((hi - lo) * 2 + 1);
+    let count = 0;
+    const add = (x: number, delta: number) => {
+      if (x < 0 || x >= w || samples[x] < 0) return;
+      hist[samples[x]] += delta;
+      count += delta;
+    };
+    for (let x = 0; x < window; x++) add(x, 1);
+    for (let x = 0; x < w; x++) {
+      add(x + window, 1);
+      add(x - window - 1, -1);
+      if (count < Math.max(4, window)) continue;
+      let n = 0;
+      for (let k = 0; k < hist.length; k++) {
+        n += hist[k];
+        if (n <= count / 2) continue;
+        const local = lo + k / 2;
+        if (Math.abs(local - cy) > 1) centers[x] = local;
+        break;
+      }
+    }
+    return centers;
+  }
+  // 曲线谱线：名义中心逐列取曲线，样本记相对名义中心的残差（四分之一像素一档），滑窗取残差中位
+  const nom = new Float64Array(w);
+  for (let x = 0; x < w; x++) nom[x] = lineYAt(line, x);
+  const off = radius + 2;
+  const samples = new Int32Array(w).fill(-1);
+  for (let x = 0; x < w; x++) {
+    const mid = nearest(x, nom[x]);
+    if (!Number.isNaN(mid)) samples[x] = Math.max(0, Math.min(off * 8, Math.round((mid - nom[x] + off) * 4)));
+  }
+  const centers = new Float64Array(nom);
+  const hist = new Int32Array(off * 8 + 1);
   let count = 0;
   const add = (x: number, delta: number) => {
     if (x < 0 || x >= w || samples[x] < 0) return;
@@ -1076,8 +1316,8 @@ function localLineCenters(bin: Binary, runs: Uint16Array, cy: number, unit: Rast
     for (let k = 0; k < hist.length; k++) {
       n += hist[k];
       if (n <= count / 2) continue;
-      const local = lo + k / 2;
-      if (Math.abs(local - cy) > 1) centers[x] = local;
+      const r = k / 4 - off;
+      if (Math.abs(r) > 1) centers[x] = nom[x] + r;
       break;
     }
   }
@@ -1096,20 +1336,24 @@ function localLineCenters(bin: Binary, runs: Uint16Array, cy: number, unit: Rast
 const THIN_ONLY_RUN = 1.6;
 /** 从杠边伸出多长（格）的细墨柱算干。 */
 const BEAM_STEM_MIN = 2.0;
+/** 墨柱的尽头落在头那么宽的墨上时，伸出这么多（格）就算干：杠离头近的八分干只有一格半上下。 */
+const BEAM_STEM_HEAD = 1.2;
+/** 那个头一侧盒里的墨占比下限（见 `beamStems::solidHead`）。 */
+const BEAM_STEM_HEAD_FILL = 0.6;
 
 /**
  * **挂在杠上的干**：孤立性判据在粗线扫描件上抽不出夹在两个头之间的干——两侧量程按最宽那一行定，
- * 贴着的邻头、横穿的谱线和杠一起占去过半行（破碎扫描版 p7 十六分，见本地私有仓库「位图五线谱现状与待办」阈值冲突表）。
+ * 贴着的邻头、横穿的谱线和杠一起占去过半行（破碎扫描版 p7 十六分，见本地私有仓库待办「五线谱识别-共性」阈值冲突表）。
  * 干没抽出来，它连着的头与邻头沿谱线焊成一团，超出拆块闸，头全丢。
  * 换个特征找：干一定挂在杠上。沿每条杠逐列从杠的上下沿往外走（谱线那几行允许断开），
  * 连续伸出 `BEAM_STEM_MIN` 格以上的列并成一束；束宽不过细笔上限、离已有竖段半格开外的，补一根竖段。
  */
-function beamStems(bin: Binary, beams: BeamQuad[], vSegs: LineSeg[], unit: RasterUnit, lineYs: number[]): LineSeg[] {
+function beamStems(bin: Binary, beams: BeamQuad[], vSegs: LineSeg[], unit: RasterUnit, grid: LineGrid | null): LineSeg[] {
   const { w, h, data } = bin;
   const sp = unit.space;
   const thin = Math.max(3, Math.min(unit.lineThick * 2, sp * 0.4));
   const lineHalf = unit.lineThick / 2 + 1;
-  const onLine = (y: number) => lineYs.some((ly) => Math.abs(ly - y) <= lineHalf);
+  const onLine = (y: number, x: number) => !!grid && grid.onLine(y, lineHalf, x);
   const ink = (x: number, y: number) => x >= 0 && y >= 0 && x < w && y < h && data[y * w + x] === 1;
   /** 从 y0 起沿 dir 走，返回走到的最远一行（谱线行上断了也接着走）。 */
   /** 这一行过 x 的横向墨宽。 */
@@ -1124,7 +1368,7 @@ function beamStems(bin: Binary, beams: BeamQuad[], vSegs: LineSeg[], unit: Raste
     let last = y0 - dir;
     for (let y = y0; y >= 0 && y < h; y += dir) {
       if (ink(x, y)) last = y;
-      else if (!onLine(y)) {
+      else if (!onLine(y, x)) {
         // 干尖与头之间常断一两行（破碎扫描版 p7 十六分 E4 差 3px）：三行内接上的是头那么宽的墨，就续进去
         let k = 1;
         while (k <= 3 && !ink(x, y + dir * k)) k++;
@@ -1134,21 +1378,42 @@ function beamStems(bin: Binary, beams: BeamQuad[], vSegs: LineSeg[], unit: Raste
     }
     return last;
   };
+  /** 墨柱尽头（x, end）顺着走向一侧贴着一个实心头：一边 1.1 格宽、尽头前后 0.2~0.8 格高的盒里墨占六成以上（谱号弯笔围不出这么实的一块） */
+  const solidHead = (x: number, end: number, dir: number): boolean => {
+    const y0 = Math.round(Math.min(end - dir * sp * 0.2, end + dir * sp * 0.8));
+    const y1 = Math.round(Math.max(end - dir * sp * 0.2, end + dir * sp * 0.8));
+    return [-1, 1].some((side) => {
+      let k = 0, n = 0;
+      for (let y = y0; y <= y1; y++)
+        for (let d = 1; d <= Math.round(sp * 1.1); d++) {
+          n++;
+          if (ink(x + side * d, y)) k++;
+        }
+      return k >= n * BEAM_STEM_HEAD_FILL;
+    });
+  };
   const out: LineSeg[] = [];
   for (const q of beams) {
     // 只找已挂着竖段的杠：真杠总有别的干抽得出来；一根都没挂的多是粗体四分休止的斜笔（主我敬拜你 m8）
-    const hung = vSegs.some((v) => {
-      const vx = (v.x0 + v.x1) / 2;
-      return vx >= q.box.x - 2 && vx <= q.box.x + q.box.w + 2 && Math.min(v.y0, v.y1) <= q.box.y + q.box.h + 2 && Math.max(v.y0, v.y1) >= q.box.y - 2;
-    });
-    if (!hung) continue;
+    const hungBy = (gap: number) =>
+      vSegs.some((v) => {
+        const vx = (v.x0 + v.x1) / 2;
+        return vx >= q.box.x - 2 && vx <= q.box.x + q.box.w + 2 && Math.min(v.y0, v.y1) <= q.box.y + q.box.h + gap && Math.max(v.y0, v.y1) >= q.box.y - gap;
+      });
+    const hung = hungBy(2);
+    // 落在实心头上的短墨柱那一档，干端离杠 0.3 格内也算挂着（干常停在杠上方那条谱线上：是爱 p1 m5）；
+    // 长墨柱那一档照旧要贴着，放宽了新编 321 m2 补出假干、和弦拆乱
+    const hungLoose = hung || hungBy(Math.max(2, sp * 0.3));
+    if (!hungLoose) continue;
     // 两端各放 0.3 格：杠的中心线拟合常收不到端头那根干
     const x0 = Math.ceil(Math.min(q.x0, q.x1, q.box.x) - sp * 0.3);
     const x1 = Math.floor(Math.max(q.x0, q.x1, q.box.x + q.box.w) + sp * 0.3);
     for (const dir of [1, -1]) {
-      let run: { x: number; end: number }[] = [];
+      let run: { x: number; end: number; short: boolean }[] = [];
       const flush = () => {
         if (!run.length) return;
+        // 够长的列在就只用够长的列：短的那几列是头边，干端按它们取就停在头顶上
+        if (run.some((r) => !r.short)) run = run.filter((r) => !r.short);
         const wd = run.length;
         const xs = run.map((r) => r.x);
         const cx = (xs[0] + xs[xs.length - 1]) / 2;
@@ -1168,7 +1433,9 @@ function beamStems(bin: Binary, beams: BeamQuad[], vSegs: LineSeg[], unit: Raste
         const yc = q.y0 + (q.y1 - q.y0) * t;
         const edge = Math.round(yc + (dir * (q.lw / 2 + 1)));
         const end = walk(x, edge, dir);
-        if ((end - edge) * dir >= sp * BEAM_STEM_MIN) run.push({ x, end });
+        const len = (end - edge) * dir;
+        if (len >= sp * BEAM_STEM_MIN && hung) run.push({ x, end, short: false });
+        else if (len >= sp * BEAM_STEM_HEAD && runAt(x, end) >= sp * 0.8 && solidHead(x, end, dir)) run.push({ x, end, short: true });
         else flush();
       }
       flush();
@@ -1190,9 +1457,14 @@ function dropHeadEndBeams(beams: BeamQuad[], vSegs: LineSeg[], unit: RasterUnit)
   const tol = unit.lineThick + 2;
   const inBox = (x: number, y: number, b: Rect) => x >= b.x - tol && x <= b.x + b.w + tol && y >= b.y - tol && y <= b.y + b.h + tol;
   const drop = new Set<BeamQuad>();
+  // 一摞：横向重叠、上下 1.5 格内的几层
+  const stackOf = (a: BeamQuad) => beams.filter((o) => o.box.x < a.box.x + a.box.w && a.box.x < o.box.x + o.box.w && Math.abs(o.box.y - a.box.y) <= unit.space * 1.5);
   for (const q of beams) {
     let touched = 0;
     let fake = true;
+    // 比的是两头各自那一摞里最长的：陡杠的内层常被干切成一格半的几截，干顶却挂着头连成的一条横带，拿截长去比就把真杠剔了；
+    // 它旁边挨着整条外层杠，这一头才是杠那头（是爱 p3 m46 钢琴右手十六分）
+    const own = Math.max(...stackOf(q).map((o) => o.box.w));
     for (const v of vSegs) {
       const vx = (v.x0 + v.x1) / 2;
       const top = Math.min(v.y0, v.y1);
@@ -1206,7 +1478,7 @@ function dropHeadEndBeams(beams: BeamQuad[], vSegs: LineSeg[], unit: RasterUnit)
       // 那一头挂的常是半截杠：比的是那一摞（横向重叠、上下 1.5 格内的几层）里最长的一条
       const at = beams.filter((o) => o !== q && inBox(vx, far, o.box));
       const stack = beams.filter((o) => o !== q && at.some((a) => o.box.x < a.box.x + a.box.w && a.box.x < o.box.x + o.box.w && Math.abs(o.box.y - a.box.y) <= unit.space * 1.5));
-      if (!stack.some((o) => o.box.w > q.box.w)) { fake = false; break; }
+      if (!stack.some((o) => o.box.w > own)) { fake = false; break; }
     }
     if (touched && fake) drop.add(q);
   }
@@ -1232,18 +1504,18 @@ const REPAIR_CAP_NARROW = 1;
  * 反过来，线带只有本线厚、又不是穿线段的那几列在这张图上清掉：去线时因为上下挨着墨留下的谱线残段，粘在弧身上就不拱了。
  * 这两种列上原图有墨的线带像素补回。和谱线完全重合、一点没加厚的笔画（平躺在线上的延音线、还原号横笔）补不回来。
  */
-export function repairLineCuts(bin: Binary, nl: Binary, lineYs: number[], unit: RasterUnit): Binary {
+export function repairLineCuts(bin: Binary, nl: Binary, lines: LineRef[], unit: RasterUnit): Binary {
   const { w, h, data } = bin;
   const out: Binary = { w, h, data: new Uint8Array(nl.data) };
   const runs = vRuns(bin);
   const nlRuns = vRuns(nl);
   const half = unit.lineThick / 2 + 1;
   const look = Math.max(1, Math.round(unit.lineThick));
-  const lineT = Math.max(unit.lineThick, measuredLineThick(bin, runs, lineYs, unit));
+  const lineT = Math.max(unit.lineThick, measuredLineThick(bin, runs, lines, unit));
   const reach = Math.max(2, Math.round(unit.space * REPAIR_REACH));
   const thinMax = unit.space * REPAIR_THIN;
-  for (const cy of lineYs) {
-    const centers = localLineCenters(bin, runs, cy, unit);
+  for (const line of lines) {
+    const centers = localLineCenters(bin, runs, line, unit);
     const band = (x: number): [number, number] => [Math.max(0, Math.floor(centers[x] - half)), Math.min(h - 1, Math.ceil(centers[x] + half))];
     // 逐列：线带紧上方 / 紧下方挨着的去线图墨（细的才算，-1 = 没有或太粗）、线带是否加厚
     const above = new Int8Array(w), below = new Int8Array(w), thick = new Uint8Array(w);
@@ -1338,12 +1610,12 @@ const SHORT_BEAM_INK_STEM = 1.5;
  * 线宽按这条线上不过 0.4 格的游程取中位数，**不加一**：一像素厚的弧腹贴在三像素的线下，游程正好线宽 + 1（宁静 p4 m56）；
  * 线局部厚一像素留下的残段由认弧那边按线带剔掉。
  */
-export function removeStaffLinesByRun(bin: Binary, lineYs: number[], unit: RasterUnit): Binary {
+export function removeStaffLinesByRun(bin: Binary, lines: LineRef[], unit: RasterUnit): Binary {
   const { w, h, data } = bin;
   const out: Binary = { w, h, data: new Uint8Array(data) };
   const runs = vRuns(bin);
-  for (const cy of lineYs) {
-    const centers = localLineCenters(bin, runs, cy, unit);
+  for (const line of lines) {
+    const centers = localLineCenters(bin, runs, line, unit);
     const ts: number[] = [];
     for (let x = 0; x < w; x += 2) {
       const y = Math.round(centers[x]);
@@ -1369,7 +1641,7 @@ export function removeStaffLinesByRun(bin: Binary, lineYs: number[], unit: Raste
   return out;
 }
 
-export function removeStaffLines(bin: Binary, lineYs: number[], unit: RasterUnit, thinOnly: Set<number> = new Set()): Binary {
+export function removeStaffLines(bin: Binary, lines: LineRef[], unit: RasterUnit, thinOnly: Set<LineRef> = new Set()): Binary {
   const { w, h, data } = bin;
   const out: Binary = { w, h, data: new Uint8Array(data) };
   const half = unit.lineThick / 2 + 1;
@@ -1382,11 +1654,11 @@ export function removeStaffLines(bin: Binary, lineYs: number[], unit: RasterUnit
   //（望十架 p7 长笛一串八分的杠贴着第四线，原图 5~6 像素、线 3 像素；钢琴右手贴第五线的两条杠同样，二十来个八分读成四分）。
   // 厚度下限与符杠同口径（`findPrimitives` 的 `bLo`），线宽取本页谱线实测的九成分位：估值常比实际薄一像素
   //（望十架 p6 估 2、实有 3），只按估值卡，厚一点的那几段空谱线也会留下来
-  const lineT = Math.max(unit.lineThick, measuredLineThick(bin, runs, lineYs, unit));
+  const lineT = Math.max(unit.lineThick, measuredLineThick(bin, runs, lines, unit));
   const keepRun = Math.max(unit.space * 0.25, lineT * 1.5);
-  for (const cy of lineYs) {
-    const centers = localLineCenters(bin, runs, cy, unit);
-    const thin = thinOnly.has(cy);
+  for (const line of lines) {
+    const centers = localLineCenters(bin, runs, line, unit);
+    const thin = thinOnly.has(line);
     // 这条线上逐列的「厚」：线带里的竖游程过 `keepRun`、又不到 0.8 格（再厚是符头、干，上下本来就连着墨）。
     // 只留**横向连着一格半以上都厚**的那几段（杠那么长）：升降号、符头压线的那一小截不够长，照旧抹
     const thickCol = new Uint8Array(w);
@@ -1456,7 +1728,7 @@ export function removeStaffLines(bin: Binary, lineYs: number[], unit: RasterUnit
  * 直接照中心线抹只抹掉一像素宽，笔画的两侧还留着，连通关系照旧。
  */
 /** `labels`：给了就把连通块标号图落进去（下标即 `Component.id`）。 */
-export function findBlobs(bin: Binary, prims: RasterPrims, unit: RasterUnit, onGrid?: (y: number) => boolean, labels?: Int32Array): Component[] {
+export function findBlobs(bin: Binary, prims: RasterPrims, unit: RasterUnit, onGrid?: (y: number, x?: number) => boolean, labels?: Int32Array): Component[] {
   const rest = blobImage(bin, prims, unit, onGrid);
   // 宽高**分别**设限，不能共用一个数：高音谱号窄而高，实测 2.8 × **7.5** 个线距
   //（连着尾巴那一圈），共用「六个线距」的上限会把整页的谱号挡在外面
@@ -1646,7 +1918,7 @@ const PB_STRAIGHT = 0.25;
 
 /** 抹掉笔画之后剩下的墨——`findBlobs` 与 `findBraces` 都从它出发。
  *  **对外**：叠置空心和弦要在这张图上数孔（原图上符干会把内腔连出去）。 */
-export function blobImage(bin: Binary, prims: RasterPrims, unit: RasterUnit, onGrid?: (y: number) => boolean): Binary {
+export function blobImage(bin: Binary, prims: RasterPrims, unit: RasterUnit, onGrid?: (y: number, x?: number) => boolean): Binary {
   const { w, h } = bin;
   const rest = new Uint8Array(bin.data);
   const clear = (x0: number, y0: number, x1: number, y1: number) => {
@@ -1665,7 +1937,7 @@ export function blobImage(bin: Binary, prims: RasterPrims, unit: RasterUnit, onG
     //（符头 1.2 格 + 两头各探出一点），比「一个线距」的老门槛长——照抹会把符头
     // **拦腰啃成两半**（实测破碎 p5 那个下加一线的音剩下 0.99×0.29 两片，判不成符头，
     // 而它的墨还都算「有主」，无主报表里看不见）。上限放到三格：再长的是别的横线。
-    if (horiz && onGrid && len <= unit.space * 3 && onGrid((s.y0 + s.y1) / 2) && headOn(bin, s, unit)) continue;
+    if (horiz && onGrid && len <= unit.space * 3 && onGrid((s.y0 + s.y1) / 2, (s.x0 + s.x1) / 2) && headOn(bin, s, unit)) continue;
     // **抹的宽度按平均厚度算，不按块的最大宽度。**
     // `maxLw` 是这一块的**包围盒宽**：笔画中途鼓出来一段（四分休止那个钩、
     // 谱号的弯），`maxLw` 就是那一段的宽度，照它抹等于把整个符号铲掉
@@ -1676,7 +1948,7 @@ export function blobImage(bin: Binary, prims: RasterPrims, unit: RasterUnit, onG
     // **连成一长条的加线按列抹**：一串同高的加线音（父恩广大低音谱表的 C4）的加线被连成一条（8 格长），
     // 头只占一小半、`headOn` 判否，整条照抹就把每个头都拦腰切成两片，头全丢了。
     // 逐列看：线外一侧 0.6 格内贴着墨（头）的列留着，其余照抹。独唱谱音符 93.93 → 94.13%（父恩广大 +2.4）。
-    if (horiz && onGrid && len > unit.space * 3 && onGrid((s.y0 + s.y1) / 2)) {
+    if (horiz && onGrid && len > unit.space * 3 && onGrid((s.y0 + s.y1) / 2, (s.x0 + s.x1) / 2)) {
       const reach = Math.max(2, Math.round(unit.space * 0.6));
       const x0 = Math.max(0, Math.round(Math.min(s.x0, s.x1)));
       const x1 = Math.min(w - 1, Math.round(Math.max(s.x0, s.x1)));

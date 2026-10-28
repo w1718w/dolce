@@ -8,7 +8,7 @@
 各排版器、试听、导出、双向定位都从它取。结构照 MusicXML 分层、`degree`+`pitch` 并存、元素稳定 `id` 带 `SourceSpan`——
 这几条是双向光标同步与「按 id 高亮/写回断点」的地基。
 
-围绕它的机制：**格式适配器表**（`editor/formats.ts`）、**格式能力表**（`model/capability.ts`）、
+围绕它的机制：**格式适配器表**（`editor/formats.ts`）、**格式能力表**（`convert/capability.ts`）、
 **双向定位**（`editor/sync.ts`）、**保存策略**（`.musicxml` 没改过给原文，改过经 `toxml.ts` 整份重写）。
 
 ## 各排版器从它取什么
@@ -17,13 +17,13 @@
 
 | 消费者 | 取法 | 引擎内部结构 |
 |---|---|---|
-| 简谱引擎（`layout/jianpu/`：各格式的原样 / 展开档、PPTX、成书） | 排版行视图 `pu/slots.ts::docView` | `layout/jianpu/place/` 的定位结构（`PlacedPage` / `PlacedGroup` / `PlacedVoice`） |
-| jianpu-ly 写出、断句量宽、识别对歌词 | `model/jianpuinput.ts` 投影出的 `JScore`（`layout/input.ts`；简谱形状 / `.jpwabc` 两个分支） | — |
+| 简谱引擎（`layout/jianpu/`：各格式的原样 / 展开档、PPTX、成书） | 排版行视图 `jianpu/slots.ts::docView` | `layout/jianpu/place/` 的定位结构（`PlacedPage` / `PlacedGroup` / `PlacedVoice`） |
+| jianpu-ly 写出、断句量宽、识别对歌词 | `jianpu/jianpuinput.ts` 投影出的 `JScore`（`layout/input.ts`；简谱形状 / `.jpwabc` 两个分支） | — |
 | 五线谱混排（`mixed/`） | `mixed/layout.ts::layoutStaff` 建版面态；MusicXML 原文的坐标/符干/字体经 `xmlsurface.ts` 查询 | `StaffLayout` 及各 `*Layout` 节点（`src` 引用模型元素） |
 | 试听 / MIDI | `playdoc.ts::playSourceOfDoc` / `playsong.ts::playSourceOfSong` | `score/timeline.ts` |
 | 断句 | `phrasedoc.ts` / `phrasesong.ts` 拼断句输入（带 `idOf`） | `score/phrase.ts` |
 
-`PuDoc`（`src/pu/ast.ts`）已退役：只是 `parsePuAst` → `puToScoreDoc` 之间的中间结果，`parsePu` 直出 `ScoreDoc`。
+`FanqieDoc`（`src/jianpu/ast.ts`）已退役：只是 `parseFanqieAst` → `fanqieToScoreDoc` 之间的中间结果，`parseFanqie` 直出 `ScoreDoc`。
 乐句重排改写原文要的行号/列号在模型上（`Print.source` / `textSources`、`LyricLineInfo.source` / `sources`）。
 
 ## 入口
@@ -32,6 +32,8 @@
 |---|---|
 | `src/model/doc.ts` | 类型定义。层级：`ScoreDoc → Song → Part → Measure → Element` |
 | `src/model/helpers.ts` | 遍历/查询/构造 |
+| `src/model/msg.ts` | **给界面的提示只给键与参数**（`ModelMsg`）：`edit.ts` 的报错（`{ error: ModelMsg }`）、`ModelError`（读写失败）、节拍提示与默认声部名都经它；翻译函数由 `i18n/index.ts` 加载时注册（`setMsgTranslator`），显示时 `msgText` 取当前语言的字。模型层对 i18n 只许类型引用（`deps-check.mjs` 守门） |
+| `src/model/marknames.ts` | 记号名字表（力度名、术语）：文本谱 / 123 / ABC / jianpu-ly / MusicXML 投影共用；字形在 `engrave/jpglyph.ts` |
 | `src/model/breaks.ts` | 断行读写对：`breaksOf`（模型 → 行首元素）/ `applyBreaks`（行首元素 → 模型，替换原有断行） |
 | `src/model/jianpu.ts` | **简谱语义层**：音高↔度数、相对调号临时记号延续（`AccidentalCarry`，两个方向共用）、`attrsAt`、减时线/增时线/附点（`jianpuShape`）、和弦原文、旋律取音、延音线/跨元素记号按 id 找对端 |
 | `src/model/fromxml.ts` | ← MusicXML（**直通**：语义进模型，每个模型对象绑到原节点） |
@@ -40,15 +42,15 @@
 | `src/model/xmlproject.ts` | 简谱来源 → MusicXML 形状的投影（音高、divisions、记号原名、跨行小节…），`toxml.ts` 先过它 |
 | `src/model/deconames.ts` | 音符记号的别名表（`decoKey`）：拼音短名 / ABC 名 / MusicXML 名 / 中文名 → 文本谱短名。模型里原名照存，简谱排版、文本谱写出、MusicXML 投影用前先归一 |
 | `src/model/jianpuproject.ts` | 反方向：MusicXML 形状 → 简谱形状（增时线、减时线、和弦原文、长音中途的和弦），`slots.ts` 与 123 写出端先过它。原生 ABC 时值只在 `divisions` 里、不带减时线/增时线，也经它投（音上的延音线配成 `tied`） |
-| `src/model/frompu.ts` | ← 文本谱语法树（**无损**：文本谱的全部排版信息都进来，`pu-scoredoc-check` 全语料逐字段还原零差异） |
-| `src/pu/slots.ts` | → **排版行视图**（`docView`）：线性化规则只写一次，原样档排版器 / 展开档投影 / 双向定位共用；行里每个符号带 `ElementId` |
-| `src/model/jianpuinput.ts` | → **简谱输入模型** `JScore`（`jianpuInputOfDoc` / `jianpuInputOfJpw`），和弦带元素 id；不再喂排版引擎，给 jianpu-ly 写出、识别对歌词用 |
+| `src/fanqie/fromfanqie.ts` | ← 文本谱语法树（**无损**：文本谱的全部排版信息都进来，`fanqie-scoredoc-check` 全语料逐字段还原零差异） |
+| `src/jianpu/slots.ts` | → **排版行视图**（`docView`）：线性化规则只写一次，原样档排版器 / 展开档投影 / 双向定位共用；行里每个符号带 `ElementId` |
+| `src/jianpu/jianpuinput.ts` | → **简谱输入模型** `JScore`（`jianpuInputOfDoc` / `jianpuInputOfJpw`），和弦带元素 id；不再喂排版引擎，给 jianpu-ly 写出、识别对歌词用 |
 | `src/model/fromjpw.ts` | ← `.jpwabc`（`JpwFile` 直出，带 span；小节中间的 `$` 另记 `Chord.lineBreakAfter`） |
-| `src/omr/todoc.ts` | ← 简谱识别结果（`RecognizedScore` 直出简谱形状，与 `j123/parse.ts` 同口径；不经 MusicXML） |
+| `src/omr/todoc.ts` | ← 简谱识别结果（`RecognizedScore` 直出简谱形状，与 `abcfamily/parse.ts` 同口径；不经 MusicXML） |
 | `src/model/tojpw.ts` | → `.jpwabc`（`emitJpwabc`；写出端只经输入接口读谱，两侧输入由 `playdoc.ts::jpwInputOfDoc` / `playsong.ts::jpwInputOfSong` 拼） |
-| `src/model/phrasedoc.ts` / `src/pu/phrasesong.ts` | 断句输入（MusicXML 形状 / 简谱形状），同一份小节视图也满足演唱顺序的输入 |
-| `src/model/playdoc.ts` / `src/model/playsong.ts` | **演唱顺序**（`PlayData`）、试听输入（`PlaySource`）与 `.jpwabc` 写出端输入：反复、房号、跳转、多段歌词逐段、`Song.playOrder`；推理本体在 `score/playorder.ts`。回归 `playorder-check --cmp` |
-| `src/model/capability.ts` | **格式能力表**：每种格式装得下什么 + `planSave`（另存为会丢什么） |
+| `src/model/phrasedoc.ts` / `src/jianpu/phrasesong.ts` | 断句输入（MusicXML 形状 / 简谱形状），同一份小节视图也满足演唱顺序的输入 |
+| `src/model/playdoc.ts` / `src/jianpu/playsong.ts` | **演唱顺序**（`PlayData`）、试听输入（`PlaySource`）与 `.jpwabc` 写出端输入：反复、房号、跳转、多段歌词逐段、`Song.playOrder`；推理本体在 `score/playorder.ts`。回归 `playorder-check --cmp` |
+| `src/convert/capability.ts` | **格式能力表**：每种格式装得下什么 + `planSave`（另存为会丢什么） |
 | `src/model/hanconv.ts` | **简繁转换**（五种格式通用）：`textGroups` 枚举人读的文字、`convertScoreDoc` 改模型、`convertSourceText` 只改原文里的字；词表加载在 `src/common/hanconv.ts`（opencc-js 按方向动态 import） |
 
 Node 侧经 `src/cli/j123.ts` → `out/cli/j123.js` 使用（`npm run build:cli`）。
@@ -69,12 +71,16 @@ Node 侧经 `src/cli/j123.ts` → `out/cli/j123.js` 使用（`npm run build:cli`
   （判据与定性清单在 `jianpu.ts` 文件头）。
   已验：`fifths -7..7` 的无点「1」与 `jppitch.ts` 注释记载的值逐个吻合（bB=58、bA=68、#C=61、
   bD=61、#F=bG=66、bE=63、bC=59；A 调不降八度、B 调降八度）。
+- **简谱来源的谱表记号（`Note.accidental` = `<accidental>`）在投影时按五线谱口径另算**（`xmlproject.ts` → `jianpu.ts::StaffAccidentalCarry`）：
+  同字母同八度在一小节内延续、起点是调号、按绝对变音命名，延音线接过来的音不印。源文的简谱记号相对调号、按唱名延续，
+  照抄过去在非 C 调错（`1=F` 的 `#4` 是 B 本位，印还原号不是升号）、跨八度漏（`#4 4'` 后一个要再印）；
+  `.jpwabc`/文本谱只写在 `degree.accidental` 上，不另算谱表上就一个记号都没有。五线谱引擎只印 `Note.accidental`，自己不推。
 - **元素一律带稳定 `id`**（`IdGen` 分配）。`Mark`、歌词锚点、`playOrder` 的 skip/limit 全部引用 id——
-  `PuDoc` 用数组下标区间，插一个元素就全错。
+  `FanqieDoc` 用数组下标区间，插一个元素就全错。
 - **增时线是可挂载的独立对象**（`Chord.sustains[]`，各有 id），而时值仍记在 `Chord.duration` 上：
   语义上 `5 - -` 是一个三拍音符（与 MusicXML 一致），但**和弦可以挂在增时线上**（语料实测 190 次）。
 - **`Space` 元素**承载 `y`（无时值占位，专供挂和弦）与 `x`（不可见休止）。
-- **`Element.voice` 在文本来源里恒为 1，唯一的例外是 ABC 的 `&`**（小节内临时多声部，§7.4）：
+- **`Element.voice` 在文本来源里恒为 1，例外是 ABC / 123 的 `&`**（小节内临时多声部，§7.4；文本谱按声部号记）。MusicXML 来源照 `<voice>` 记：
   分支的元素照原文顺序留在同一个 `Measure` 里、只是 `voice` 不同，小节内的实际起点由投影写进
   `Chord/Space.onset`（缺省是「前一个元素的终点」，`toxml.ts` 据此补 `<backup>`）。
   读这个模型的地方要按 `voice` 分轨算时间，别把一小节的时值一路加下去（见 [源格式-abc家族](源格式-abc家族.md)）。
@@ -104,16 +110,16 @@ Node 侧经 `src/cli/j123.ts` → `out/cli/j123.js` 使用（`npm run build:cli`
   只剩半个小节的一行写不出来）。**读写对在 `model/breaks.ts`**：`breaksOf` 读出行首元素，`applyBreaks` 把一组行首
   写回（替换原有断行；小节中间的按 `inline` / `snap` / `source` 三种口径落，多声部一律顺延，多声部文本谱不重断）。
   乐句重排（`relayout.ts`）、导出 MusicXML 照简谱视图重断（`xmlproject.ts`）、跨格式另存为（`App.convertTo`）都经它。
-  回归 `break-roundtrip-check`：写回 → 六种写出端 → 读回，断点集合不变（ABC 没有换页记号，只比断行位置，能力表记 `pageBreak`）。
+  回归 `break-roundtrip-check`：写回 → 六种写出端 → 读回，断点集合不变（能力表记了 `pageBreak` 的格式只比断行位置；ABC 写 `%%newpage`，换页也比）。
 - **文本谱专有字段**（`doc.ts` 里注释写明「文本谱」的那些：`SourceOrnament`、`InlineItem`、`Print.system/texts/lyricLines`（`system` 还是各声部共用时间轴的依据，见 `timeaxis.ts`）、
   `Chord.continued`、`Mark.startLead/endTrail/leadInPreviousLine/continuationLevels`、`Ending.startOffset/endOffset/pair`…）
   **是排版信息，不是给导出用的**：没有它们谱面就少画或画错（例如弧线端点落在小节线上时简谱引擎认为没收口，弧会接到下一行）。
-  改 `frompu.ts` 后必须跑 `pu-scoredoc-check`。
+  改 `fromfanqie.ts` 后必须跑 `fanqie-scoredoc-check`。
 - **`source: SourceSpan` 不是可有可无的**：编辑器的双向光标/选择同步（`editor/sync.ts`）
   按它建「源文本偏移 → 元素 id」的索引。新增元素类型时**一定要把 span 填对**。
 - **只给编辑用的原文位置**：`Chord/Sustain/Space.attachedSources`（和弦名、装饰、注记各自的原文）、`Mark.openSource/closeSource`
   （弧的 `(` 与 `)`）、`Part.breakSources`（`$`、`$(…)`、`[fenye]`）。可视化编辑按它们选中、删除挂在音符上的记号与换行符；
-  排版、写出端、试听都不读，比对类回归（`pu-scoredoc-check`）要忽略它们。
+  排版、写出端、试听都不读，比对类回归（`fanqie-scoredoc-check`）要忽略它们。
 - **简繁转换以模型为准**（`model/hanconv.ts`）：
   - 转什么：`textGroups` 枚举人读的文字（标题、署名、版权、页眉页脚、备注、有排版角色的 meta、声部名、段落词、文字指示、
     `W:` 行、歌词及其标点）。和弦、调号拍号、字体族、纸张等代码类值不碰——转了会认不出（字体名 `宋体`→`宋體` 就找不到）。

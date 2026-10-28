@@ -4,7 +4,7 @@
 // **别在这里另写一套** ——那份是简谱导出、文本谱导出与本文件的公共件。
 import { barlineXml, escapeXml, scorePartXml, workXml, wrapPartwise } from "../score/xmlutil";
 import { harmonyXml } from "../score/harmonyxml";
-import type { StaffNote } from "./notedata";
+import type { StaffChord, StaffNote } from "./notedata";
 import { clefFor, fifthsAt, timeSignatures, timeXml, type StaffContext } from "./notedata";
 import { Bar, type SPage, type Staff } from "./model";
 import type { StaffScore } from "./score";
@@ -23,6 +23,9 @@ export interface StaffXmlOptions {
   partId?: string;
   /** 给 `<note>` 写 `id`（编辑器的识别对照按它把模型里的音对回源图坐标）；返回 undefined 不写 */
   noteId?: (n: StaffNote) => string | undefined;
+  /** 给 `<slur type="start">` 写 `id`：`markSlurNotes` 的弧号 → 识别对照的 id（跨行接上的后半截写在 `stop` 上）；返回 undefined 不写。
+   *  歌词、文字、力度、延音线的 id 记在各自身上（`lyrics[].id`、`words[].id`、`dynamicId`、`tieId`），有就写 */
+  arcId?: (arc: string) => string | undefined;
   /** 页眉各条（位图路 OCR 读出的标题、词曲作者），写成曲首页的 `<credit>`；`size` 是字号（pt），
    *  `box` 是它在首个系统那一页上的位置（页面单位），写源谱版面时折成 `default-x` / `default-y` */
   /** 小节号印在哪（`<measure-numbering>`，写在第一声部首小节的 `<print>` 里），见 `score.ts::measureNumbering` */
@@ -39,6 +42,16 @@ export interface StaffXmlOptions {
 
 /** 本次写出的 `noteId`（`scoreToMusicXml` 进出时设、清；写出是同步的） */
 let currentNoteId: StaffXmlOptions["noteId"] | null = null;
+let currentArcId: StaffXmlOptions["arcId"] | null = null;
+
+/** 本次写出已写过的识别 id：同一个音分进两个声部时被复制（`{...n}`），挂在它上面的字、弧也跟着写两遍，id 只给头一份 */
+const writtenIds = new Set<string>();
+/** ` id="…"`（没有、或已写过就空串） */
+const idAttr = (id: string | undefined): string => {
+  if (!id || writtenIds.has(id)) return "";
+  writtenIds.add(id);
+  return ` id="${escapeXml(id)}"`;
+};
 
 /** A4 纸宽（pt）：页面尺寸不可信的页（图片）按页宽 = 它折算 */
 const A4_WIDTH_PT = (210 * 72) / 25.4;
@@ -107,7 +120,7 @@ function dynamicXml(n: StaffNote, dirStaff: string): string {
   const ink = [...name].map((c) => DYNAMIC_INK[c]).filter((v): v is [number, number] => !!v);
   const pg = n.staff?.page;
   if (!withSourceLayout || !b || !ink.length || !pg) {
-    return `<direction placement="below"><direction-type><dynamics><${name}/></dynamics></direction-type>${dirStaff}</direction>`;
+    return `<direction placement="below"${idAttr(n.dynamicId)}><direction-type><dynamics><${name}/></dynamics></direction-type>${dirStaff}</direction>`;
   }
   const lo = Math.min(...ink.map((v) => v[0]));
   const hi = Math.max(...ink.map((v) => v[1]));
@@ -118,7 +131,7 @@ function dynamicXml(n: StaffNote, dirStaff: string): string {
   const pt = roundPt(4 * unit * ptPerUnit(pg));
   const x = n.sym.box.left;
   const pl = aboveStaff(n.staff, x, (b.top + b.bottom) / 2) ? "above" : "below";
-  return `<direction placement="${pl}"><direction-type><dynamics default-y="${staffY(n.staff, x, baseline)}" relative-x="${staffDx(n.staff, pen - x)}" font-size="${pt}"><${name}/></dynamics></direction-type>${dirStaff}</direction>`;
+  return `<direction placement="${pl}"${idAttr(n.dynamicId)}><direction-type><dynamics default-y="${staffY(n.staff, x, baseline)}" relative-x="${staffDx(n.staff, pen - x)}" font-size="${pt}"><${name}/></dynamics></direction-type>${dirStaff}</direction>`;
 }
 
 /** `<wedge>` 起点：写源谱版面时照原图写上下方、中线（`default-y`）、左端离符头左缘（`relative-x`）；渐弱的开口（`spread`）写在起点 */
@@ -273,6 +286,8 @@ function emitVoices(inBar: StaffNote[], ticks: (d: number) => number, staffNo: n
       .map((n) => (n.crossStaff ? { ...n, voice: own.reduce((a, b) => (Math.abs(b.x - n.x) < Math.abs(a.x - n.x) ? b : a)).voice } : n))
       .sort((a, b) => a.x - b.x);
   }
+  const split = splitUnisonStems(inBar, ticks);
+  inBar = split.notes;
   const voices = [...new Set(inBar.map((n) => n.voice))].sort((a, b) => a - b);
   const withVoice = voices.length > 1 || staffNo > 0;
   const voiceBase = staffNo > 0 ? (staffNo - 1) * 4 : 0;
@@ -333,10 +348,10 @@ function emitVoices(inBar: StaffNote[], ticks: (d: number) => number, staffNo: n
           const w = mates.flatMap((m) => m.words ?? []);
           if (w.length) n = { ...n, words: [...(n.words ?? []), ...w] };
           const t = !n.metronome && !n.tempoText ? mates.find((m) => m.metronome || m.tempoText) : undefined;
-          if (t) n = { ...n, metronome: t.metronome, tempoText: t.tempoText, tempoSize: t.tempoSize };
+          if (t) n = { ...n, metronome: t.metronome, tempoText: t.tempoText, tempoSize: t.tempoSize, tempoId: t.tempoId };
           const d = !n.dynamic ? mates.find((m) => m.dynamic) : undefined;
-          if (d) n = { ...n, dynamic: d.dynamic, dynamicBox: d.dynamicBox };
-        } else n = { ...n, words: undefined, metronome: undefined, tempoText: undefined, dynamic: undefined };
+          if (d) n = { ...n, dynamic: d.dynamic, dynamicBox: d.dynamicBox, dynamicSrcBox: d.dynamicSrcBox, dynamicId: d.dynamicId };
+        } else n = { ...n, words: undefined, metronome: undefined, tempoText: undefined, tempoId: undefined, dynamic: undefined, dynamicId: undefined };
       }
       // 松叶的起止同理：挂在和弦哪个头上都是这一拍，写在打头的那个音前；挂在后写的头上，`<direction>` 落在和弦中间，
       // 读回来是下一拍（按拍位写时和弦先写最高音，主音不一定打头：破碎 m5、m106、m107）
@@ -354,6 +369,11 @@ function emitVoices(inBar: StaffNote[], ticks: (d: number) => number, staffNo: n
       if (!extra && n0.group && !n.beam) {
         const bm = vn.find((m) => m.group === n0.group && m.beam)?.beam;
         if (bm) n = { ...n, beam: bm };
+      }
+      const splitAt = !timed && !n.chordExtra ? split.starts.get(n0) : undefined;
+      if (splitAt !== undefined && splitAt > cur) {
+        body += `<forward><duration>${splitAt - cur}</duration></forward>`;
+        cur = splitAt;
       }
       if (timed && !n.chordExtra && !n.grace) {
         const off = at(n.group!.offset);
@@ -376,12 +396,14 @@ function emitVoices(inBar: StaffNote[], ticks: (d: number) => number, staffNo: n
         // 文字后面接节拍器时末尾留一个空格（`Andante ♩ = c. 76`），不然排出来文字与音符字形贴在一起
         const words = n.tempoText ? `<direction-type><words${fontAttr(textPt(n, n.tempoSize))}>${escapeXml(m ? `${n.tempoText.trimEnd()} ` : n.tempoText)}</words></direction-type>` : "";
         const metro = m ? `<direction-type><metronome${m.parentheses ? ' parentheses="yes"' : ""}><beat-unit>${m.unit}</beat-unit><per-minute>${escapeXml(m.text ?? String(m.bpm))}</per-minute></metronome></direction-type>` : "";
-        body += `<direction placement="above">${words}${metro}${dirStaff}${m ? `<sound tempo="${m.bpm}"/>` : ""}</direction>`;
+        body += `<direction placement="above"${idAttr(n.tempoId)}>${words}${metro}${dirStaff}${m ? `<sound tempo="${m.bpm}"/>` : ""}</direction>`;
       }
+      for (const g of n.signs ?? []) body += `<direction placement="above"><direction-type><${g}/></direction-type>${dirStaff}<sound ${g}="${g}"/></direction>`;
       for (const w of n.words ?? []) {
         const wy = withSourceLayout && w.baseY !== undefined ? ` default-y="${staffY(n.staff, n.sym.box.left, w.baseY)}"` : "";
         const el = w.rehearsal ? "rehearsal" : "words";
-        body += `<direction placement="${w.above ? "above" : "below"}"><direction-type><${el}${w.rehearsal ? ' enclosure="square"' : ""}${wy}${fontAttr(textPt(n, w.size))}>${escapeXml(w.text)}</${el}></direction-type>${dirStaff}</direction>`;
+        const snd = w.rehearsal ? "" : jumpSound(w.text);
+        body += `<direction placement="${w.above ? "above" : "below"}"${idAttr(w.id)}><direction-type><${el}${w.rehearsal ? ` enclosure="${w.bracket ? "none" : "square"}"` : ""}${wy}${fontAttr(textPt(n, w.size))}>${escapeXml(w.text)}</${el}></direction-type>${dirStaff}${snd}</direction>`;
       }
       if (n.dynamic) body += dynamicXml(n, dirStaff);
       // 松叶：**止排在起之前**——同一个音符上前一条松叶收尾、下一条起头是常事，
@@ -398,6 +420,12 @@ function emitVoices(inBar: StaffNote[], ticks: (d: number) => number, staffNo: n
       if (n.wedgeStop && n.wedgeStopAfter) {
         const sn = n;
         pendingStop = (ax) => wedgeStopXml(sn, wNo, wDir, ax);
+      }
+      // 行末小节线上的 ⊕ / 𝄋（`signsAfter`）：写在末音之后，读回来落在小节末、画在小节线上
+      if (n.signsAfter?.length) {
+        const prevStop: ((anchorX?: number) => string) | null = pendingStop;
+        const signs = n.signsAfter.map((g) => `<direction placement="above"><direction-type><${g}/></direction-type>${dirStaff}</direction>`).join("");
+        pendingStop = (ax?: number): string => (prevStop ? prevStop(ax) : "") + signs;
       }
       if (!n.chordExtra && !n.grace) cur += ticks(n.duration);
     }
@@ -425,6 +453,62 @@ function rowStartClef(entry: SysEntry, st: Staff): string {
 function midRowClefs(entry: SysEntry, st: Staff) {
   const sp = st.stepDistance() * 2;
   return (entry.ctx.get(st)?.clefs ?? []).filter((c) => c.box.left >= st.box.left + sp * ROW_START_CLEF);
+}
+
+/**
+ * **两声部同音、各带一根干的，拆回两个声部**（万口欢唱女高女中同是 E4 二分，原谱一个头上下两根干）：识别把两根干并成一枚和弦
+ *（`initChords` 的断干拼接），写出来是一个声部里两个同音高、`<stem>` 一上一下的和弦音——MusicXML 一枚和弦只有一根干，
+ * 混排画成并排两个头加一根干，转 ABC / 123 也只能写成 `[EE]`。
+ *
+ * 判据：一枚和弦里有干朝上、也有干朝下的音，且有一对同音高（音级、升降都同）的一上一下。干朝下的那几个音挪进本小节新开的声部
+ *（声部号接在已有的后面，同一声部拆出来的共用一个），起点同原和弦，其余拍子靠 `<forward>` 补（按拍位写时 `emitVoices` 本来就补；不按拍位写时
+ * 按原声部里它前面那些和弦的时值累加，记在 `starts` 里）。挂在挪走的音上的歌词留给原和弦：读入端按声部配词，挪到第二声部就丢了。
+ */
+function splitUnisonStems(inBar: StaffNote[], ticks: (d: number) => number): { notes: StaffNote[]; starts: Map<StaffNote, number> } {
+  const starts = new Map<StaffNote, number>();
+  const groups = new Set(inBar.map((n) => n.group).filter((g): g is StaffChord => !!g && !g.grace));
+  const hits = [...groups].filter((g) => {
+    const ns = inBar.filter((n) => n.group === g && !n.rest && !n.grace);
+    return ns.some((u) => u.stemUp === true && ns.some((d) => d.stemUp === false && d.diatonic === u.diatonic && d.alter === u.alter));
+  });
+  if (!hits.length) return { notes: inBar, starts };
+  const timed = inBar.every((n) => n.group?.timed);
+  let next = Math.max(...inBar.map((n) => n.voice));
+  // 同一声部里拆出来的音前后不重叠，共用一个新声部
+  const newVoice = new Map<number, number>();
+  const out = inBar.slice();
+  for (const g of hits) {
+    const v = inBar.find((n) => n.group === g)!.voice;
+    const moved = out.filter((n) => n.group === g && n.stemUp === false).sort((a, b) => a.diatonic - b.diatonic);
+    const kept = out.filter((n) => n.group === g && n.stemUp !== false).sort((a, b) => a.diatonic - b.diatonic);
+    const voice = newVoice.get(v) ?? (newVoice.set(v, ++next), next);
+    const ng: StaffChord = { ...g, notes: moved, voice };
+    // 只补原和弦里还没有的段：同一段两个字（挪走的那个多半是错挂的）原先写出时也只留打头那个音上的
+    const have = new Set(kept.flatMap((n) => (n.lyrics ?? []).map((l) => l.verse)));
+    const lyrics = moved.flatMap((n) => n.lyrics ?? []).filter((l) => !have.has(l.verse) && (have.add(l.verse), true));
+    const stopHave = new Set(kept.flatMap((n) => (n.lyricExtendStop ?? []).map((l) => l.verse)));
+    const stops = moved.flatMap((n) => n.lyricExtendStop ?? []).filter((l) => !stopHave.has(l.verse) && (stopHave.add(l.verse), true));
+    const copies = new Map<StaffNote, StaffNote>();
+    moved.forEach((n, i) => copies.set(n, { ...n, group: ng, voice, chordExtra: i > 0 || undefined, lyrics: undefined, lyricExtendStop: undefined }));
+    kept.forEach((n, i) => {
+      const add = i === 0 ? { lyrics: lyrics.length ? [...(n.lyrics ?? []), ...lyrics] : n.lyrics, lyricExtendStop: stops.length ? [...(n.lyricExtendStop ?? []), ...stops] : n.lyricExtendStop } : {};
+      copies.set(n, { ...n, ...add, chordExtra: i > 0 || undefined });
+    });
+    for (let i = 0; i < out.length; i++) out[i] = copies.get(out[i]) ?? out[i];
+    if (!timed) {
+      // 原声部里排在这枚和弦之前的那些和弦（按 x）的时值和，就是它在小节里的起点。按和弦数、每枚一次，不看 `chordExtra`：
+      // 打头音不在这小节里的和弦音也带着它，`emitVoices` 分组写出时照样占拍（天父加恩 m8 的八分 F4）
+      const left = Math.min(...moved.map((n) => n.x));
+      const durOf = new Map<unknown, number>();
+      for (const n of out) {
+        if (n.voice !== v || n.grace || n.x >= left - 1e-6 || n.group === g) continue;
+        const key = n.group ?? n;
+        if (!durOf.has(key) || !n.chordExtra) durOf.set(key, ticks(n.duration));
+      }
+      starts.set(copies.get(moved[0])!, [...durOf.values()].reduce((a, d) => a + d, 0));
+    }
+  }
+  return { notes: out, starts };
 }
 
 /** `emitVoices` 用掉的时长（大谱表换行时要照它倒回小节头）。 */
@@ -466,10 +550,11 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
   // `<voice>` 排在 `<duration>`/`<tie>` 之后、`<type>` 之前
   const voiceEl = withVoice ? `<voice>${n.voice + voiceBase}</voice>` : "";
   if (n.rest)
-    return `<note><rest/><duration>${dur}</duration>${voiceEl}<type>${type}</type>${dots}${staffEl}</note>`;
+    return `<note${n.hidden ? ' print-object="no"' : ""}><rest/><duration>${dur}</duration>${voiceEl}<type>${type}</type>${dots}${staffEl}</note>`;
   // **倚音不占拍子**：MusicXML 的 `<grace/>` 排在最前（`<chord/>` 之前），
   // 而且这种音**不许写 `<duration>`**——写了小节就超时长，回读的软件多半直接报错。
-  const grace = n.grace ? "<grace/>" : "";
+  // 短倚音的斜杠：路径画的（`findGraceSlashes`）记在 `graceSlash`，字形画的（`graceNoteSlash*`）挂在记号里
+  const grace = n.grace ? (n.graceSlash || n.marks?.some((m) => m.startsWith("graceNoteSlash")) ? '<grace slash="yes"/>' : "<grace/>") : "";
   const durEl = n.grace ? "" : `<duration>${dur}</duration>`;
   // `<chord/>` 紧跟在 `<grace/>` 之后（没有倚音时它就是第一个子元素）
   const chord = n.chordExtra ? "<chord/>" : "";
@@ -489,7 +574,7 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
   if (n.tieStop) nots.push(`<tied type="stop"/>`);
   // 弧的方向：圆滑线写 `placement`、连音线写 `orientation`（两种软件导出的常规写法，读入端两个都认）
   const tieOri = n.tieAbove === undefined ? "" : ` orientation="${n.tieAbove ? "over" : "under"}"`;
-  if (n.tieStart) nots.push(`<tied type="start"${n.tieDashed ? ` line-type="dashed"` : ""}${tieOri}/>`);
+  if (n.tieStart) nots.push(`<tied type="start"${idAttr(n.tieId)}${n.tieDashed ? ` line-type="dashed"` : ""}${tieOri}/>`);
   // 编号按谱表号：钢琴两行合一个 part 时同号的弧按编号配对，右手一条长弧还开着、左手又起又止一条，读入端就配串了（宁静 m32–36）；
   // 止端按起端那行编（跨谱表的弧）
   const slurNo = staffNo || 1;
@@ -518,7 +603,7 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
   for (const m of n.marks ?? []) {
     const a = ARTICULATION[m];
     if (a) {
-      arts.push(a);
+      arts.push(a.replace("/>", ` placement="${m.endsWith("Below") ? "below" : "above"}"/>`));
       continue;
     }
     if (m === "stringsUpBow" || m === "stringsDownBow") {
@@ -528,6 +613,8 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
     if (m === "arpeggiato") arpeggiate = true;
     else if (m.startsWith("fermata")) fermata = `<fermata type="${m === "fermataBelow" ? "inverted" : "upright"}"/>`;
     else if (m.startsWith("ornamentTrill") || m.startsWith("wiggleTrill")) orns.push(`<trill-mark/>`);
+    else if (m === "ornamentShortTrill") orns.push(`<inverted-mordent/>`);
+    else if (/^tremolo[123]$/.test(m)) orns.push(`<tremolo type="single"${n.tremoloAt ? ` default-x="${Math.round(n.tremoloAt.x * 100) / 10}" default-y="${Math.round(n.tremoloAt.y * 100) / 10}"` : ""}>${m.slice(-1)}</tremolo>`);
   }
   if (orns.length) nots.push(`<ornaments>${orns.join("")}</ornaments>`);
   if (tech.length) nots.push(`<technical>${tech.join("")}</technical>`);
@@ -543,11 +630,11 @@ function noteXmlRaw(n: StaffNote, dur: number, staffNo = 0, withVoice = false, v
   // 斜杠符头（前奏/间奏的「照这个节奏弹和弦」）：音高留着（它就画在第三线上），
   // 但要把符头形状写出来，不然回读时会变成一串真的 B4。`<notehead>` 排在 `<stem>` 之后、
   // `<staff>` 之前——MusicXML 的子元素次序是有规定的。
-  const head = n.slash ? `<notehead>slash</notehead>` : "";
+  const head = n.slash ? `<notehead>slash</notehead>` : n.xHead ? `<notehead>${n.xHead}</notehead>` : "";
   // `<beam>` 排在 `<staff>` 之后、`<notations>` 之前；和弦只写在打头那个音上（`emitVoices` 已把整枚和弦的杠挪到它身上）
   const beam = n.chordExtra ? "" : (n.beam ?? []).map((b, i) => `<beam number="${i + 1}">${b}</beam>`).join("");
   return (
-    `<note>${grace}${chord}<pitch><step>${escapeXml(n.step)}</step>${alter}<octave>${n.octave}</octave></pitch>` +
+    `<note>${grace}${chord}${n.unpitched ? `<unpitched><display-step>${escapeXml(n.step)}</display-step><display-octave>${n.octave}</display-octave></unpitched>` : `<pitch><step>${escapeXml(n.step)}</step>${alter}<octave>${n.octave}</octave></pitch>`}` +
     `${durEl}${tie}${voiceEl}<type>${type}</type>${dots}${acc}${timeMod}${stem}${head}${staffEl}${beam}${notations}${lyric}</note>`
   );
 }
@@ -759,6 +846,9 @@ export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = fal
     }
     return s0 + body.slice(at, to);
   };
+  // 识别对照的 id 写在同一端的**最后一份**上：和弦各音都起着同一条弧时（同一个弧号写了几遍），读入端并成一条、绑的是最后那个标签
+  const lastOf = new Map<string, Tok>();
+  for (const t of toks) lastOf.set(`${t.type}:${t.arc}`, t);
   const num = new Map<string, number>();
   const used = new Set<number>();
   let out = "";
@@ -776,7 +866,8 @@ export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = fal
       if (d >= 0) out = out.slice(0, d + 11) + `<tie type="${t.type}"/>` + out.slice(d + 11);
       // 弧的上下方照抄成延音线的朝向（读入端照 `orientation` 定方向，不写就由排版去猜）
       const ori = t.type === "start" ? ` orientation="${t.above || t.rest.includes('placement="above"') ? "over" : "under"}"` : "";
-      out += `<tied type="${t.type}"${ori}/>`;
+      const tid = lastOf.get(`${t.type}:${t.arc}`) === t && (t.type === "start" || alias.has(t.arc)) ? currentArcId?.(t.arc) : undefined;
+      out += `<tied type="${t.type}"${idAttr(tid)}${ori}/>`;
       continue;
     }
     let n = num.get(key);
@@ -789,16 +880,19 @@ export function renumberSlurs(body: string, sysOfBar?: number[], crossTies = fal
       used.delete(n);
       num.delete(key);
     }
-    out += `<slur type="${t.type}" number="${n}"${t.rest}/>`;
+    // 识别对照的 id：起端写这条弧的；跨行接上的后半截另是一个弧对象，它的 id 写在止端
+    const sid = lastOf.get(`${t.type}:${t.arc}`) !== t ? undefined : t.type === "start" || alias.has(t.arc) ? currentArcId?.(t.arc) : undefined;
+    out += `<slur type="${t.type}" number="${n}"${idAttr(sid)}${t.rest}/>`;
   }
   out += copy(last, body.length);
   return out.replace(/<notations><\/notations>/g, "");
 }
 
 /** `y`：写源谱版面时这一行词的基线（tenths，相对谱表顶线），原图上量的 */
-function lyricXml(l: { verse: number; text: string; hyphen: boolean; cont: boolean; extend?: boolean; above?: boolean }, y?: number): string {
+function lyricXml(l: { verse: number; text: string; hyphen: boolean; cont: boolean; extend?: boolean; above?: boolean; id?: string; label?: string }, y?: number): string {
   const syllabic = l.cont ? (l.hyphen ? "middle" : "end") : l.hyphen ? "begin" : "single";
-  return `<lyric number="${l.verse}"${y !== undefined ? ` default-y="${y}"` : ""}${l.above ? ' placement="above"' : ""}><syllabic>${syllabic}</syllabic><text>${escapeXml(l.text)}</text>${l.extend ? '<extend type="start"/>' : ""}</lyric>`;
+  // 首字前印的段号并进字前（`1.道`；不带点的隔空格 `1 Be`，读入端 `model/fromxml.ts::readLyrics` 拆回 `verseLabel`）
+  return `<lyric number="${l.verse}"${idAttr(l.id)}${y !== undefined ? ` default-y="${y}"` : ""}${l.above ? ' placement="above"' : ""}><syllabic>${syllabic}</syllabic><text>${escapeXml((l.label === undefined ? "" : /\d$/.test(l.label) ? `${l.label} ` : l.label) + l.text)}</text>${l.extend ? '<extend type="start"/>' : ""}</lyric>`;
 }
 
 function accidentalName(alter: number): string {
@@ -854,11 +948,14 @@ export function scoreToMusicXml(
   opts: StaffXmlOptions = {},
 ): string {
   currentNoteId = opts.noteId ?? null;
+  currentArcId = opts.arcId ?? null;
   withSourceLayout = opts.layout !== false;
   try {
     return scoreToMusicXmlRaw(score, notesOf, opts);
   } finally {
     currentNoteId = null;
+    currentArcId = null;
+    writtenIds.clear();
     withSourceLayout = false;
   }
 }
@@ -945,6 +1042,20 @@ function scoreToMusicXmlRaw(
         len = Math.max(len, voiceTicks(own, ticks));
       }
       return count >= 2 && len > 0 && len < full ? len : undefined;
+    };
+    /** 这一小节是不是多小节休止：印出来的各行都只有一个带数字的 `restHBar`、数字一致，返回小节数（不是返回 0） */
+    const multiRestOf = (staves: readonly (Staff | null | undefined)[], bi: number): number => {
+      let n = 0;
+      for (const st of staves) {
+        if (!st) continue;
+        const bar = st.bars[bi];
+        if (!bar) return 0;
+        const own = barNotes(st, staves, bar).filter((x) => !x.chordExtra);
+        const m = own.length === 1 && own[0].sym.code === "restHBar" ? (own[0].sym.multiRest ?? 0) : 0;
+        if (!m || (n && n !== m)) return 0;
+        n = m;
+      }
+      return n;
     };
     const hiddenSystem = (entry: (typeof score.systems)[number], si: number): string => {
       const ref = entry.sys.staves.find((st) => st.bars.length);
@@ -1047,6 +1158,9 @@ function scoreToMusicXmlRaw(
           // 隐藏了一段之后重新露面；多谱表声部只印了其中几行的（望十架第三页长笛那行没印、钢琴右手照印），没印的那行单独藏
           attrs += staffDetails(staves.map((st) => !!st));
         }
+        // 多小节休止：这个声部印出来的每行谱这一小节都只有一个带数字的 `restHBar`（数字一致），展开成那么多小节
+        const multi = multiRestOf(staves, bi);
+        if (multi > 1) attrs += `<measure-style><multiple-rest>${multi}</multiple-rest></measure-style>`;
         // 被系统换行劈开的小节的后半截：系统里任一行谱配得上就算（一行认漏了音、凑不满，别的行照样配得上，232 主也爱我歌）
         const splitTail = entry.sys.staves.some((st) => st.bars[bi]?.splitTail);
         const [beats, beatType] = (prevTime ?? "4/4").split("/").map((v) => parseInt(v));
@@ -1068,7 +1182,10 @@ function scoreToMusicXmlRaw(
           const bar = st.bars[bi];
           if (!bar) return;
           // 弱起小节里的整小节休止按弱起的实长写
-          const inBar = barNotes(st, staves, bar).map((n) => (pickup && n.sym.code === "restHBar" ? { ...n, duration: pickup / ticks(1) } : n));
+          // 整小节休止（`restHBar`，或一小节里只有一个全休止）按拍号的实长写：2/4 小节里印的全休止是两拍（八段锦 m52）
+          const own0 = barNotes(st, staves, bar);
+          const whole = own0.length === 1 && own0[0].rest && (own0[0].sym.code === "restHBar" || own0[0].base === 1);
+          const inBar = own0.map((n) => (pickup && n.sym.code === "restHBar" ? { ...n, duration: pickup / ticks(1) } : whole && !pickup ? { ...n, duration: beats / beatType } : n));
           // 行中换谱号（读音高时已经按它读了，`clefFor`）：写进这一小节，下一行行首要不要再写照它比
           const mids = midRowClefs(entry, st).filter((c) => c.box.left >= bar.left && c.box.left < bar.right);
           const midXml = mids.map((c) => {
@@ -1076,19 +1193,42 @@ function scoreToMusicXmlRaw(
             return { x: c.box.left, xml: staves.length > 1 ? x.replace("<clef>", `<clef number="${k + 1}">`) : x };
           });
           if (mids.length) prevClef[k] = clefXml(mids[mids.length - 1].code);
+          // 谱面上整小节什么都没印（八段锦钢片琴 m12）：写一个不显示的整小节休止占住时值
+          if (!inBar.length && !midXml.length) {
+            const dur = pickup ?? ticks(beats / beatType);
+            body += `<note print-object="no"><rest measure="yes"/><duration>${dur}</duration>${staves.length > 1 ? `<voice>${k * 4 + 1}</voice><staff>${k + 1}</staff>` : ""}</note>`;
+            if (k < staves.length - 1) body += `<backup><duration>${dur}</duration></backup>`;
+            return;
+          }
           body += emitVoices(inBar, ticks, staves.length > 1 ? k + 1 : 0, midXml, bar.right);
           const used = voiceTicks(inBar, ticks);
           // 换到下一行谱之前要把时间**倒回**小节头（MusicXML 的 `<backup>`）
           if (k < staves.length - 1 && used > 0) body += `<backup><duration>${used}</duration></backup>`;
         });
 
-        if (bar0)
-          body += barlineXml("right", {
-            style: bar0.rightStyle,
-            repeat: bar0.rightRepeat,
-            ending: bar0.endingStop ? bar0.endingNumber : null,
-          });
+        const rightBar = bar0
+          ? barlineXml("right", {
+              style: bar0.rightStyle,
+              repeat: bar0.rightRepeat,
+              ending: bar0.endingStop ? bar0.endingNumber : null,
+            })
+          : "";
+        if (multi <= 1) body += rightBar;
         body += `</measure>`;
+        // 多小节休止后面那几小节：各行一个整小节休止，右边的小节线挪到最后一小节
+        for (let k = 1; k < multi; k++) {
+          measureNo++;
+          sysOfBar.push(si);
+          const dur = ticks(beats / beatType);
+          body += `<measure number="${measureNo}">`;
+          staves.forEach((st, j) => {
+            if (!st) return;
+            if (j) body += `<backup><duration>${dur}</duration></backup>`;
+            body += `<note><rest measure="yes"/><duration>${dur}</duration><voice>${j * 4 + 1}</voice>${staves.length > 1 ? `<staff>${j + 1}</staff>` : ""}</note>`;
+          });
+          if (k === multi - 1) body += rightBar;
+          body += `</measure>`;
+        }
       }
     });
     bodies.push(`<part id="${id}">${renumberSlurs(body, sysOfBar, opts.crossPageTies)}</part>`);
@@ -1240,4 +1380,14 @@ function creditsXml(credits: StaffXmlOptions["credits"], layout?: SourceLayout |
       return `<credit page="${c.page ?? 1}">${c.type ? `<credit-type>${escapeXml(c.type)}</credit-type>` : ""}<credit-words${at}${c.justify ? ` justify="${c.justify}"` : ""}${fontAttr(c.size ? roundPt(c.size) : undefined)}>${escapeXml(c.text)}</credit-words></credit>`;
     })
     .join("");
+}
+
+/** 跳转记号文字的播放语义（`<sound>`）：D.S. → 回到 segno、D.C. → 回到曲首、Fine → 收在这里、To Coda → 跳到 coda。别的文字不出 */
+export function jumpSound(text: string): string {
+  const t = text.trim();
+  if (/^D\.?\s*S\b/i.test(t)) return `<sound dalsegno="segno"/>`;
+  if (/^D\.?\s*C\b/i.test(t)) return `<sound dacapo="yes"/>`;
+  if (/^fine\.?$/i.test(t)) return `<sound fine="yes"/>`;
+  if (/^to\s*coda/i.test(t)) return `<sound tocoda="coda"/>`;
+  return "";
 }

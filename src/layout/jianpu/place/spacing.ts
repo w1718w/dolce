@@ -6,17 +6,20 @@
 //
 // 锚点 x 是数字**墨迹中心**（compose 按墨迹居中落笔）；占位按数字**字面宽**算（同旧简谱引擎 `entryWidth`），
 // 所以列的左占位 = 锚点到落笔原点（墨迹中心偏移），右占位 = 字面宽 − 它（+ 附点占位）。
-import type { BarlineElement, Meter, NoteElement } from "../../../pu/ast";
+import { jpTremoloCount, jpTremoloStrokes } from "../../../engrave/jptremolo";
+import { jpSlideArrow, jpSlideOf } from "../../../engrave/jpslide";
+import type { BarlineElement, Meter, NoteElement } from "../../../jianpu/ast";
 import { barlineSpan, jianpuGraceMetrics, jianpuGraceNotes, type JianpuGrid } from "../metrics";
 import { latinWordBreak } from "../../../engrave/syllable";
 import { graceAdvance } from "../../../engrave/grace";
-import { ACCIDENTAL_CLEARANCE, accidentalLead, type AccidentalKind } from "../../../engrave/accidental";
+import { ACCIDENTAL_CLEARANCE } from "../../../engrave/accidental";
 import { BarlineGlyph } from "../../../engrave/barline";
 import { timeSigWidth } from "../../../engrave/timesig";
-import { puBarlineSpec } from "../barspec";
-import { BARLINE_MARKS } from "../../../pu/glyph";
+import { fanqieBarlineSpec } from "../barspec";
+import { BARLINE_MARKS } from "../../../engrave/jpglyph";
 import type { InkMeasurer, PlacedItem } from "./model";
-import { type ChordSpan, lineStartIndex, sectionWordOf, sectionWordSlot } from "./sectionword";
+import { accidentalLeadOf } from "./vertical";
+import { type ChordSpan, lineStartIndex, sectionWordLines, sectionWordOf, sectionWordSlot, widestLine } from "./sectionword";
 
 /** 一列：同一拍位（或同一条小节线）上各声部的符号。 */
 interface Column {
@@ -46,7 +49,7 @@ export const TIME_SIG_PAD_EM = 1 / 4;
  * 另给出线前那一小格要按的「组里第一个图元的高」（普通线是线高，`:‖` 先画点，是点径）。隐藏线 null。
  */
 export function barlineBox(el: BarlineElement, m: JianpuGrid): { left: number; right: number; first: number } | null {
-  const bs = puBarlineSpec(el);
+  const bs = fanqieBarlineSpec(el);
   if (!bs) return null;
   const span = barlineSpan(m);
   const g = new BarlineGlyph(bs.spec, bs.final, {
@@ -68,7 +71,7 @@ export function barlineBox(el: BarlineElement, m: JianpuGrid): { left: number; r
 
 /** 小节线第一根、最后一根竖线的线心（相对锚点）：房号竖脚对齐线位（`band.ts` / `marks.ts`，同旧简谱引擎 `Line.endingSpan`）。隐藏线 null。 */
 export function barlineLines(el: BarlineElement, m: JianpuGrid): { first: number; last: number } | null {
-  const bs = puBarlineSpec(el);
+  const bs = fanqieBarlineSpec(el);
   if (!bs) return null;
   const span = barlineSpan(m);
   const g = new BarlineGlyph(bs.spec, bs.final, {
@@ -92,6 +95,9 @@ export function meterAdvance(meter: Meter, m: JianpuGrid): number {
 }
 
 /** 一个符号的占位（相对锚点），口径见文件头。 */
+/** 多小节休止那道横杠的宽（数字墨迹高的倍数） */
+export const MULTI_REST_WIDTH = 3.2;
+
 function itemBox(it: PlacedItem, m: JianpuGrid, ink: InkMeasurer): { left: number; right: number; lead: number; want: number; over: number } {
   const el = it.element;
   if (el.kind === "barline") {
@@ -109,15 +115,30 @@ function itemBox(it: PlacedItem, m: JianpuGrid, ink: InkMeasurer): { left: numbe
   let lead = 0;
   let want = 0;
   let over = 0;
+  // 多小节休止：一道粗横杠（compose/note.ts::paintMultiRest），宽 MULTI_REST_WIDTH 个数字墨迹高，落笔点在中间
+  if (el.kind === "note" && el.multiRest) {
+    const half = (m.ink.noteHeight * MULTI_REST_WIDTH) / 2;
+    return { left: half, right: half + (d.advance - (d.ink.right - d.ink.left)) / 2, lead: 0, want: 0, over: 0 };
+  }
   if (el.kind === "note") {
     // 附点是画上去的圆，占位照旧按 `·` 的字面宽留（同旧简谱引擎 `JpNumber.augDotAdvance`）
     if (el.dots > 0) right += ink.digit("·").advance * el.dots;
+    // 震音号记在右下角、附点之后（`engrave/jptremolo.ts`）
+    const trem = jpTremoloCount(el.ornaments.map((o) => o.name));
+    if (trem > 0 && !el.hidden) right += jpTremoloStrokes(trem, m.ink.noteHeight).width;
+    // 滑音箭头记在数字（连同附点）右侧偏上（`engrave/jpslide.ts`）；尽量少占：只补出伸出字面宽之外的那截
+    const slide = jpSlideOf(el.ornaments.map((o) => o.name));
+    if (slide && !el.hidden) {
+      const inkEnd = d.ink.right - center + (el.dots > 0 ? ink.digit("·").advance * el.dots : 0);
+      right = Math.max(right, inkEnd + jpSlideArrow(slide === "up", m.ink.noteHeight).width);
+    }
     if (el.graceBefore.length > 0) lead = graceAdvance(jianpuGraceNotes(el.graceBefore), jianpuGraceMetrics(m));
     if (el.graceAfter.length > 0) right += graceAdvance(jianpuGraceNotes(el.graceAfter), jianpuGraceMetrics(m));
     // 临时记号软让位：伸出落笔原点左边多少、再多留一道空（`NoteEntry.addAccidental`）；`classic`（成书照原书）不让
-    if (el.accidental !== undefined && m.style.look.accidentalStyle !== "classic") {
+    const lead0 = accidentalLeadOf(el, m);
+    if (lead0 > 0 && m.style.look.accidentalStyle !== "classic") {
       const h = m.ink.noteHeight;
-      over = Math.max(0, accidentalLead(el.accidental as AccidentalKind, h, m.style.look.accidentalScale) - d.ink.left);
+      over = Math.max(0, lead0 - d.ink.left);
       want = over + h * ACCIDENTAL_CLEARANCE;
     }
   }
@@ -125,10 +146,17 @@ function itemBox(it: PlacedItem, m: JianpuGrid, ink: InkMeasurer): { left: numbe
 }
 
 /** 各声部的符号按「小节:拍位」归列（小节线按「第几条」），列按先后排好。键法同旧的多声部对齐。 */
-function columnsOf(lines: ReadonlyArray<{ items: PlacedItem[]; pad: number[] }>, m: JianpuGrid, ink: InkMeasurer): Column[] {
+/** 参加归列的一行：各声部的主行，外加同一谱表第二声部的并排下行（`barBase` = 它从主行第几小节起）。 */
+export interface SpacedLine {
+  items: PlacedItem[];
+  pad: number[];
+  barBase?: number;
+}
+
+function columnsOf(lines: ReadonlyArray<SpacedLine>, m: JianpuGrid, ink: InkMeasurer): Column[] {
   const byKey = new Map<string, { bar: number; beat: number; occ: number; col: Column }>();
   lines.forEach((l, v) => {
-    let bar = 0;
+    let bar = l.barBase ?? 0;
     const seen = new Map<string, number>();
     l.items.forEach((it, i) => {
       const isBar = it.element.kind === "barline";
@@ -264,7 +292,7 @@ function justify(cols: readonly Column[], X: number[], extra: number): void {
  * 返回自然宽（占位右缘，含歌词）。
  */
 export function placeColumns(
-  lines: ReadonlyArray<{ items: PlacedItem[]; pad: number[] }>,
+  lines: ReadonlyArray<SpacedLine>,
   m: JianpuGrid,
   ink: InkMeasurer,
   width: number,
@@ -343,7 +371,7 @@ class SectionWordRoom {
       const start = lineStartIndex(l.items);
       l.items.forEach((it, i) => {
         const w = sectionWordOf(it.element);
-        if (w) this.words.push({ items: l.items, i, ink: ink.sectionWord(w).ink, start: i === start });
+        if (w && sectionWordLines(w).length) this.words.push({ items: l.items, i, ink: widestLine(sectionWordLines(w), (x) => ink.sectionWord(x)).ink, start: i === start });
       });
     }
   }
@@ -496,7 +524,7 @@ class BarEndRoom {
  * 返回各符号的自然 x 与这一组的自然宽。
  */
 export function naturalColumns(
-  lines: ReadonlyArray<{ items: PlacedItem[]; pad: number[] }>,
+  lines: ReadonlyArray<SpacedLine>,
   m: JianpuGrid,
   ink: InkMeasurer,
 ): { xOf: Map<PlacedItem, number>; leftOf: Map<PlacedItem, number>; rightOf: Map<PlacedItem, number>; width: number } {
@@ -517,3 +545,4 @@ export function naturalColumns(
   });
   return { xOf, leftOf, rightOf, width };
 }
+

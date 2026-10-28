@@ -3,14 +3,17 @@
 // **默认音长固定写 `L:1/8`**：写出端要幂等，就不能让默认音长随内容浮动——
 // 同一份 `ScoreDoc` 第二次写出必须逐字相同。读入端照样认任意 `L:`。
 
-import { SIMPLE_DIVISIONS, type Chord, type Element, type Key, type Note, type Song } from "../model/doc";
-import { AbcFamilyEmitter, type MarkIndex } from "./emit";
-import { harmonyText } from "../model/jianpu";
+import { SIMPLE_DIVISIONS, type Chord, type Element, type Key, type Note, type Part, type ScoreDoc, type Song } from "../model/doc";
+import { AbcFamilyEmitter, type LyricStyle, type MarkIndex } from "./emit";
+import { clefName, harmonyText } from "../model/jianpu";
 import { nominalQuarters } from "../model/jianpu";
 import { tonicSpelling } from "../model/keyshift";
-import { isXmlShaped } from "../model/xmlproject";
+import { hasTieSyntax, isXmlShaped, slursAsTies } from "../model/xmlproject";
 import { directionsAsMarks } from "../model/directionmarks";
-import { withAbcPitches } from "./abcpitch";
+import { fillEmptyMeasures, splitStaves } from "../model/staves";
+import { fillAbsentGroups } from "../model/timeaxis";
+import { withAbcAccidentals, withAbcPitches } from "./abcpitch";
+import { creatorsFromCredits, headerFromCredits } from "../model/jianpuproject";
 
 /** ABC §4.13 里不随拍号变的默认比例（`parsedialect.ts::tupletNormalAbc`）。 */
 const ABC_FIXED_TUPLET: Readonly<Record<number, number>> = { 2: 3, 3: 2, 4: 3, 6: 2, 8: 3 };
@@ -52,6 +55,10 @@ function withAbcDivisions(src: Song): Song {
     let divisions = 1;
     for (const m of part.measures) {
       if (m.attrs?.divisions !== undefined) divisions = m.attrs.divisions;
+      // 记下的小节长（拆开的大谱表，`staves.ts::subMeasure`）写出端按它补齐末尾，同一口径
+      if (m.duration) m.duration = Math.round((m.duration / divisions) * SIMPLE_DIVISIONS);
+      // 小节中间换谱号的时刻（`emit.ts::midClefChanges`）同此
+      for (const la of m.laterAttrs ?? []) if (la.onset) la.onset = Math.round((la.onset / divisions) * SIMPLE_DIVISIONS);
       for (const el of m.elements) {
         if (el.kind === "chord" && el.grace) continue;
         if ((el.kind === "chord" || el.kind === "space") && el.duration) {
@@ -69,16 +76,49 @@ const GRACE_LEN: Readonly<Record<string, string>> = { quarter: "2", eighth: "", 
 
 export class EmitterAbc extends AbcFamilyEmitter {
   protected readonly versionLine = "%abc-2.1";
+  /** 正在写的歌是 MusicXML 来源（`emitSong` 设） */
+  private xmlSource = false;
+
+  /** 曲中换谱号写 `[K:clef=bass]`（ABC §3.1.14 的 `clef=` 写进 `K:`） */
+  protected override readonly inlineClefs = true;
+  /** 小节中间换谱号在原位写（行内字段 §3 哪儿都能写；钢琴下谱表半小节处转低音谱号） */
+  protected override readonly midClefs = true;
+
+  /** 声部名之外再写谱号 `clef=bass`（ABC §3.1.20）：低音、中音谱号与八度谱号写，单声部的高音谱号不写。
+   *  ABC 的音名是记谱音高，谱号只管画在哪条线上（钢琴左手的低音谱表以前转过来全丢，画成高音谱表上一串加线） */
+  protected override voiceAttrs(part: Part, multi: boolean): string {
+    const found = part.measures[0]?.attrs?.clefs?.find((x) => (x.staff ?? 1) === 1);
+    // 八度谱号只照 MusicXML 来源写（音名是记谱音高，读回 `assignDegrees` 按它推唱名，两头对得上）；
+    // 简谱来源的 `treble-8` 是「简谱按高八度记」，ABC 的音名照唱名写、不另写谱号（同以前）
+    const c = found && !this.xmlSource && found.octaveChange ? { ...found, octaveChange: 0 } : found;
+    const treble = !c || (c.sign === "G" && (c.line ?? 2) === 2);
+    const name = c && (c.octaveChange || !treble) ? clefName(c) : null;
+    return [super.voiceAttrs(part, multi), name ? `clef=${name}` : ""].filter(Boolean).join(" ");
+  }
+
+  /** 简谱口径的来源（123、文本谱…）相邻同音的括号是延音线，写成 `-`（`slursAsTies`）；ABC / Muse 来的括号就是圆滑线，照写 */
+  override emitDoc(doc: ScoreDoc): string {
+    return super.emitDoc(hasTieSyntax(doc) ? doc : { ...doc, songs: doc.songs.map(slursAsTies) });
+  }
 
   /** MusicXML 形状的歌先换时值口径，否则 `L:1/8` 下写出的是原始 divisions（八分写成 `E1/8`）；
    *  简谱形状的（只有度数）先补音高与 ABC 口径的记号（`abcpitch.ts`）。 */
   override emitSong(song: Song, fallbackNumber?: number): string {
-    const own = directionsAsMarks(song);
-    return super.emitSong(isXmlShaped(own) ? withAbcDivisions(own) : withAbcPitches(own), fallbackNumber);
+    // 钢琴大谱表拆成每条谱表一个 `V:`（`part=` 记它属于哪个声部，`model/staves.ts`）；
+    // 某声部缺席的组（前几行只有一个声部）补整小节不可见休止，ABC 各声部各数各的小节（`timeaxis.ts::fillAbsentGroups`）
+    const own = directionsAsMarks(splitStaves(fillEmptyMeasures(fillAbsentGroups(song))));
+    this.xmlSource = isXmlShaped(own);
+    if (!this.xmlSource) return super.emitSong(withAbcPitches(own), fallbackNumber);
+    // 页眉只写在 `<credit>` 里的署名、左上右上的文字、标题下的英文标题落成 `C:` / `I:topleft` / `T:`（同 123 那一路，`jianpuproject.ts`）
+    const xml = withAbcAccidentals(withAbcDivisions(own));
+    creatorsFromCredits(xml);
+    headerFromCredits(xml);
+    return super.emitSong(xml, fallbackNumber);
   }
 
   /** 长音中途换和弦（123 的 `5 F - C - -`，和弦挂在增时线上）：ABC 没有增时线，拆成连音线相连的几段、
-   *  和弦挂在各段上（`"F"A2-"C"A6`）。只在有增时线带和弦时拆，其余照旧一个音写完。 */
+   *  和弦挂在各段上（`"F"A2-"C"A6`）。只在有增时线带和弦时拆，其余照旧一个音写完。
+   *  MusicXML 的长音中途和弦（`laterHarmonies`）不拆：读回是几个连着的音、不再是一个长音，比丢一个和弦步数还多（丢失清单「长音中间不在整拍上的和弦」） */
   private sustainSegments(ch: Chord): { harmony?: Chord["harmony"]; divisions: number }[] | null {
     const su = ch.sustains;
     if (!su?.some((s) => s.harmony) || ch.rest || ch.grace || ch.rhythm) return null;
@@ -125,9 +165,14 @@ export class EmitterAbc extends AbcFamilyEmitter {
     return dur ? lengthSuffix(dur.divisions) : "";
   }
 
-  /** tie 的 start 端写 `-`（ABC §4.11）。 */
+  /** tie 的 start 端写 `-`（ABC §4.11）：和弦的音全连上写在和弦后，只连其中几个的写在那几个音后（`[D-d]`，`noteTieText`）。 */
   protected override tieText(ch: Chord): string {
-    return ch.notes.some((n) => n.tie?.start) ? "-" : "";
+    const notes = this.chordNotes(ch);
+    return notes.length && notes.every((n) => n.tie?.start) ? "-" : "";
+  }
+
+  protected override noteTieText(n: Note, notes: readonly Note[]): string {
+    return notes.length > 1 && n.tie?.start && !notes.every((x) => x.tie?.start) ? "-" : "";
   }
 
   /** ABC 没有「节奏音符」，退化成一个不发音高的 `x`——比丢掉强，且时值对得上。 */
@@ -166,17 +211,23 @@ export class EmitterAbc extends AbcFamilyEmitter {
   /** 拉丁词必须空格分开，否则读回来粘成一个音节。 */
   protected override readonly lyricSeparator = " ";
 
+  /** 印刷段号照 ABC 惯例写在首字前（`w:1.~道`），读回认（`parseLyricLine` 的 `tildeLabel`） */
+  protected override readonly lyricStyle: LyricStyle = { labels: "tilde" };
+
   /** ABC §5.1 的跳音符。 */
   protected override readonly lyricSkip = "*";
   protected override readonly lyricSlotRule = "abc" as const;
 
   /** ABC 默认「代码换行即谱面换行」（§6.1），所以写真换行而不是 123 的 `$`。
-   *  换页 ABC 没有对应记号，退化成换行。 */
+   *  换页在两个系统之间另起一行写 `%%newpage`（`pageBreakLine`）。 */
   protected override breakText(): string {
     return "\n";
   }
 
   protected override readonly trailingBreak = false;
+
+  /** ABC §11.4.7 的排版指令（规范标 VOLATILE，排版程序都认） */
+  protected override readonly pageBreakLine = "%%newpage";
 
   /** 倚音长度相对倚音单位（八分，ABC §4.12 单位由软件定）：`{g/}` 十六分、`{g2}` 四分。 */
   protected override graceDurationText(ch: Chord): string {

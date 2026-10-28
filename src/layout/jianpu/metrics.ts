@@ -10,11 +10,11 @@
 //   行内算完自然宽度后再整体拉伸/压缩到版心宽度（两端对齐）。
 // 子计划 3 改成按拍位归列、列宽按内容定之后，步进退役。
 
-import { Font } from "../font";
+import { Font } from "../../pagetree/font";
 import { arcHeight, type SlurStyle } from "../../engrave/arc";
 import type { GraceMetrics, GraceNote } from "../../engrave/grace";
 import { highDotY, lowDotY, type StackStyle } from "../../engrave/stack";
-import type { NoteElement } from "../../pu/ast";
+import type { NoteElement } from "../../jianpu/ast";
 import type { JianpuStyle } from "../../engrave/jianpustyle";
 
 /**
@@ -279,7 +279,7 @@ export function jianpuGraceMetrics(m: JianpuGrid): GraceMetrics {
   };
 }
 
-/** pu 的音符元素 → 公共倚音几何要的那几个字段。 */
+/** fanqie 的音符元素 → 公共倚音几何要的那几个字段。 */
 export function jianpuGraceNotes(els: readonly NoteElement[]): GraceNote[] {
   return els.map((gn) => ({
     digit: String(gn.pitch),

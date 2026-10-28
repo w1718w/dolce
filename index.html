@@ -67,7 +67,7 @@
           "alternateName": ["Dolce", "悦谱", "Dolce — Jianpu & Staff Notation Editor"],
           "applicationCategory": "MultimediaApplication",
           "operatingSystem": "Windows, macOS, Web",
-          "softwareVersion": "0.8.4",
+          "softwareVersion": "0.8.5",
           "inLanguage": ["zh-CN", "en"],
           "url": "https://lodebar2026.github.io/dolce/",
           "downloadUrl": "https://github.com/lodebar2026/dolce/releases",
@@ -258,6 +258,11 @@
           <div id="layout-mode-switch" class="layout-mode-switch" data-context-control aria-label="分行方式" data-i18n-aria="toolbar.linesAria" hidden>
             <button id="btn-layout-original" class="active" aria-pressed="true" title="保留导入或识别时的行结构" data-i18n-title="toolbar.layoutOriginal.title" data-i18n="toolbar.layoutOriginal">原始排版</button>
             <button id="btn-phrase" aria-pressed="false" title="根据歌词和音乐乐句重新安排换行" data-i18n-title="toolbar.phrase.title" data-i18n="toolbar.phrase">按乐句重排</button>
+            <span class="bars-per-line">
+              <button id="btn-bars" aria-pressed="false" title="每行固定放几个小节（弱起不计，原有换页保留）" data-i18n-title="toolbar.bars.title" data-i18n="toolbar.bars">每行</button>
+              <select id="sel-bars-per-line" aria-label="每行小节数" data-i18n-aria="toolbar.barsCount"><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option></select>
+              <span class="bars-unit" data-i18n="toolbar.barsUnit">小节</span>
+            </span>
           </div>
         </div>
         <div id="recognition-tools" class="tool-group context-tool-group" hidden>
@@ -307,9 +312,13 @@
               <select id="sel-doc-format" title="切换源码格式（识别结果不重新识别；打开的文件切回「原文」可还原）" aria-label="源码格式" data-i18n-title="pane.docFormat.title" data-i18n-aria="pane.docFormat"></select>
               <span class="select-chevron" aria-hidden="true">⌄</span>
             </label>
+            <!-- 转换丢了什么、怎么回到原稿（editor/formatswitch.ts::DocFormatSource.note） -->
+            <span id="doc-format-note" class="pane-note" hidden></span>
           </div>
           <div id="code-pane"></div>
         </section>
+        <!-- 三栏分隔条：拖动改宽度、双击复位（editor/splitters.ts） -->
+        <div id="split-code" class="pane-splitter" role="separator" aria-orientation="vertical" title="拖动调整宽度，双击复位" data-i18n-title="pane.splitter.title"></div>
         <section id="score-pane-shell" class="workspace-pane" aria-label="排版" data-i18n-aria="pane.score">
           <div class="pane-heading">
             <span data-i18n="pane.score">排版</span>
@@ -330,6 +339,7 @@
           <div id="score-pane"></div>
           <div id="omr-follow" class="omr-follow" hidden></div>
           <div id="omr-side" class="omr-side" hidden></div>
+          <div id="split-side" class="pane-splitter pane-splitter-abs" role="separator" aria-orientation="vertical" title="拖动调整宽度，双击复位" data-i18n-title="pane.splitter.title" hidden></div>
         </section>
 
         <section id="start-screen" aria-labelledby="start-title">

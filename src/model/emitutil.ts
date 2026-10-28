@@ -1,4 +1,4 @@
-// 文本写出端**共用**的助手：`ScoreDoc` → 123 / ABC（`abcfamily/emit.ts`）与 → 文本谱（`model/topu.ts`）。
+// 文本写出端**共用**的助手：`ScoreDoc` → 123 / ABC（`abcfamily/emit.ts`）与 → 文本谱（`fanqie/tofanqie.ts`）。
 //
 // 这几样与目标语法无关、只与模型结构有关：怎么按换行切系统、哪些弧两端都落在本声部、
 // 拉丁词挨着写会不会粘成一个音节。以前只在 ABC 家族的基类里，文本谱写出端要同一套判据，
@@ -6,7 +6,7 @@
 
 import type { Element, ElementId, Mark, Part, Song } from "./doc";
 import { breakAfter, type BreakKind } from "./helpers";
-import { isLyricCjk, isLyricOpenQuote, isLyricTrailingPunct } from "../common/cjkpunct";
+import { isLyricApostrophe, isLyricCjk, isLyricOpenQuote, isLyricTrailingPunct } from "../common/cjkpunct";
 
 /** 一个系统：第 `from`–`to` 小节（闭区间）。切在小节中间时，首小节从第 `fromEl` 个元素起、末小节到第 `toEl` 个止（不含）。 */
 export interface SystemRange {
@@ -28,7 +28,7 @@ export function inlineBreakOf(el: Element): BreakKind | null {
 
 /**
  * 按声部的换行切出系统。最后一段开到无穷，别的声部小节多出来的也归它。
- * **小节中间换行**照原位切（同 `.jpwabc`，读入端 `j123/parse.ts` 记在 `Chord.lineBreakAfter`）；
+ * **小节中间换行**照原位切（同 `.jpwabc`，读入端 `abcfamily/parse.ts` 记在 `Chord.lineBreakAfter`）；
  * 同一处换行在下一小节上还有一份小节级的 `print`（「这一小节之后」），那一份就不再切第二次。
  * 切点按这个声部（第一声部）算；别的声部的小节中间切点由 `partRanges` 按拍位对过去。
  */
@@ -62,7 +62,7 @@ export function systemRanges(part: Part | undefined): SystemRange[] {
  *  在别的声部是第几个元素（取拍位不早于切点的第一个）。四声部简谱的弱起曲（78《马槽歌》）谱行末不收
  *  小节线，每条谱行都切在小节中间；别的声部只按整小节归系统的话，行尾那半小节全挤到上一行，
  *  各声部的行就对不齐了。 */
-export function partRanges(ranges: readonly SystemRange[], lead: Part, part: Part): SystemRange[] {
+export function partRanges(ranges: readonly SystemRange[], lead: Part, part: Part, axis?: { lead: readonly number[]; part: readonly number[] }): SystemRange[] {
   if (part === lead) return [...ranges];
   const onsetAt = (p: Part, mi: number, el: number): number => {
     let t = 0;
@@ -78,9 +78,24 @@ export function partRanges(ranges: readonly SystemRange[], lead: Part, part: Par
     for (let j = 0; j <= els.length; j++) if (onsetAt(part, mi, j) >= t) return j;
     return els.length;
   };
-  const map = (mi: number, el: number): number =>
-    el === 0 || !Number.isFinite(el) ? el : indexAt(mi, onsetAt(lead, mi, el));
-  return ranges.map((r) => ({ ...r, fromEl: map(r.from, r.fromEl), toEl: map(r.to, r.toEl) }));
+  const map = (mi: number, el: number, pmi = mi): number =>
+    el === 0 || !Number.isFinite(el) ? el : indexAt(pmi, onsetAt(lead, mi, el));
+  if (!axis) return ranges.map((r) => ({ ...r, fromEl: map(r.from, r.fromEl), toEl: map(r.to, r.toEl) }));
+  // 按组排的歌（`timeaxis.ts`：某声部在有的组里缺席）：第一声部的小节落在轴上第几格，本声部就取同一格起止的小节；
+  // 这一段里本声部一个小节都没有就给空段（from > to，写出端跳过）。小节中间的切点只在两边同一格时照拍位对过去。
+  const atOrAfter = (slot: number): number => { const i = axis.part.findIndex((g) => g >= slot); return i < 0 ? part.measures.length : i; };
+  const atOrBefore = (slot: number): number => { let i = -1; axis.part.forEach((g, k) => { if (g <= slot) i = k; }); return i; };
+  return ranges.map((r) => {
+    const sf = axis.lead[r.from] ?? Infinity;
+    const st = r.to >= lead.measures.length ? Infinity : axis.lead[r.to]!;
+    const from = atOrAfter(sf);
+    const to = st === Infinity ? Number.MAX_SAFE_INTEGER : atOrBefore(st);
+    return {
+      ...r, from, to,
+      fromEl: axis.part[from] === sf ? map(r.from, r.fromEl, from) : 0,
+      toEl: axis.part[to] === st ? map(r.to, r.toEl, to) : Infinity,
+    };
+  });
 }
 
 /** 本声部里写得出来的元素 id（含增时线）。`emits` 判哪些元素写（123 只写简谱印的那一路）。 */
@@ -207,7 +222,7 @@ const LATIN_CH = /[\p{L}\p{N}']/u;
 /** 拉丁音节（非 CJK 的字母/数字）起头——歌词读入端的拉丁分支会把它和前面的拉丁词粘在一起 */
 export function isLatinStart(text: string): boolean {
   const c = [...text][0] ?? "";
-  return LATIN_CH.test(c) && !isLyricCjk(c);
+  return (LATIN_CH.test(c) && !isLyricCjk(c)) || isLyricApostrophe(text, 0);
 }
 export function isLatinEnd(text: string): boolean {
   const cs = [...text];
@@ -223,4 +238,13 @@ export function isOneCjkWithPunct(text: string): boolean {
   if (cs.length > 1 && isLyricOpenQuote(cs[0]!)) k = 1;
   if (!isLyricCjk(cs[k] ?? "")) return false;
   return cs.slice(k + 1).every(isLyricTrailingPunct);
+}
+
+/** 第一层符杠在这个音上是起、续还是收（`Chord.beams` 不保证按层排：识别稿的十六分音常是 `["backward hook","continue"]`）。不连为 undefined。 */
+export function beamLevel1(beams: readonly string[] | undefined): "begin" | "continue" | "end" | undefined {
+  const vals = (beams ?? []).filter((v) => v === "begin" || v === "continue" || v === "end");
+  if (!vals.length) return undefined;
+  if (vals.includes("continue")) return "continue";
+  if (vals.includes("begin")) return "begin";
+  return "end";
 }

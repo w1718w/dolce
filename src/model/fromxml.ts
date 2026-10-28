@@ -51,7 +51,7 @@ import { assignDegrees } from "./jianpu";
 import { addMeta } from "./metakeys";
 import { child, childText, children } from "../score/xmldom";
 import { bindSurface } from "./xmlsurface";
-import { t as tr } from "../i18n";
+import { ModelError, msg } from "./msg";
 
 const num = (el: Element | null, tag: string): number | undefined => {
   const t = el ? childText(el, tag) : null;
@@ -303,7 +303,12 @@ function readLyrics(noteEl: Element): Lyric[] {
     const texts = children(l, "text");
     const text = texts.map((t) => t.textContent ?? "").join("");
     const n = l.getAttribute("number");
-    const lr: Lyric = { number: n ? Number(n.replace(/[^\d]/g, "")) || 1 : 1, text };
+    // 首字前的印刷段号（`1.道`、`<text>1.</text><elision/><text>道</text>`；不带点的英文段号要隔空格 `1 Be`）
+    // 拆成 `verseLabel`，不算字（写出端 `toxml.ts::lyricXml` 并回去）
+    const syl0 = childText(l, "syllabic");
+    const lm = !syl0 || syl0 === "single" || syl0 === "begin" ? /^(\d+[.．、]|\d+(?=\s))\s*(\S.*)$/su.exec(text) : null;
+    const lr: Lyric = { number: n ? Number(n.replace(/[^\d]/g, "")) || 1 : 1, text: lm ? lm[2]! : text };
+    if (lm) lr.verseLabel = lm[1]!;
     if (n !== null && !/^\d+$/.test(n)) lr.numberText = n;
     const name = l.getAttribute("name");
     if (name !== null) lr.name = name;
@@ -334,10 +339,19 @@ function readNotations(noteEl: Element, marks: MarkSink, id: number, into: Notat
   if (art) {
     const list = Array.from(art.children).map((c) => c.tagName);
     if (list.length) n.articulations = list;
+    for (const c of Array.from(art.children)) {
+      const pl = c.getAttribute("placement");
+      if (pl === "above" || pl === "below") (n.articPlacement ??= {})[c.tagName] = pl;
+    }
   }
   const orn = child(nots, "ornaments");
   if (orn) {
-    const list = Array.from(orn.children).map((c) => c.tagName);
+    // 单音震音单收道数（`tremolo`）；双音震音（start/stop）照旧按元素名记
+    const trem = Array.from(orn.children).find((c) => c.tagName === "tremolo" && (c.getAttribute("type") ?? "single") === "single");
+    if (trem) n.tremolo = Math.min(4, Math.max(1, Number(trem.textContent?.trim() || 3) || 3));
+    const tx = trem?.getAttribute("default-x"), ty = trem?.getAttribute("default-y");
+    if (trem && tx !== null && ty !== null && tx !== undefined && ty !== undefined && Number.isFinite(Number(tx)) && Number.isFinite(Number(ty))) n.tremoloPos = { x: Number(tx), y: Number(ty) };
+    const list = Array.from(orn.children).filter((c) => c !== trem).map((c) => c.tagName);
     if (list.length) n.ornaments = list;
   }
   const tech = child(nots, "technical");
@@ -413,6 +427,12 @@ class MarkSink {
     const k = `${type}#${number}`;
     const list = this.open_.get(k);
     let at = list ? list.length - 1 : -1;
+    // tied：连的是同一个音，和弦里几条同时起、同时收时按音高配；按栈（后进先出）配就成了交叉的 A→D、D→A（八段锦高音笙 m74）
+    if (type === "tied" && list && list.length > 1) {
+      const pitch = pitchKeyOf(el);
+      const i = pitch ? list.map((o) => pitchKeyOf(o.el)).lastIndexOf(pitch) : -1;
+      if (i >= 0) at = i;
+    }
     // slur：先同谱表同声部，再同谱表，再别的谱表（跨谱表弧）
     if (type === "slur" && list) {
       const pick = (ok: (o: { staff: number; voice: number }) => boolean) => {
@@ -646,6 +666,8 @@ function readMeasure(
         if (staves !== undefined) a.staves = staves;
         const tr = child(c, "transpose");
         if (tr) a.transpose = readTranspose(tr);
+        const mr = num(child(c, "measure-style") ?? c, "multiple-rest");
+        if (child(c, "measure-style") && mr !== undefined && mr > 1) a.multiRest = mr;
         if (m.elements.length === 0) {
           m.attrs = { ...(m.attrs ?? {}), ...a };
           if (!firstAttrs) firstAttrs = c;
@@ -699,6 +721,14 @@ function readMeasure(
         if (pitchEl) {
           note.pitch = readPitch(pitchEl);
         }
+        const unpEl = pitchEl ? null : child(c, "unpitched");
+        if (unpEl) {
+          const ds = childText(unpEl, "display-step"), dov = childText(unpEl, "display-octave");
+          note.unpitched = {
+            ...(ds && /^[A-G]$/.test(ds) ? { step: ds as Pitch["step"] } : {}),
+            ...(dov && !Number.isNaN(Number(dov)) ? { octave: Number(dov) } : {}),
+          };
+        }
         const accEl = child(c, "accidental");
         const acc = accEl?.textContent;
         if (acc) note.accidental = acc as Note["accidental"];
@@ -713,7 +743,7 @@ function readMeasure(
             if (t.getAttribute("type") === "stop") note.tie.stop = true;
           }
         }
-        if (pitchEl) bindSurface(note, c);
+        if (pitchEl || unpEl) bindSurface(note, c);
         const noteSize = child(c, "type")?.getAttribute("size");
         if (noteSize) note.typeSize = noteSize;
         if (isChordNote && last) {
@@ -738,7 +768,8 @@ function readMeasure(
         const ch: Chord = {
           kind: "chord",
           id: ids.next(),
-          notes: pitchEl ? [note] : [],
+          // 节奏音符也留着这个音：它的延音线（`<tie>`）、显示位置、和弦里叠的第二个都挂在音上
+          notes: pitchEl || unpEl ? [note] : [],
           duration: {
             divisions: num(c, "duration") ?? 0,
             dots: children(c, "dot").length,
@@ -846,7 +877,7 @@ function readMeasure(
  *  读不懂的子节点挂在最近的 `raw` 上，由 `toxml.ts` 原位吐回去。 */
 export function loadScoreDoc(xmlText: string): ScoreDoc {
   const dom = new DOMParser().parseFromString(xmlText, "application/xml");
-  if (dom.querySelector("parsererror")) throw new Error(tr("err.xmlParse"));
+  if (dom.querySelector("parsererror")) throw new ModelError(msg("err.xmlParse"));
   const root = dom.documentElement;
   const doc = emptyDoc("musicxml");
   doc.source = xmlText;
@@ -942,4 +973,14 @@ export type { DocElement };
 function sourceIdOf(attr: string | null): ElementId | null {
   const m = attr ? new RegExp(`^${SOURCE_ID_PREFIX}(\\d+)$`).exec(attr) : null;
   return m ? Number(m[1]) : null;
+}
+
+/** `<tied>`/`<slur>` 所在那个 `<note>` 的音高（step + alter + octave）；没有音高（休止、节奏音符）为 undefined */
+function pitchKeyOf(notation: Element): string | undefined {
+  // 不用 `closest`：Node 端（测试、CLI）的 DOM 实现没有它
+  let note: Element | null = notation;
+  while (note && note.nodeName !== "note") note = note.parentNode as Element | null;
+  const p = note ? child(note, "pitch") : null;
+  if (!p) return undefined;
+  return `${childText(p, "step")}${childText(p, "alter") ?? ""}${childText(p, "octave")}`;
 }

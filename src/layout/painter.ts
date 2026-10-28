@@ -6,7 +6,7 @@
 // 点选 / 高亮部分移植自 mp/layout/draw.kt。
 
 import type { PlayItem } from "../score/playorder";
-import { Group, PageItem, TextFrame } from "./pageitem";
+import { Group, PageItem, TextFrame } from "../pagetree/pageitem";
 import type { ElementId, ScoreDoc } from "../model/doc";
 import { headerPartsOf, mixedVisitor, renderPageSvg, type HeaderPart } from "./render";
 import { pageGeometry, type LayoutResult } from "./result";
@@ -27,7 +27,7 @@ import type { PlacedPage } from "./jianpu/place";
 import type { JianpuGrid } from "./jianpu/metrics";
 import { ScoreIndex, type Hit } from "./scoreindex";
 import { Playhead, spanIn, svgBox } from "./playhead";
-import type { IdentityKind } from "./identity";
+import type { IdentityKind } from "../pagetree/identity";
 
 /** 五线谱播放线的宽（tenths，线距 10）：两个符头宽上下，各音一样宽 */
 const PLAYHEAD_W = 24;
@@ -45,6 +45,8 @@ export interface StaffPaintRequest {
   readonly hideBarNumber: boolean;
   /** 混排：简谱层叠在第几个声部上（缺省 0） */
   readonly jianpuPart?: number;
+  /** 谱里的换行换页是源文写明的，当硬断点（`MixedOptions.sourceBreaks`） */
+  readonly sourceBreaks?: boolean;
 }
 
 /** 原样文档这一路（文本谱与多声部 123/ABC、MusicXML 的原样档）：整份 `ScoreDoc` 按源行排，印刷原版观感。
@@ -123,7 +125,7 @@ export function measureDocument(
   const lead = one.parts.find((p) => p.measures.some((m) => m.elements.some((e) => e.kind === "chord" && (e.lyrics?.length ?? 0) > 0))) ?? one.parts[0];
   if (!lead) return { width: 0, spans: new Map() };
   const clone = structuredClone({ ...doc, songs: [{ ...one, parts: [lead] }] });
-  if (doc.sourceFormat !== "pu") for (const song of clone.songs) clearSongBreaks(song);
+  if (doc.sourceFormat !== "fanqie") for (const song of clone.songs) clearSongBreaks(song);
   const r = layoutJianpu(clone, {
     style: jianpuStyleOf(sheet),
     page: { width, height: width, continuous: true },
@@ -290,6 +292,7 @@ export class ScorePainter {
     const options = staffOptionsOf(meta, req.style);
     options.hideBarNumber = req.hideBarNumber;
     options.page = req.page;
+    options.sourceBreaks = req.sourceBreaks ?? false;
     const score = layoutStaff(req.doc, options);
     const { pages, placed } = layoutStaffPages(score, req.view === "mixed", req.jianpuPart ?? 0);
     const d = score.defaults;
@@ -346,7 +349,7 @@ export class ScorePainter {
     return out;
   }
 
-  /** 五线谱排好的版面与各系统落位（MusicXML 布局导出写版面坐标用，`mixed/engrave.ts`）。 */
+  /** 五线谱排好的版面与各系统落位（MusicXML 布局导出写版面坐标用，`editor/xmllayout.ts`）。 */
   get staffPlacement(): LayoutResult["staffPlacements"][number] | null {
     return this.result?.staffPlacements[0] ?? null;
   }

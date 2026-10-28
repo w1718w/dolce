@@ -10,7 +10,7 @@
 |---|---|
 | `src/model/toxml.ts::scoreDocToMusicXml` | **唯一写出端**：MusicXML 形状的 `ScoreDoc` → 文本。按固定元素次序建树，读进来的文档再按原节点回填表层（`OWNS` 之外的属性与子节点） |
 | `src/model/xmlproject.ts::projectForMusicXml` | **投影**：简谱来源留空的语义字段补齐成 MusicXML 形状（见下） |
-| `src/mixed/engrave.ts::engraveScoreDoc` | 版面坐标：五线谱引擎按设置里的纸排一遍。纸、分行分页、标题块、弧朝向写回模型；系统/谱表间距、小节宽、音符 `default-x`、符干、歌词/和弦/文字 `default-y` 装进 `EngravedLayout`，经 `ToXmlOptions.layout` 交给写出端 |
+| `src/editor/xmllayout.ts::engraveScoreDoc` | 版面坐标：五线谱引擎按设置里的纸排一遍。纸、分行分页、标题块、弧朝向写回模型；系统/谱表间距、小节宽、音符 `default-x`、符干、歌词/和弦/文字 `default-y` 装进 `EngravedLayout`，经 `ToXmlOptions.layout` 交给写出端 |
 | `src/editor/export.ts::buildMusicXml` | 调度：有底本且没改过给底本，否则整份重写 |
 
 只有这一份写出端、不做底本增量 patch：语义在 `ScoreDoc`，表层在原节点（`model/xmlsurface.ts`），整份重写不是降采样。
@@ -34,7 +34,7 @@
 
 ## 反方向：MusicXML → 简谱形状（`model/jianpuproject.ts`）
 
-`.musicxml` 的简谱档（`pu/slots.ts::docView`）与 123 写出端（`Emitter123.emitSong`）之前先投一次，模型本身不动。
+`.musicxml` 的简谱档（`jianpu/slots.ts::docView`）与 123 写出端（`Emitter123.emitSong`）之前先投一次，模型本身不动。
 MusicXML 的 `beams` 是 `<beam>` 元素、`dots` 是 `<dot>`、长音是 `type="half"`；简谱侧读的是减时线条数、简谱附点、增时线。
 不投的话附点二分画成附点四分、没连杠的八分音符当四分、结构化和弦一个都不显示。
 
@@ -49,7 +49,7 @@ MusicXML 的 `beams` 是 `<beam>` 元素、`dots` 是 `<dot>`、长音是 `type=
 
 **判据**：首小节带 `attrs.divisions` 的是 MusicXML 形状（`fromxml.ts` 读进来的），**原样返回**——
 `.musicxml` 重写因此逐字节不受投影影响（568 份实测）。其余在克隆上投影，不改调用方的文档。
-简谱来源（`frompu`/`j123`/`fromjpw`）一律不写 `attrs.divisions`，时值以一个四分音符 = 48 记名义时值。
+简谱来源（`fromfanqie`/`j123`/`fromjpw`）一律不写 `attrs.divisions`，时值以一个四分音符 = 48 记名义时值。
 
 改 `xmlproject.ts` 之前先读这几条，每条都对应一个对拍出来的问题（全部文本谱语料新旧写出端对拍）：
 
@@ -144,8 +144,8 @@ MusicXML 的 `beams` 是 `<beam>` 元素、`dots` 是 `<dot>`、长音是 `type=
 
 ## 版面
 
-版面坐标由**五线谱引擎**给（`mixed/engrave.ts::engraveScoreDoc`）：与屏幕上的五线谱同一套——
-同一张纸（设置里五线谱/混排那张，`App.staffPage`）、同一套断行（简谱视图实际排出的行当优选断点，见 [混排](混排.md) 自动铺排）、
+版面坐标由**五线谱引擎**给（`editor/xmllayout.ts::engraveScoreDoc`）：与屏幕上的五线谱同一套——
+同一张纸（设置里五线谱/混排那张，`App.staffPage`）、同一套断行（简谱视图实际排出的行当优选断点；ABC 照源文换行换页、当硬断点，见 [混排](混排.md) 自动铺排）、
 同一套自动铺排，排出来的坐标装进 `EngravedLayout`（不写进模型，与原文的表层同理），由写出端序列化。不碰 DOM。
 
 - 给出的：`<defaults>`（scaling 7mm/40tenths、page-layout、边距，写回模型；`system-layout` 在 `EngravedLayout`）、每行首小节的 `<print new-system|new-page>`（写回模型）与

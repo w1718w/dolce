@@ -161,6 +161,7 @@ export function resolvePairOctaveDots(rows: StaffRow[], numH: number): void {
 
 /** 每页单道增时线的统计宽度（见 buildJpNums 里的 dashUnit），按 Classified 记一次 */
 const dashUnitOf = new WeakMap<Classified, number>();
+const lineThickOf = new WeakMap<Classified, number>();
 
 export function buildJpNums(
   bin: Binary, rowCores: DigitCore[], numH: number, cls: Classified, ocrDigit: (b: Rect) => number,
@@ -524,6 +525,47 @@ export function buildJpNums(
     // 小节凭空少半拍（《主祢真伟大》第 25/33 小节即此，连 GT 都跟着错了）。
     // 改为：自上而下逐层验距，第一条要紧贴数字底，后面每条与上一条的间距不得超过 0.28 字高，
     // 断档就停止计数——真减时线不会稀稀拉拉地散在半个字高的范围里。
+    // 两道减时线挨得太近、连成一块（青年诗歌 60《经历基督作牧人》`3·3̳`：上道罩两音、下道只在后一音底下，
+    // 一头连着上道，合成一块 218×12，本页单道线厚 5~7）：本音符底下逐列数——中间隔着白的按墨段数，
+    // 糊死的按墨厚折成本页单道线厚的几倍；列数的中位是两三层就拆开，交给下面逐层验距去数
+    {
+      let t = lineThickOf.get(cls);
+      if (t === undefined) {
+        t = median(cls.hlines.filter((h) => h.bbox.w >= numH * 0.5 && h.bbox.h <= numH * 0.3).map((h) => h.bbox.h)) || 0;
+        lineThickOf.set(cls, t);
+      }
+      const thick = t;
+      const layersAt = (kb: Rect, x: number): number => {
+        let segs = 0, n = 0, inInk = false;
+        for (let y = kb.y; y < rbottom(kb); y++) {
+          const on = bin.data[y * bin.w + x] !== 0;
+          if (on) { n++; if (!inInk) segs++; }
+          inInk = on;
+        }
+        return segs >= 2 ? segs : n >= thick * 1.7 ? Math.round(n / thick) : segs;
+      };
+      if (thick >= 2) {
+        for (let i = 0; i < belowLines.length; i++) {
+          const kb = belowLines[i]!;
+          if (kb.h < thick * 1.7) continue;
+          const x0 = Math.max(kb.x, d.x), x1 = Math.min(rright(kb), rright(d));
+          const cols: number[] = [];
+          for (let x = x0; x < x1; x++) cols.push(layersAt(kb, x));
+          const layers = Math.min(3, median(cols));
+          if (layers < 2) continue;
+          probe("underline.fusedStack");
+          // 多层那段的横向范围：从本音符往两边连着几层都在的列
+          let a = x0, b = x1;
+          while (a > kb.x && layersAt(kb, a - 1) >= layers) a--;
+          while (b < rright(kb) && layersAt(kb, b) >= layers) b++;
+          const h = kb.h / layers;
+          const parts: Rect[] = [{ x: kb.x, y: kb.y, w: kb.w, h: Math.round(h) }];
+          for (let j = 1; j < layers; j++) parts.push({ x: a, y: Math.round(kb.y + h * j), w: b - a, h: Math.round(h) });
+          belowLines.splice(i, 1, ...parts);
+          i += parts.length - 1;
+        }
+      }
+    }
     belowLines.sort((a, b) => a.y - b.y);
     let prev: Rect | null = null;
     for (const kb of belowLines) {
@@ -540,6 +582,10 @@ export function buildJpNums(
         //（青年诗歌 18 `3̲` 下「丽」的顶横：层距 0.26 字高、单看层距分不开，左冒 4px、右冒 6px，字号 43）
         const tol = Math.max(2, numH * 0.06);
         if (prev.x - kb.x > tol || rright(kb) - rright(prev) > tol) { probe("underline.misaligned"); break; }
+        // 下一道不能是**字框的顶边**：歌词字的顶横底下连着字身，在这道线的横向范围里往下量，墨不断档、一口气延伸大半个字高
+        //（青年诗歌 22 `4̲` 下「远」的顶横：层距 0.38 字高、两端都缩在上一道里，往下连着 0.83 字高的墨）。
+        // 真减时线底下是空的，或隔着一道空白才到歌词
+        if (glyphBelow(bin, kb, numH) >= numH * 0.55) { probe("underline.glyphTop"); break; }
       }
       div++;
       prev = kb;
@@ -562,6 +608,20 @@ export function buildJpNums(
     for (const n of out) if (Math.abs(rcy(n.bbox) - mid) > numH * 0.45) n.doubt = [...(n.doubt ?? []), "note.offRow"];
   }
   return out;
+}
+
+/** 从横线 `r` 的顶往下、在它的横向范围（两边各放 0.15 字号：字的竖笔常从顶横端头外侧下来）里量墨连续延伸多高，
+ *  容 0.1 字号以内的断档（字身里笔画间的空；减时线到下面歌词的空白要宽得多，该书 0.18 字号）。 */
+function glyphBelow(bin: Binary, r: Rect, numH: number): number {
+  const pad = Math.round(numH * 0.15);
+  const x0 = Math.max(0, Math.round(r.x) - pad), x1 = Math.min(bin.w - 1, Math.round(rright(r)) + pad);
+  const y0 = Math.max(0, Math.round(r.y)), yMax = Math.min(bin.h - 1, Math.round(r.y + numH * 1.2));
+  const maxGap = Math.max(1, Math.round(numH * 0.1));
+  let last = y0;
+  for (let y = y0; y <= yMax && y - last <= maxGap; y++) {
+    for (let x = x0; x <= x1; x++) if (bin.data[y * bin.w + x]) { last = y; break; }
+  }
+  return last - y0 + 1;
 }
 
 /** 数字 `d` 正上方（中间几列）离它最近的那段墨像不像一个点（离数字顶不到 0.8 字号）。只量像素、不看连通块——

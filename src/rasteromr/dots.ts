@@ -69,7 +69,7 @@ const REPEAT_INK = 0.9;
 /** `onLine`：这一行像素在谱线上（去线后残渣所在）。连通照走，但不计入点的盒、也不算伸出窗口
  *  ——贴着谱线的附点在去线图上常连着一截残渣，盒高超限或伸出窗口就整个丢了（我灵镇静 m3 的附点四分）。
  *  `only`：只给这几个头找（后补的头），其余头照样用来定窗口。 */
-export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staffYs: number[][], onLine: (y: number) => boolean = () => false, only?: RasterSym[]): Rect[] {
+export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staffYs: (x: number) => number[][], onLine: (y: number, x?: number) => boolean = () => false, only?: RasterSym[]): Rect[] {
   const sp = unit.space;
   const out: Rect[] = [];
   const heads = syms.filter((s0) => /^notehead/.test(s0.code));
@@ -102,7 +102,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
           const py = stack.pop()!;
           const px = stack.pop()!;
           grow(a, px, py);
-          if (!onLine(py)) grow(b, px, py);
+          if (!onLine(py, px)) grow(b, px, py);
           for (let dy = -1; dy <= 1; dy++)
             for (let dx = -1; dx <= 1; dx++) {
               const nx = px + dx;
@@ -110,7 +110,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
               if (nx < 0 || ny < 0 || nx >= bin.w || ny >= bin.h || !bin.data[ny * bin.w + nx]) continue;
               if (nx < x0 || ny < y0 || nx >= x1 || ny >= y1) {
                 a.edge = true;
-                if (!onLine(ny)) b.edge = true;
+                if (!onLine(ny, nx)) b.edge = true;
                 continue;
               }
               const j = (ny - y0) * W + (nx - x0);
@@ -161,7 +161,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
     const cy = b.y + b.h / 2;
     const above = colHead(b, 0.3, 3.2);
     if (above && colHead(b, -0.1, 0.7) && !colHead(b, -3.2, -0.3)) return DOT_BELOW_PUSHED;
-    if (colHead(b, 0.3, 1.2) || ((above || stemDown(b)) && onLine(Math.round(cy)))) return DOT_BELOW_STACKED;
+    if (colHead(b, 0.3, 1.2) || ((above || stemDown(b)) && onLine(Math.round(cy), b.x + b.w / 2))) return DOT_BELOW_STACKED;
     return DOT_BELOW;
   };
   /** 干从头的左缘往下伸（下声部）：左缘一像素内有一段 1.5 格以上的竖墨，谱线行算连着。
@@ -169,7 +169,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
   const stemDown = (b: Rect) => {
     for (let x = Math.max(0, b.x - 1); x <= Math.min(bin.w - 1, b.x + 1); x++) {
       let run = 0;
-      for (let y = Math.round(b.y + b.h / 2); y < bin.h && (bin.data[y * bin.w + x] || onLine(y)); y++) run++;
+      for (let y = Math.round(b.y + b.h / 2); y < bin.h && (bin.data[y * bin.w + x] || onLine(y, x)); y++) run++;
       if (run >= sp * 1.5 + b.h / 2) return true;
     }
     return false;
@@ -187,7 +187,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
    * 是符尾的尖——符尾弯下来的末端被切断，剩一个圆点贴着笔画的断口（善牧恩慈歌 m9、万福泉源歌 m18）。
    * 只贴着连音线、加线的真附点不算（晨曦破晓 m8、m9 的附点二分）。谱线那几行不算。
    */
-  const isolated = (d: Rect): boolean => {
+  const isolated = (d: Rect, own?: Rect): boolean => {
     const g = Math.max(2, Math.round(sp * DOT_ISOLATE));
     const R = Math.round(sp * 1.5);
     const x0 = Math.max(0, d.x - R), x1 = Math.min(bin.w, d.x + d.w + R);
@@ -204,9 +204,12 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
       while (c < bin.w - 1 && bin.data[y * bin.w + c + 1]) c++;
       return c - a + 1;
     };
-    const inDot = (x: number, y: number) => x >= d.x && x < d.x + d.w && y >= d.y && y < d.y + d.h;
+    // 本头那几列（连同贴在头右缘的干）在头上下半格以内的也不灌：点贴着头右缘一两像素时，从头灌到它自己朝上的干上
+    //（主差遣我 p1 m13 女声 G4 附点四分）。再往外的照灌：本音自己的符尾尖贴着干弯下来（善牧恩慈歌 m8）
+    const ownCol = (x: number, y: number) => !!own && x >= own.x - 1 && x <= own.x + own.w + 1 && y >= own.y - sp * 0.5 && y <= own.y + own.h + sp * 0.5;
+    const inDot = (x: number, y: number) => (x >= d.x && x < d.x + d.w && y >= d.y && y < d.y + d.h) || ownCol(x, y);
     for (let y = d.y - g; y < d.y + d.h + g; y++) {
-      if (y < y0 || y >= y1 || onLine(y)) continue;
+      if (y < y0 || y >= y1 || onLine(y, d.x + d.w / 2)) continue;
       for (let x = d.x - g; x < d.x + d.w + g; x++) {
         if (x < x0 || x >= x1 || inDot(x, y) || !bin.data[y * bin.w + x] || seen[(y - y0) * W + x - x0] || hRun(x, y) >= sp) continue;
         seen[(y - y0) * W + x - x0] = 1;
@@ -226,9 +229,9 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
         for (let dx = -1; dx <= 1; dx++) {
           const nx = x + dx;
           let ny = y + dy;
-          if (dy !== 0 && ny >= y0 && ny < y1 && onLine(ny)) {
+          if (dy !== 0 && ny >= y0 && ny < y1 && onLine(ny, nx)) {
             let k = 0;
-            while (k < 8 && ny >= y0 && ny < y1 && onLine(ny)) {
+            while (k < 8 && ny >= y0 && ny < y1 && onLine(ny, nx)) {
               ny += dy;
               k++;
             }
@@ -246,7 +249,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
       let run = 0;
       let most = 0;
       for (let y = a; y <= c; y++) {
-        run = bin.data[y * bin.w + x] || onLine(y) ? run + 1 : 0;
+        run = bin.data[y * bin.w + x] || onLine(y, x) ? run + 1 : 0;
         most = Math.max(most, run);
       }
       if (most >= sp * 1.5) return false;
@@ -258,7 +261,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
     let n = 0;
     let sy = 0;
     for (let y = o.y; y < o.y + o.h; y++) {
-      if (onLine(y)) continue;
+      if (onLine(y, o.x + o.w / 2)) continue;
       for (let x = o.x; x < o.x + o.w; x++) if (bin.data[y * bin.w + x]) {
         n++;
         sy += y;
@@ -269,7 +272,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
   /** 盒里有不在谱线行上的墨。 */
   const offLine = (o: Rect) => {
     for (let y = o.y; y < o.y + o.h; y++) {
-      if (onLine(y)) continue;
+      if (onLine(y, o.x + o.w / 2)) continue;
       for (let x = o.x; x < o.x + o.w; x++) if (bin.data[y * bin.w + x]) return true;
     }
     return false;
@@ -283,14 +286,14 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
     const ax = d.x + d.w / 2, ay = d.y + d.h / 2;
     const bx = o.x + o.w / 2, by = o.y + o.h / 2;
     if (Math.abs(ax - bx) > sp * REPEAT_X) return false;
-    const ys = staffYs.find((l) => l.length === 5 && ay > l[0] && ay < l[4]);
+    const ys = staffYs(ax).find((l) => l.length === 5 && ay > l[0] && ay < l[4]);
     if (!ys) return false;
     const up = Math.min(ay, by), dn = Math.max(ay, by);
     if (Math.abs(up - (ys[1] + ys[2]) / 2) > sp * REPEAT_Y || Math.abs(dn - (ys[2] + ys[3]) / 2) > sp * REPEAT_Y) return false;
     // 贯穿谱表的竖墨列，并成一根根竖线
     const full = (x: number) => {
       let ink = 0;
-      for (let y = Math.round(ys[0]); y <= Math.round(ys[4]); y++) if (bin.data[y * bin.w + x] || onLine(y)) ink++;
+      for (let y = Math.round(ys[0]); y <= Math.round(ys[4]); y++) if (bin.data[y * bin.w + x] || onLine(y, x)) ink++;
       return ink >= (Math.round(ys[4]) - Math.round(ys[0]) + 1) * REPEAT_INK;
     };
     const left = Math.min(d.x, o.x), right = Math.max(d.x + d.w, o.x + o.w);
@@ -331,20 +334,20 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
     // 靠这一放才收进来的（左缘在原窗口左边）要够大（两边都 0.3 格）：谱线在头右边的残渣原来被窗口切掉（我灵镇静 m21 多出一个点）
     // 上沿在谱线网格验得了间位的地方多放 `DOT_HEAD_TOL`：头盒带进加线下面一截时中心偏下，线上音写在上方间里的点
     // 就出了窗口（齐来谢主歌 m13 低音谱表上加一线 C4 附点二分，差 0.4 像素）。放进来的仍要过下面按谱线定高差那一道
-    const gridAt = (qy: number) => staffYs.find((ys) => ys.length === 5 && qy > ys[0] - sp * 1.5 && qy < ys[4] + sp * 1.5);
+    const gridAt = (qy: number) => staffYs(r).find((ys) => ys.length === 5 && qy > ys[0] - sp * 1.5 && qy < ys[4] + sp * 1.5);
     const upTol = gridAt(cy) ? DOT_HEAD_TOL : 0;
     for (const d of blobsIn(r - sp * DOT_PAD, cy - sp * (0.85 + upTol + DOT_PAD), r + sp * (1.3 + DOT_PAD), cy + sp * (bl + DOT_PAD)).filter((q) => {
       const qx = q.x + q.w / 2;
       const qy = q.y + q.h / 2;
       if (q.x < r + sp * 0.05 && (q.w < sp * 0.3 || q.h < sp * 0.3)) return false;
       if (!(qx > r + sp * 0.05 && qx < r + sp * 1.3 && qy > cy - sp * (0.85 + (gridAt(qy) ? upTol : 0)) && qy < cy + sp * bl)) return false;
-      const inStaff = staffYs.some((l) => qy > l[0] - sp && qy < l[l.length - 1] + sp);
+      const inStaff = staffYs(qx).some((l) => qy > l[0] - sp && qy < l[l.length - 1] + sp);
       // **按谱线定高差**：附点写在间里，点心离间心不过 `DOT_SPACE_TOL` 格；点所在的间与头的位置（按谱线取整到半格）
       // 只差几档——间上的音同一个间（0）、线上的音上下相邻的间（±半格）、和弦挤着二度的往下挪一个间（+1）。
       // 头盒中心不准（带进一截干、只罩住半个头），拿它直接量高差会错剔二十多个真附点，所以头位置取 ±`DOT_HEAD_TOL` 格内的半格。
       // 点心取不在谱线行上的墨的重心：贴线的点盒子带进线行，中心被拉偏（我灵镇静 m10、父恩广大 m6）。
       // 五线以外没有线，加线音的点常与头齐平（齐来崇拜 m8、m22 的 C4），那里不要求落在间里。谱表外一格半以外的不管
-      const l = staffYs.find((ys) => ys.length === 5 && qy > ys[0] - sp * 1.5 && qy < ys[4] + sp * 1.5);
+      const l = staffYs(qx).find((ys) => ys.length === 5 && qy > ys[0] - sp * 1.5 && qy < ys[4] + sp * 1.5);
       if (l) {
         const g = (l[4] - l[0]) / 4;
         const pos = (inkMidY(q) - l[0]) / g;
@@ -365,12 +368,13 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
       // 扫描件谱线下沿的鼓包、残渣正好在那儿（破碎 p6/p7 三处），谱表外歌词字的一笔也常落在这儿（望十架）
       if (bl === DOT_BELOW && qy > cy + sp * DOT_BELOW_SOLID) {
         if (!inStaff) return false;
-        for (let y = q.y - 1; y <= q.y + q.h; y++) if (onLine(y)) return false;
+        for (let y = q.y - 1; y <= q.y + q.h; y++) if (onLine(y, q.x + q.w / 2)) return false;
       }
       return true;
     })) {
       if (out.some((o) => overlapFrac(o, d) > 0)) continue;
-      if (syms.some((s0) => overlapFrac(d, s0.box) > 0.3)) continue;
+      // 本头的盒不算：空心头盒偏宽、罩住紧贴着的点三四列（主差遣我 p2 m29 男声 G3 附点二分）
+      if (syms.some((s0) => s0.box !== b && overlapFrac(d, s0.box) > 0.3)) continue;
       // 反复记号的两点：同一列上下一格处还有一个点。
       // 但**和弦的附点**也是这样上下一格排着：另一个点若落在同列**另一个头**的附点窗口里，
       // 它就有自己的主人、不是反复记号（齐来称颂 m4/m17~m19、赞美三一真神 m5/m8 的附点二分和弦
@@ -391,7 +395,7 @@ export function findDots(bin: Binary, syms: RasterSym[], unit: RasterUnit, staff
       const speckles = blobsIn(dcx - sp * DOT_CLEAR, dcy - sp * DOT_CLEAR, dcx + sp * DOT_CLEAR, dcy + sp * DOT_CLEAR)
         .filter((o) => overlapFrac(o, d) === 0 && offLine(o) && !syms.some((s0) => overlapFrac(o, s0.box) > 0));
       if (speckles.length) continue;
-      if (!isolated(d)) continue;
+      if (!isolated(d, b)) continue;
       out.push(d);
     }
   }

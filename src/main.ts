@@ -15,6 +15,11 @@ import type { MixedOptions } from "./mixed/model";
 import { initLang, onLangChange, t } from "./i18n";
 import { setupPopover } from "./editor/toolpop";
 import { setupCompareSelect } from "./editor/comparemode";
+import { attachPinchZoom } from "./editor/pinchzoom";
+import { setupSplitters } from "./editor/splitters";
+
+/** 工具栏「每行 N 小节」上次选的 N */
+const BARS_PER_LINE_KEY = "dolce-bars-per-line";
 
 // Built-in sample (圣哉，圣哉，圣哉) — same content as CodeEditor.kt `scr`.
 const SAMPLE = `// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************
@@ -84,7 +89,7 @@ async function boot() {
     paletteBtn: document.getElementById("btn-palette") as HTMLButtonElement | null,
   });
   app.mountEditor(codePane, SAMPLE);
-  const win = window as unknown as { __app: App; __paint: ReturnType<typeof paintProbe>; __mixedModel: unknown; __omr: unknown; __raster: unknown; __project: unknown; __xmlout: unknown; __pu: unknown; __book: unknown;
+  const win = window as unknown as { __app: App; __paint: ReturnType<typeof paintProbe>; __mixedModel: unknown; __omr: unknown; __raster: unknown; __project: unknown; __xmlout: unknown; __fanqie: unknown; __book: unknown;
     __j123: unknown; __pptx: unknown; __songbook: unknown };
   win.__app = app;
   // 统一排版器暴露（`new __paint.ScorePainter(__paint.resources)` + 请求），供混排 / 原样文档的无头回归脚本用。
@@ -98,20 +103,20 @@ async function boot() {
   win.__raster = import("./rasteromr/browser");
   // 识别项目打包 / 自动保存草稿：`omr-project-check.mjs` 拿字节做存—开往返
   win.__project = Promise.all([import("./editor/omrproject"), import("./editor/autosave")]).then(([p, a]) => ({ ...p, ...a }));
-  // 文本谱（番茄 / 有谱）解析与排版暴露，供 pu-*.mjs 回归。
-  win.__pu = import("./pu");
+  // 文本谱（番茄 / 有谱）解析与排版暴露，供 fanqie-*.mjs 回归。
+  win.__fanqie = import("./fanqie");
   // PPTX 导出（序列化器 + 展开档另排一遍那个 painter）暴露，供 scripts/pptx-export.mjs 批量转出用。
   win.__pptx = Promise.all([import("./editor/pptx"), import("./editor/export")])
     .then(([pptx, exp]) => ({ ...pptx, pptxPainter: exp.pptxPainter }));
   // 成书重排（BookStyle 注入 + 页面树 → DrawList）暴露，供 scripts/rebuild.mjs 用。
   win.__book = Promise.all([
     import("./pdflayout/browser"), import("./style/book"), import("./layout/painter"),
-    import("./score/phrase"), import("./score/applybreaks"), import("./jpword/jpwfile"),
-    import("./jpword/parse"), import("./model/jianpuinput"), import("./pu"),
+    import("./score/phrase"), import("./jianpu/applybreaks"), import("./jpword/jpwfile"),
+    import("./jpword/parse"), import("./jianpu/jianpuinput"), import("./fanqie"),
     import("./model/fromxml"), import("./model/phrasedoc"), import("./score/timeline"), import("./model/playdoc"),
     import("./score/midi"), import("./layout/input"),
-  ]).then(([book, bookStyle, painter, phrase, applybreaks, jpwfile, parse, jianpuinput, pu, fromxml, phrasedoc, timeline, playdoc, midi, input]) => ({
-    ...book, ...bookStyle, ...painter, ...phrase, ...applybreaks, ...jpwfile, ...parse, ...jianpuinput, pu,
+  ]).then(([book, bookStyle, painter, phrase, applybreaks, jpwfile, parse, jianpuinput, fanqie, fromxml, phrasedoc, timeline, playdoc, midi, input]) => ({
+    ...book, ...bookStyle, ...painter, ...phrase, ...applybreaks, ...jpwfile, ...parse, ...jianpuinput, fanqie,
     ...fromxml, ...phrasedoc, ...timeline, ...playdoc, ...midi, ...input,
   }));
   // 混排歌本（清单 + .ss → DrawPage[]）暴露，供 scripts/kl2020-book.mjs 用。
@@ -120,24 +125,24 @@ async function boot() {
   // 123 格式与语义模型暴露，供 scripts/j123-migrate.mjs 跑 MusicXML 那一路——
   // `loadScoreDoc` 要 DOMParser，Node 侧没有，所以这条必须在浏览器里走（同 __book 的路子）。
   win.__j123 = Promise.all([
-    import("./j123/parse"), import("./j123/emit"),
-    import("./model/fromjpw"), import("./model/frompu"), import("./model/helpers"),
-    import("./model/jianpuinput"), import("./pu"),
+    import("./abcfamily/parse"), import("./abcfamily/emit123.entry"),
+    import("./model/fromjpw"), import("./fanqie/fromfanqie"), import("./model/helpers"),
+    import("./jianpu/jianpuinput"), import("./fanqie"),
     import("./abcfamily/emitabc.entry"),
-    import("./model/fromxml"), import("./model/toxml"), import("./model/capability"),
+    import("./model/fromxml"), import("./model/toxml"), import("./convert/capability"),
     import("./model/jianpuproject"), import("./model/jianpu"), import("./model/tojpw"), import("./model/xmlproject"),
-    import("./model/breaks"),
+    import("./model/breaks"), import("./convert/jpwabc"),
   ]).then((
-    [parse, emit, fromjpw, frompu, helpers, jianpuinput, pu, emitabc,
-     fromxml, toxml, capability, jianpuproject, jianpu, tojpw, xmlproject, breaks],
+    [parse, emit, fromjpw, fromfanqie, helpers, jianpuinput, fanqie, emitabc,
+     fromxml, toxml, capability, jianpuproject, jianpu, tojpw, xmlproject, breaks, jpwabc],
   ) => ({
-    ...parse, ...emit, ...fromjpw, ...frompu, ...helpers, ...jianpuinput, pu,
-    ...emitabc, ...fromxml, ...toxml, ...capability, ...jianpuproject, ...jianpu, ...tojpw, ...xmlproject, ...breaks,
+    ...parse, ...emit, ...fromjpw, ...fromfanqie, ...helpers, ...jianpuinput, fanqie,
+    ...emitabc, ...fromxml, ...toxml, ...capability, ...jianpuproject, ...jianpu, ...tojpw, ...xmlproject, ...breaks, ...jpwabc,
   }));
   // `.jpwabc` ↔ MusicXML 的读入与导出版面（`engraveScoreDoc`：五线谱引擎排出导出版面，交给写出端）暴露，供 scripts/xml-roundtrip.mjs 回归
   // （写出端只有 `model/toxml.ts`，在 `__j123` 里）。
   win.__xmlout = Promise.all([
-    import("./mixed/engrave"), import("./model/jianpuinput"), import("./model/fromxml"),
+    import("./editor/xmllayout"), import("./jianpu/jianpuinput"), import("./model/fromxml"),
     import("./model/fromjpw"), import("./jpword/jpwfile"), import("./jpword/parse"),
   ]).then(([layout, jianpuinput, fromxml, fromjpw, jpwfile, parse]) =>
     ({ ...layout, ...jianpuinput, ...fromxml, ...fromjpw, ...jpwfile, ...parse }));
@@ -304,12 +309,27 @@ async function boot() {
   }
   const docFormatSel = document.getElementById("sel-doc-format") as HTMLSelectElement | null;
   if (docFormatSel) app.formats.bind(docFormatSel); // 选项由来源（识别结果 / 打开的文件）给，见 editor/formatswitch.ts
+  const docFormatNote = document.getElementById("doc-format-note");
+  if (docFormatNote) app.formats.bindNote(docFormatNote);
   const originalLayoutBtn = document.getElementById("btn-layout-original") as HTMLButtonElement | null;
   const phraseBtn = document.getElementById("btn-phrase") as HTMLButtonElement | null;
-  if (originalLayoutBtn && phraseBtn) {
-    app.setPhraseButtons(originalLayoutBtn, phraseBtn);
-    originalLayoutBtn.addEventListener("click", () => app.setPhraseLayout(false));
-    phraseBtn.addEventListener("click", () => app.setPhraseLayout(true));
+  const barsBtn = document.getElementById("btn-bars") as HTMLButtonElement | null;
+  const barsSel = document.getElementById("sel-bars-per-line") as HTMLSelectElement | null;
+  if (originalLayoutBtn && phraseBtn && barsBtn && barsSel) {
+    try {
+      const last = localStorage.getItem(BARS_PER_LINE_KEY);
+      if (last && [...barsSel.options].some((o) => o.value === last)) barsSel.value = last;
+    } catch { /* 存储不可用：用出厂的 4 */ }
+    app.setPhraseButtons(originalLayoutBtn, phraseBtn, barsBtn, barsSel);
+    originalLayoutBtn.addEventListener("click", () => app.setLineMode("original"));
+    phraseBtn.addEventListener("click", () => app.setLineMode("phrase"));
+    barsBtn.addEventListener("click", () => app.setLineMode("bars"));
+    barsSel.addEventListener("change", () => {
+      try {
+        localStorage.setItem(BARS_PER_LINE_KEY, barsSel.value);
+      } catch { /* 记不住就算了 */ }
+      app.setLineMode("bars", Number(barsSel.value));
+    });
   }
   const playBtn = document.getElementById("btn-play") as HTMLButtonElement | null;
   if (playBtn) {
@@ -334,6 +354,7 @@ async function boot() {
   mobileScoreBtn.addEventListener("click", () => setMobileView("score"));
 
   const updateZoom = wireZoomControls(app, scorePane, on);
+  setupSplitters();
   // 切换界面语言：已开的对话框关掉（下次打开按新语言建），代码写的控件文字重出
   onLangChange(() => {
     document.querySelectorAll(".modal-overlay, .help-overlay").forEach((el) => el.remove());
@@ -410,91 +431,13 @@ function wireZoomControls(
   on("btn-zoom-out", () => { app.zoomBy(1 / 1.2); updateZoom(); });
   on("btn-zoom-reset", () => { app.resetZoom(); updateZoom(); });
   updateZoom();
-  // 指针锚定缩放：以触点为中心，缩放后让触点下的内容点保持在原屏幕位置
-  // （与双指预览图片一致）。连续的滚轮/捏合事件累积到 pending，按 rAF 每帧
-  // 只应用一次——避免每个事件都触发一次「改 CSS 变量 → 强制同步布局」的抖动。
-  let pendingZoom: number | null = null; // 目标 zoom（绝对值），null 表示无待处理
-  let anchorX = 0, anchorY = 0;
-  let rafId = 0;
-  // 找触点落在哪一页（缩放前），间隙/页外则取最接近的页。页内 SVG 等比缩放，
-  // 故基于该页自身的包围盒做锚定，天然规避了 score-pane 的居中/内边距偏移。
-  const anchorPage = (y: number): HTMLElement | null => {
-    const wraps = scorePane.querySelectorAll<HTMLElement>(".score-page-wrap");
-    let best: HTMLElement | null = null;
-    let bestDist = Infinity;
-    for (const w of wraps) {
-      const rc = w.getBoundingClientRect();
-      if (y >= rc.top && y <= rc.bottom) return w;
-      const d = y < rc.top ? rc.top - y : y - rc.bottom;
-      if (d < bestDist) { bestDist = d; best = w; }
-    }
-    return best;
-  };
-  // 内容锚点：一段手势内固定的「谱面上的点」（锚定页 + 页内归一化坐标）。
-  // 在手势开始时算一次并保持，避免低 zoom 居中阶段页位置变化污染归一化坐标；
-  // 当前手指屏幕坐标 (anchorX/anchorY) 每个事件更新，故捏合平移时谱面随手指走。
-  let gAnchor: { page: HTMLElement; fx: number; fy: number } | null = null;
-  let idleTimer: ReturnType<typeof setTimeout> | undefined;
-  const beginOrKeepAnchor = (clientX: number, clientY: number) => {
-    if (!gAnchor) {
-      const page = anchorPage(clientY);
-      if (page) {
-        const rc = page.getBoundingClientRect();
-        gAnchor = { page, fx: (clientX - rc.left) / rc.width, fy: (clientY - rc.top) / rc.height };
-      }
-    }
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => { gAnchor = null; }, 250); // 手势空闲即结束
-  };
-  const flushZoom = () => {
-    rafId = 0;
-    if (pendingZoom === null) return;
-    app.setZoom(pendingZoom);
-    pendingZoom = null;
-    if (gAnchor) {
-      // 同步读取缩放后的包围盒，调整滚动让固定的内容点回到当前手指屏幕坐标
-      const post = gAnchor.page.getBoundingClientRect();
-      const wantLeft = anchorX - gAnchor.fx * post.width;
-      const wantTop = anchorY - gAnchor.fy * post.height;
-      scorePane.scrollLeft += post.left - wantLeft;
-      scorePane.scrollTop += post.top - wantTop;
-    }
-    updateZoom();
-  };
-  const scheduleZoom = (target: number, clientX: number, clientY: number) => {
-    pendingZoom = target;
-    anchorX = clientX;
-    anchorY = clientY;
-    beginOrKeepAnchor(clientX, clientY);
-    if (!rafId) rafId = requestAnimationFrame(flushZoom);
-  };
-  const zoomBy = (clientX: number, clientY: number, factor: number) => {
-    const base = pendingZoom ?? app.zoom;
-    scheduleZoom(base * factor, clientX, clientY);
-  };
-
-  // Chromium/Edge：捏合与 Ctrl+滚轮都表现为 ctrlKey 的 wheel 事件。
-  scorePane.addEventListener("wheel", (e) => {
-    if (!e.ctrlKey && !e.metaKey) return;
-    e.preventDefault();
-    zoomBy(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
-  }, { passive: false });
-
-  // WebKit/WKWebView（Tauri macOS）：触控板双指捏合走 gesture* 事件，带绝对 scale。
-  let gestureBase = 1;
-  type GEvt = Event & { scale: number; clientX: number; clientY: number };
-  scorePane.addEventListener("gesturestart", (ev) => {
-    const e = ev as GEvt;
-    e.preventDefault();
-    gestureBase = app.zoom;
-    gAnchor = null; // 新捏合以新的双指中心为锚
+  // 指针锚定的滚轮/捏合缩放（与并排原图栏共用，见 editor/pinchzoom.ts）
+  attachPinchZoom(scorePane, {
+    get: () => app.zoom,
+    set: (z) => app.setZoom(z),
+    pages: () => scorePane.querySelectorAll(".score-page-wrap"),
+    onChange: updateZoom,
   });
-  scorePane.addEventListener("gesturechange", (ev) => {
-    const e = ev as GEvt;
-    e.preventDefault();
-    scheduleZoom(gestureBase * e.scale, e.clientX, e.clientY);
-  });
-  scorePane.addEventListener("gestureend", (ev) => ev.preventDefault());
 
   return updateZoom;
 }

@@ -13,7 +13,7 @@ import {
   sortByLeft,
   xSpace,
 } from "./model";
-import { accidentalAlter, flagLevel, isAccidental, isClef, isRest, restDuration, timeSigDigit } from "./glyphs";
+import { accidentalAlter, flagLevel, isAccidental, isClef, isRest, isTimeSig, restDuration, timeSigDigit } from "./glyphs";
 import { subPaths } from "./vecgeom";
 import { HOLLOW_IN } from "./page";
 
@@ -83,10 +83,23 @@ export function findClefKeyTime(pg: SPage): Map<Staff, StaffContext> {
   const accids: Sym[] = [];
   const clefs: Sym[] = [];
   const times: Sym[] = [];
+  const eights: Sym[] = [];
   for (const it of pg.symbols) {
     if (isAccidental(it.code)) accids.push(it);
     else if (isClef(it.code)) clefs.push(it);
     else if (timeSigDigit(it.code) >= 0 || it.code === "timeSigCommon" || it.code === "timeSigCutCommon") times.push(it);
+    else if (it.code === "clef8") eights.push(it);
+  }
+  // 谱号底下（或头上）另起一枚小 8 的写法（八段锦中阮：Anastasia 的高音谱号与 `clef8` 是两个字形）：
+  // 横向落在谱号范围里、贴着谱号下沿（上沿）的，并进谱号成 gClef8vb / gClef8va
+  for (const e of eights) {
+    const cx = (e.box.left + e.box.right) / 2;
+    const g = clefs.find((c) => (c.code === "gClef" || c.code === "fClef") && cx >= c.box.left && cx <= c.box.right && (e.box.top >= (c.box.top + c.box.bottom) / 2 || e.box.bottom <= (c.box.top + c.box.bottom) / 2));
+    if (!g) continue;
+    const below = e.box.top >= (g.box.top + g.box.bottom) / 2;
+    if (g.code === "gClef") g.code = below ? "gClef8vb" : "gClef8va";
+    else if (below) g.code = "fClef8vb";
+    e.addTag("Clef");
   }
 
   const validClefs: Sym[] = [];
@@ -159,9 +172,13 @@ function analyzeAccidental(pg: SPage, accids: Sym[], clefs: Sym[]): void {
     // 紧跟谱号
     let after = false;
     for (const c of clefs) {
+      // 打击乐谱号（‖）又窄又只占谱表中间两格（八段锦小钗）：调号离它三格多，头一个升号印在第五线上、与它纵向不搭。
+      // 横向放到四格，纵向按它那行谱的高度比
+      const perc = c.code.startsWith("unpitchedPercussionClef");
       if (c.box.right > acc.box.left) continue;
-      if (acc.box.left - c.box.right > sp * 3) continue;
-      if (!overlapY(c.box, acc.box)) continue;
+      if (acc.box.left - c.box.right > sp * (perc ? 4 : 3)) continue;
+      const cb = perc && c.ownerStaff ? { ...c.box, top: c.ownerStaff.box.top - sp, bottom: c.ownerStaff.box.bottom + sp } : c.box;
+      if (!overlapY(cb, acc.box)) continue;
       after = true;
       break;
     }
@@ -302,7 +319,7 @@ export interface BeamShape {
   y0: number;
   x1: number;
   y1: number;
-  /** 第几层（1 = 离符头最近的那条 = 八分）。由 `calcBeamLevels` 填。 */
+  /** 第几层（1 = 离符头最远、在干尖上的那条主杠 = 八分；往符头方向叠的副杠依次 2、3）。由 `calcBeamLevels` 填。 */
   level: number;
 }
 
@@ -484,10 +501,12 @@ export const staffOmrOptions = {
  * 判据照原文：符头的**左缘或右缘**与符干 x 差在四分之一格以内，且纵向相交。
  * （符干贴在符头的一侧，不是穿过中心。）
  */
+/** 头团里的竖笔离头盒左右缘都至少这么多像素才算藏在盒里（见 `buildStems`）。 */
+const INNER_STROKE = 2;
 /** 伸出头外的干长下限（格），见 `buildStems` 里「一上一下两根干」那段。 */
 const SHORT_STEM_OUT = 2;
 
-export function buildStems(pg: SPage, sp: number): StemInfo[] {
+export function buildStems(pg: SPage, sp: number, vector = false): StemInfo[] {
   const heads = pg.symbols.filter((s) => s.hasTag("Note") && !isRest(s.code) && s.ownerStaff);
   const flagSyms = pg.symbols.filter((s) => s.hasTag("Tail"));
   const out: StemInfo[] = [];
@@ -514,6 +533,16 @@ export function buildStems(pg: SPage, sp: number): StemInfo[] {
       notes.push(nt);
     }
     if (!notes.length) continue;
+    // 整根藏在所挂头团里的竖笔不是干：纵向被头盒盖满、横向落在每个头盒里面（不贴缘）。
+    // 扫描件上三个实心头叠成一团，团里一道竖笔被抽成竖段（望十架 p8 m64 钢琴右手 B3/D4/F♯4，下面两个头被拆成另一声部的四分）。
+    // 二度和弦夹在两个头之间的短干贴着两个盒的缘，不受这条影响。
+    // 只看实心头：空心头的盒按内腔外扩，自己的干本就常落在盒里（见 `HOLLOW_IN`）
+    const inside = (nt: Sym) => nt.code === "noteheadBlack" && seg.cx - nt.box.left >= INNER_STROKE && nt.box.right - seg.cx >= INNER_STROKE;
+    // 头盒要把竖笔一路盖满：八度和弦两个头之间那截真干两端也不出头（破碎扫描 p4 m56 C4/C5）
+    const covered = (y: number) => notes.some((n) => y >= n.box.top - 1 && y <= n.box.bottom + 1);
+    let hidden = notes.every(inside);
+    for (let y = Math.round(seg.top); hidden && y <= seg.bottom; y++) hidden = covered(y);
+    if (hidden) continue;
     // `Stem::up`：符干伸到符头**上方**就是朝上。高出头顶不到 `STEM_UP_SLACK` 格的不算：干端齐着头顶、
     // 扫描件上高出一两个像素的朝下干会被当成朝上（是爱 p2 m30 女低 F4 二分，干上端比头顶高 1px、往下伸 2.5 格，
     // 分声部时上方 C5 全音符的「上下两声部」豁免因此不成立，三个音排成了一串）。
@@ -551,6 +580,21 @@ export function buildStems(pg: SPage, sp: number): StemInfo[] {
       (nt) => !(st.notes.some((m) => m !== nt && filled(m) !== filled(nt)) && out.some((o) => o !== st && o.up !== st.up && o.notes.length === 1 && o.notes[0] === nt && proper(o, nt))),
     );
   }
+  // 一上一下两根干挂着同样两个头：两声部三度叠放、头挨着头，两根干都贴着两个头的缘、又都从一个头伸到另一个头
+  // （望十架 p4 m33 男声 B♭3 附点二分朝上、G3 二分朝下，两个头各读出两遍）。照两声部的惯例，朝上的留上头、朝下的留下头
+  for (const st of out) {
+    if (!st.up || st.notes.length !== 2) continue;
+    const o = out.find((q) => !q.up && q.notes.length === 2 && q.notes.every((n) => st.notes.includes(n)));
+    if (!o) continue;
+    const [hi, lo] = [...st.notes].sort((a, b) => a.py - b.py);
+    // 两个头叠在一处（两声部同音、刻谱软件各画了一个头：八段锦笛子 m62 E5）：一根干分一个
+    if (lo.py - hi.py < sp * 0.25) {
+      if (vector && Math.abs(lo.box.left - hi.box.left) < sp * 0.25) (st.notes = [hi]), (o.notes = [lo]);
+      continue;
+    }
+    st.notes = [hi];
+    o.notes = [lo];
+  }
   return out.filter((st) => st.notes.length);
 }
 
@@ -559,6 +603,8 @@ export type BeamState = "begin" | "continue" | "end" | "forward hook" | "backwar
 
 /** 只接上一根干、短于这么多格的杠是半截钩（附点八分 + 十六分的那一截）；长的是另一头的音没认出来，照普通杠算。 */
 const HOOK_MAX = 1.6;
+/** 两条杠横向叠着不到这么多格的不算一摞（见 `calcBeamLevels`）。 */
+const BEAM_STACK_OV = 0.3;
 
 /**
  * 一根干上逐层的符杠状态：这一层的杠伸出干的左侧 / 右侧（超过 `beamConnect` 的端点容差五分之一格）
@@ -613,6 +659,10 @@ function beamConnect(b: BeamShape, st: StemInfo, sp: number): BeamHit {
   const cys = st.notes.map((n) => (n.box.top + n.box.bottom) / 2);
   const headEnd = toward > 0 ? Math.max(...cys) : Math.min(...cys);
   if ((y - headEnd) * toward > 0) return "none";
+  // **杠也不会夹在和弦的头之间**：杠总在离干远端最近那个头的远端一侧；落在它朝头那侧半格开外的，是压着加线的头连着加线
+  // 横出去的一截（是爱 p2 m20 钢琴右手 D5/F5/A5，A5 骑的加线读成钩，四分读成八分）
+  const farHead = toward > 0 ? Math.min(...cys) : Math.max(...cys);
+  if ((y - farHead) * toward > sp / 2) return "none";
   const near = Math.abs(st.seg.top - y) < sp || Math.abs(st.seg.bottom - y) < sp;
   if (!near) {
     const d = (y - far) * toward;
@@ -663,6 +713,9 @@ export function calcBeamLevels(beams: BeamShape[], stems: StemInfo[], sp: number
     for (const bj of kept) {
       if (done.has(bj)) continue;
       if (bi.x0 > bj.x1 || bj.x0 > bi.x1) continue;
+      // 只在端头碰着（共用端头那根干）的是一条杠断成先后两截，不是一摞：手写杠在中途提笔（是爱 p1 m10 右手，
+      // 两截在干上错开 0.5 格，按层算就把那个音读成十六分）。真副杠与主杠横向叠着至少一个音距
+      if (Math.min(bi.x1, bj.x1) - Math.max(bi.x0, bj.x0) < sp * BEAM_STACK_OV) continue;
       const si = new Set(conn.get(bi)!.map((h) => h.st));
       if (!conn.get(bj)!.some((h) => si.has(h.st))) continue;
       grp.push(bj);
@@ -696,7 +749,9 @@ export function calcBeamLevels(beams: BeamShape[], stems: StemInfo[], sp: number
         continue;
       }
     }
-    // 定层：按「离符头那一端有多远」从近到远排。
+    // 定层：按「离符头那一端有多远」从远到近排——主杠在干尖上（离符头最远）是第 1 层，副杠往符头方向叠上去。
+    // 原来是从近到远，副杠成了第 1 层：时值只数层数不受影响，可 `<beam number>` 整组反了
+    //（八段锦「八分 + 两个十六分」：第二个音第 1 层写成 begin、主杠写成第 2 层 continue）。
     // musicpp 是按符干朝向决定升序还是降序；本仓改用**到符头端的距离**——
     // 符干与符头常常有重叠，`Stem::up` 那条判据（符干是否伸到符头之上）会误判，
     // 一误判整组的层就反过来，十六分与八分互换。距离这个量与朝向无关。
@@ -715,7 +770,7 @@ export function calcBeamLevels(beams: BeamShape[], stems: StemInfo[], sp: number
       const xc = (g.x0 + g.x1) / 2;
       return [g, (beamY(g, xc) - beamY(main, xc)) * toward] as const;
     }));
-    grp.sort((a, b) => rel.get(b)! - rel.get(a)!);
+    grp.sort((a, b) => rel.get(a)! - rel.get(b)!);
     let last = rel.get(grp[0])!;
     let level = 1;
     grp[0].level = 1;
@@ -765,7 +820,7 @@ export interface StaffNote {
   beam?: BeamState[];
   x: number;
   /** 挂在这个音符上的歌词，按段（verse）。 */
-  lyrics?: { verse: number; text: string; hyphen: boolean; cont: boolean; /** 这个字后面拖着延长线（一字多音，见 `markLyricExtends`）。 */ extend?: boolean; /** 字号（页面单位，见 `SPage.textEm`） */ size?: number; /** 这一行词印在谱表上方（`<lyric placement="above">`） */ above?: boolean; /** 这一行词的基线（页面单位），写源谱版面时出成 `default-y` */ baseY?: number }[];
+  lyrics?: { verse: number; text: string; hyphen: boolean; cont: boolean; /** 这个字后面拖着延长线（一字多音，见 `markLyricExtends`）。 */ extend?: boolean; /** 字号（页面单位，见 `SPage.textEm`） */ size?: number; /** 这一行词印在谱表上方（`<lyric placement="above">`） */ above?: boolean; /** 这一行词的基线（页面单位），写源谱版面时出成 `default-y` */ baseY?: number; /** 原图上这个字的框（页面单位），识别对照用 */ box?: Box; /** 编辑器的识别对照用：写进 `<lyric id>` 的 id（同 `omrId`） */ id?: string; /** 首字前印的段号（「1.」），写出时并进字前（`toxml.ts::lyricXml`） */ label?: string }[];
   /** 这些字的歌词延长线到这个音为止（`<extend type="stop"/>`）。记的是那个字本身，段号后来被重排也跟着走。 */
   lyricExtendStop?: { verse: number }[];
   /** 挂在这个音符上的和弦符号（归一后的原文，如 `Am`、`G/B`、`Dm7`）。 */
@@ -785,6 +840,8 @@ export interface StaffNote {
   chordExtra?: boolean;
   /** 挂在这个音符上的演奏法记号（SMuFL 名，见 `notations.ts`）。 */
   marks?: string[];
+  /** 没有符干的音（全音符）上震音斜线的墨迹中心：x 离符头左缘、y 在谱表顶线之上多少，格（写成 `<tremolo default-x/default-y>`） */
+  tremoloAt?: { x: number; y: number };
   /**
    * 声部号（1 起）。一行谱上写两个声部时（SATB 把女高女低挤在一行），
    * **按符干方向分**：朝上的是第一声部、朝下的是第二声部。见 `assignVoices`。
@@ -802,14 +859,25 @@ export interface StaffNote {
   /** 力度记号（`mp`/`f`…）。MusicXML 里出成 `<direction>`，排在这个音符之前。 */
   dynamic?: string;
   /** 印在这个音符处的文字指示（rit. / a tempo / cresc. / Fine…）：原文与在谱表上方还是下方。MusicXML 里出成 `<direction><words>`。 */
-  words?: { text: string; above: boolean; /** 字号（页面单位） */ size?: number; /** 基线（页面单位），写源谱版面时出成 `default-y` */ baseY?: number; /** 加框的排练号（`<rehearsal enclosure="square">`） */ rehearsal?: boolean }[];
+  /** 挂在这个音前面的反复记号（`notations.ts::attachSigns`），出 `<direction>` 的 `<segno/>` / `<coda/>`。 */
+  signs?: ("segno" | "coda")[];
+  /** 印在这个音（本行末音）之后、行末小节线上的反复记号（`attachSigns`），`<direction>` 写在音之后 */
+  signsAfter?: ("segno" | "coda")[];
+  words?: { text: string; above: boolean; /** 字号（页面单位） */ size?: number; /** 基线（页面单位），写源谱版面时出成 `default-y` */ baseY?: number; /** 加框的排练号（`<rehearsal enclosure="square">`） */ rehearsal?: boolean; /** 排练号自带【】（`enclosure="none"`） */ bracket?: boolean; /** 原图上的框（页面单位），识别对照用 */ box?: Box; /** 写进 `<direction id>` 的 id（同 `omrId`） */ id?: string }[];
   /** 节拍器记号：拍子单位（`quarter`）、每分钟拍数、`<per-minute>` 的原文（带「约」时 `c. 76`，否则省）。MusicXML 里出成 `<direction><metronome>`。 */
   metronome?: { unit: string; bpm: number; text?: string; /** 印在圆括号里（「(♩ = 82)」）→ `<metronome parentheses="yes">` */ parentheses?: boolean };
   /** 与节拍器印在同一条的速度文字（`Andante ♩ = c. 76` 的 `Andante`）：与节拍器写进**同一个** `<direction>`，不拆成两个对象。 */
   tempoText?: string;
   tempoSize?: number;
+  /** 速度 / 节拍器那一条在原图上的框与写进 `<direction id>` 的 id（识别对照用） */
+  tempoBox?: Box;
+  tempoId?: string;
   /** 力度记号在原图上的墨迹框（页面单位）：写出成 `default-y` / `relative-x` / `font-size`，排版照原位原大小。见 `attachDynamicTexts` */
   dynamicBox?: { left: number; right: number; top: number; bottom: number };
+  /** 编辑器的识别对照用：力度那条 `<direction id>`（同 `omrId`，有 `dynamicBox` 的才给） */
+  dynamicId?: string;
+  /** OCR 读出、没量墨迹框的力度在原图上的大致范围（字行起头那几个字母）：只给识别对照画框，写出不用 */
+  dynamicSrcBox?: { left: number; right: number; top: number; bottom: number };
   /** 松叶从这个音符**起**（`<wedge type="crescendo|diminuendo">`）。见 `attachWedges`。 */
   wedgeStart?: "crescendo" | "diminuendo";
   /** 起在这个音上的松叶在原图上的样子（页面单位）：左端 x、中线 y、开口高 */
@@ -832,10 +900,18 @@ export interface StaffNote {
    * MusicXML 那边出成 `<notehead>slash</notehead>`。
    */
   slash?: boolean;
+  /** 打击乐谱号下的音（`unpitchedPercussionClef*`）：没有音高，MusicXML 出 `<unpitched>` 记显示位置，调号、临时记号都不作用 */
+  unpitched?: boolean;
+  /** 打击乐的叉形符头（`noteheadXBlack` / `noteheadCircleX`），MusicXML 出 `<notehead>x</notehead>` / `circle-x`。 */
+  xHead?: "x" | "circle-x";
   /** 所属和弦（`initChords` 填）。声部与小节内起点都记在和弦上，见 `StaffChord`。 */
   group?: StaffChord;
   /** 倚音：不占拍子，MusicXML 里出 `<grace/>` 且**不写 `<duration>`**。见 `checkFull` 的 `ignoreSmall`。 */
   grace?: boolean;
+  /** 叠印的第二个休止（`Sym.redrawn`）：占拍子，写出 `print-object="no"` */
+  hidden?: boolean;
+  /** 倚音干上斜穿一道杠（短倚音），MusicXML 出 `<grace slash="yes"/>`。见 `notations.ts::findGraceSlashes`。 */
+  graceSlash?: boolean;
   /** 圆滑线/连音线的起讫（见 `slur.ts`）。一个音符可以同时是上一条的收尾与下一条的起头。 */
   slurStart?: boolean;
   slurStop?: boolean;
@@ -859,6 +935,11 @@ export interface StaffNote {
   /** 起头的那条圆滑线 / 连音线画成虚线（`<slur line-type="dashed">`）。 */
   slurDashed?: boolean;
   tieDashed?: boolean;
+  /** 起在 / 挂在这个音上的弧在原图上的外框（`markSlurNotes` 按弧号记，同一条画两份的只记头一份）：识别对照给 `<slur id>` 配框 */
+  slurBoxes?: { arc: string; box: Box }[];
+  /** 起在这个音上的延音线在原图上的外框与写进 `<tied id>` 的 id（识别对照用） */
+  tieBox?: Box;
+  tieId?: string;
 }
 
 /**
@@ -912,14 +993,23 @@ export function buildNotes(
   stemsOut?: StemInfo[],
   /** 可选：认成实心、其实中间是空的头（位图路按墨判）。没有杠和尾的，时值按空心头算。 */
   hollowish?: (s: Sym) => boolean,
+  /** 矢量路：开只在矢量路用的判据（两声部同音共头、首尾相接的干不并和弦等，位图路干端不准，开了独唱 / 合唱谱退步） */
+  vector = false,
 ): StaffNote[] {
   const sp = pg.normalStaffSpace || pg.space;
-  const stems = buildStems(pg, sp);
+  const stems = buildStems(pg, sp, vector);
   stemsOut?.push(...stems);
   calcBeamLevels(beams, stems, sp, pg.symbols.filter((q) => q.code.startsWith("notehead")).map((q) => q.box));
   // 符头 → 它那根符干
   const stemOf = new Map<Sym, StemInfo>();
   for (const st of stems) for (const n of st.notes) if (!stemOf.has(n)) stemOf.set(n, st);
+  /** 一个头贴着一上一下两根干、朝上的在右缘朝下的在左缘：两声部同音共用的头，返回两根干 */
+  const unisonStems = (s: Sym): StemInfo[] | undefined => {
+    const on = stems.filter((st) => st.notes.includes(s));
+    if (!vector || on.length !== 2 || on[0].up === on[1].up) return undefined;
+    const edge = (st: StemInfo) => Math.abs((st.up ? s.box.right : s.box.left) - st.seg.cx) <= sp / 4;
+    return on.every(edge) ? on : undefined;
+  };
   const beamOf = new Map<StemInfo, BeamState[]>();
   for (const st of stems) if (!st.flags && st.beams.length) beamOf.set(st, beamStates(st, stems, sp));
 
@@ -939,10 +1029,27 @@ export function buildNotes(
     return best;
   };
 
+  // 空心头不上符杠：干端压着一条与别的干共用的杠，这个头就是扫描件上肚里留白的实心头
+  // （望十架 p5 m39–40 低音八分读成二分 / 全音符）。杠要在干端——干中段横穿的粗谱线也会被收成杠（p6 m50 二分 D4）；
+  // 共用这条杠的干要与它同向——二分和弦的干顶顶到上方谱表朝下的那组杠的，是另一声部的杠（爱是从神而来 p4 m40 低音）。
+  const beamedTip = (st: StemInfo): boolean => {
+    const tip = st.up ? st.seg.box.top : st.seg.box.bottom;
+    return st.beams.some((b) => Math.abs(beamY(b, st.seg.cx) - tip) < sp * 0.6 && stems.some((o) => o !== st && o.up === st.up && o.beams.includes(b)));
+  };
+  const timeBoxes = pg.symbols.filter((t) => isTimeSig(t.code)).map((t) => t.box);
   for (const s of pg.symbols) {
     if (!s.hasTag("Note") || !s.ownerStaff) continue;
     const stf = s.ownerStaff;
     const rest = isRest(s.code);
+    // 中心落在拍号盒里的不是音：拍号认出之后，后面几路补头还会在数字的笔画上补出头来
+    //（生之颂钢琴 m1 行首 2/2 的两个「2」，右手多出一个三音全音符和弦）
+    if (timeBoxes.some((b) => s.px > b.left && s.px < b.right && s.py > b.top && s.py < b.bottom)) continue;
+    // 行首谱号左缘以左的休止不是谱里的：速度记号「𝅗𝅥 = 72」的空心头落在谱号上方，按字形认成二分休止
+    //（主爱的大能 m1 多出一个全休止）
+    if (rest) {
+      const first = (ctx.get(stf)?.clefs ?? []).reduce<Sym | null>((a, c) => (!a || c.box.left < a.box.left ? c : a), null);
+      if (first && (s.box.left + s.box.right) / 2 < first.box.right) continue;
+    }
     const clef = clefFor(pg, ctx, stf, s.box.left);
     const mid = clef ? clefMiddleStep(clef.code) ?? 41 : 41;
 
@@ -956,66 +1063,82 @@ export function buildNotes(
       octave = p.octave;
     }
 
-    const stem = rest ? undefined : stemOf.get(s);
-    const stemUp = stem ? stem.up : s.compositeStemUp ?? null;
-    // **层数取符尾条数，或这根符干上最高的那一层符杠**——不是「数穿过符干几条」：
-    // 十六分的第二条常常只是半截钩，盖住的符干比第一条少（见 calcBeamLevels 的注释）。
-    // **层数 = 这根符干上「有几个不同的层」**，不是「最高的那一层」。
-    //
-    // musicpp 取最高层。实测那样更差（全书时值 71.7% → 70.3%）：`calcLevel` 把整组符杠
-    // 外推到组左端的 x 处比高低，靠右那条短符杠一外推，斜率误差被放大，层就判高了；
-    // 于是只压着一条符杠的符干拿到了「第 2 层」，八分读成十六分。
-    // 数「不同的层」两头都占：同一条符杠被拆成两段时（同层）只算一次，
-    // 而外推判错层也只影响那一层的编号、不影响个数。
-    const nb = stem
-      ? stem.flags ||
-        (staffOmrOptions.beamLevels
-          ? new Set(stem.beams.map((b, i) => (b.level > 0 ? `L${b.level}` : `u${i}`))).size
-          : stem.beams.length)
-      : 0;
+    // **两声部同音共用一个符头**：头的右缘挂着朝上的干、左缘挂着朝下的干，两根干各出一个音（八段锦笛子 m61–62 上下声部同是 G4 / E5）
+    for (const stem of rest ? [undefined] : unisonStems(s) ?? [stemOf.get(s)]) {
+      const stemUp = stem ? stem.up : s.compositeStemUp ?? null;
+      // **层数取符尾条数，或这根符干上最高的那一层符杠**——不是「数穿过符干几条」：
+      // 十六分的第二条常常只是半截钩，盖住的符干比第一条少（见 calcBeamLevels 的注释）。
+      // **层数 = 这根符干上「有几个不同的层」**，不是「最高的那一层」。
+      //
+      // musicpp 取最高层。实测那样更差（全书时值 71.7% → 70.3%）：`calcLevel` 把整组符杠
+      // 外推到组左端的 x 处比高低，靠右那条短符杠一外推，斜率误差被放大，层就判高了；
+      // 于是只压着一条符杠的符干拿到了「第 2 层」，八分读成十六分。
+      // 数「不同的层」两头都占：同一条符杠被拆成两段时（同层）只算一次，
+      // 而外推判错层也只影响那一层的编号、不影响个数。
+      const nb = stem
+        ? stem.flags ||
+          (staffOmrOptions.beamLevels
+            ? new Set(stem.beams.map((b, i) => (b.level > 0 ? `L${b.level}` : `u${i}`))).size
+            : stem.beams.length)
+        : 0;
 
-    let base: number;
-    if (s.compositeBase !== undefined) {
-      // 复合音符字形（`page.ts::adoptCompositeNotes`）：没有单独的符干可数，
-      // 时值由字形本身给出，符干一律朝上。
-      base = s.compositeBase;
-    } else if (rest) {
-      base = restDuration(s.code);
-      if (base < 0) base = 1; // restHBar：整小节休止，先按全音符，`toxml` 再按拍号改
-      // **全休止与半休止在字体里是同一个方块**，只有落在第几线上不同：
-      // 半休止**坐在中线上**（墨迹底贴中线），全休止**吊在上面一线下**（底比中线高一格）。
-      // 字形字典分不开它们（轮廓逐位相同，一律标成了 `restHalf`），只能按几何判——
-      // 不判的话整小节的全休止全读成半休止，小节时值自检与 GT 的时值档都跟着错。
-      if (s.code === "restHalf" || s.code === "restWhole") {
-        const space = (stf.stepDistance() || 0) * 2 || sp;
-        const mid = (stf.box.top + stf.box.bottom) / 2;
-        base = mid - s.box.bottom > space * 0.5 ? 1 : 1 / 2;
+      let base: number;
+      if (s.compositeBase !== undefined) {
+        // 复合音符字形（`page.ts::adoptCompositeNotes`）：没有单独的符干可数，
+        // 时值由字形本身给出，符干一律朝上。
+        base = s.compositeBase;
+      } else if (rest) {
+        base = restDuration(s.code);
+        if (base < 0) base = 1; // restHBar：整小节休止，先按全音符，`toxml` 再按拍号改
+        // **全休止与半休止在字体里是同一个方块**，只有落在第几线上不同：
+        // 半休止**坐在中线上**（墨迹底贴中线），全休止**吊在上面一线下**（底比中线高一格）。
+        // 字形字典分不开它们（轮廓逐位相同，一律标成了 `restHalf`），只能按几何判——
+        // 不判的话整小节的全休止全读成半休止，小节时值自检与 GT 的时值档都跟着错。
+        if (s.code === "restHalf" || s.code === "restWhole") {
+          const space = (stf.stepDistance() || 0) * 2 || sp;
+          const mid = (stf.box.top + stf.box.bottom) / 2;
+          // 按方块的**中线**判：全休止吊在第四线下（中线在谱表中线上方 0.75 格），二分休止坐在中线上（0.25 格），门槛取半格。
+          // 原先按底边比半格：八段锦的全休止底边离中线正好半格，卡在线上读成二分；改按底边比四分之一格，
+          // 位图路去了谱线的二分休止底边离中线也有零点几格，又读成全休止（新编 076 m18）
+          // 推广开就是**中心落在上下两条线之间的哪一半**：上半是吊着的全休止、下半是坐着的二分休止（谱表外照线距往外推）。
+          // 标准位置上与「离中线半格」同一个门槛；让位到别处的（两声部时上声部的休止抬高一两格）也判得对——
+          // 生之颂钢琴 m13 左手二分休止坐在第二线上，中心比中线高一格，按离中线读成全休止，这一小节多出两拍
+          // 位图路弯、斜的谱线按方块所在 x 取线位（`lineYsAt`）；矢量路没有，就是整行的线位
+          const ys = [...(stf.lineYsAt?.(s.px) ?? stf.lineYs)].sort((a, b) => a - b);
+          const cy = (s.box.top + s.box.bottom) / 2;
+          if (ys.length >= 2) {
+            const k = ys.filter((y) => y <= cy).length - 1;
+            const above = k >= 0 ? ys[k] : ys[0] - space;
+            const below = k < 0 ? ys[0] : k < ys.length - 1 ? ys[k + 1] : ys[ys.length - 1] + space;
+            base = (cy - above) / (below - above) < 0.5 ? 1 : 1 / 2;
+          } else base = mid - cy > space * 0.5 ? 1 : 1 / 2;
+        }
+      } else if (s.code === "noteheadWhole" || s.code === "noteheadDoubleWhole") {
+        base = s.code === "noteheadDoubleWhole" ? 2 : 1;
+      } else if (s.code === "noteheadHalf" && !(stem && !stem.flags && beamedTip(stem))) {
+        base = stem ? 1 / 2 : 1;
+      } else if (nb === 0 && s.code === "noteheadBlack" && hollowish?.(s)) {
+        base = stem ? 1 / 2 : 1;
+      } else {
+        base = 1 / 4;
+        for (let i = 0; i < nb; i++) base /= 2;
       }
-    } else if (s.code === "noteheadWhole" || s.code === "noteheadDoubleWhole") {
-      base = s.code === "noteheadDoubleWhole" ? 2 : 1;
-    } else if (s.code === "noteheadHalf") {
-      base = stem ? 1 / 2 : 1;
-    } else if (nb === 0 && s.code === "noteheadBlack" && hollowish?.(s)) {
-      base = stem ? 1 / 2 : 1;
-    } else {
-      base = 1 / 4;
-      for (let i = 0; i < nb; i++) base /= 2;
-    }
 
-    // 谱面上印出来的临时记号：贴在符头左边、同高度。**一个记号只归一个符头**（`accidentalOwner`）：
-    // 升号字形高约三格，三度和弦里上面那个头也跟它纵向交叠，按交叠认会一个升号给两个头
-    // （宣主荣耀钢琴 m11 `♯C4 E4 G4` 读成 C♯ + E♯）
-    let accidental: number | null = null;
-    for (const a of pg.symbols) {
-      if (!a.hasTag("Accidental")) continue;
-      if (accidentalOwner(a) !== s) continue;
-      accidental = accidentalAlter(a.code);
-      break;
-    }
+      // 谱面上印出来的临时记号：贴在符头左边、同高度。**一个记号只归一个符头**（`accidentalOwner`）：
+      // 升号字形高约三格，三度和弦里上面那个头也跟它纵向交叠，按交叠认会一个升号给两个头
+      // （宣主荣耀钢琴 m11 `♯C4 E4 G4` 读成 C♯ + E♯）
+      let accidental: number | null = null;
+      for (const a of pg.symbols) {
+        if (!a.hasTag("Accidental")) continue;
+        if (accidentalOwner(a) !== s) continue;
+        accidental = accidentalAlter(a.code);
+        break;
+      }
 
-    // 复合音符字形自带时值、没有杠可分
-    const beam = stem && s.compositeBase === undefined ? beamOf.get(stem) : undefined;
-    out.push({ sym: s, staff: stf, rest, diatonic, step, octave, alter: 0, accidental, duration: base, base, dots: 0, stemUp, ...(stem ? { stemTip: stem.up ? stem.seg.box.top : stem.seg.box.bottom } : {}), beams: nb, ...(beam ? { beam } : {}), x: s.px, voice: 1, slash: s.code.startsWith("noteheadSlash") || undefined });
+      // 复合音符字形自带时值、没有杠可分
+      const beam = stem && s.compositeBase === undefined ? beamOf.get(stem) : undefined;
+      out.push({ sym: s, staff: stf, rest, diatonic, step, octave, alter: 0, accidental, duration: base, base, dots: 0, stemUp, ...(stem ? { stemTip: stem.up ? stem.seg.box.top : stem.seg.box.bottom } : {}), beams: nb, ...(beam ? { beam } : {}), x: s.px, voice: 1, ...(s.redrawn ? { hidden: true } : {}), slash: s.code.startsWith("noteheadSlash") || undefined, ...(s.code === "noteheadXBlack" ? { xHead: "x" as const } : s.code === "noteheadCircleX" ? { xHead: "circle-x" as const } : {}), ...(!rest && clef?.code.startsWith("unpitchedPercussionClef") ? { unpitched: true } : {}) });
+    }
   }
   // **先按谱行、再按 x**。只按 x 排会把一页里几行谱的音符横向交织在一起
   // ——顺序一乱，与 GT 的逐音比对就全废（实测准确率卡在两成半）。
@@ -1023,7 +1146,7 @@ export function buildNotes(
   attachDots(out, dots, sp);
   // 和弦归拢要在这里做（符干还在手里）；**声部与小节内起点留到 `checkBars`**——
   // 三连音（`findTuplets`）在 `buildNotes` 之后才改时值，早算的 offset 会是错的。
-  initChords(out, stems, sp);
+  initChords(out, stems, sp, vector);
   calcAlters(pg, ctx, out);
   return out;
 }
@@ -1174,13 +1297,21 @@ export interface StaffChord {
    *  `toxml` 要退回按顺序累加时值（见那边的 `emitVoices`）。 */
   timed: boolean;
   voice: number;
+  /** 矢量路的和弦：`checkFull` / `checkBars` 里只矢量路开的判据看它（见 `buildNotes` 的 `vector`） */
+  vector?: boolean;
 }
 
 /** `Chord::guessDur(true, true)`：本仓的时值早在 `buildNotes` 里算好了，取主音的即可。 */
 const guessDur = (ch: StaffChord): number => ch.notes[0].duration;
 
 /** 这个音的符头有多大（相对线距）。`ignoreSmall` 判倚音用，代替原文的 `Note::fontSize()`。 */
-const headSize = (n: StaffNote): number => n.sym.box.bottom - n.sym.box.top;
+/** 符头大小：宽高的几何平均。只量高的话倚音头比正常头只矮三成上下，卡在门槛上（八段锦二胡 m48 全音符前的小 D5，高比 0.71）。
+ *  休止仍只量高：扁的二分 / 全休止按高量总算「小」、凑拍子时先剔掉，位图路靠这个把「四个四分 + 另一声部的二分休止」凑成一个声部
+ *（按几何平均它不算小，凑不满，跨谱表对齐把四分全改成八分：新编 076 m18） */
+const headSize = (n: StaffNote): number => {
+  const h = Math.max(0, n.sym.box.bottom - n.sym.box.top);
+  return n.rest ? h : Math.sqrt(h * Math.max(0, n.sym.box.right - n.sym.box.left));
+};
 
 /**
  * `Bar::initChords`：把符头归拢成和弦。
@@ -1215,11 +1346,12 @@ function inheritDur(ch: StaffChord, ns: StaffNote[], orphan: boolean): void {
   }
 }
 
-function initChords(notes: StaffNote[], stems: StemInfo[], sp: number): StaffChord[] {
+function initChords(notes: StaffNote[], stems: StemInfo[], sp: number, vector = false): StaffChord[] {
   const byNote = new Map<StaffNote, StaffChord>();
   const out: StaffChord[] = [];
-  const bySym = new Map<Sym, StaffNote>();
-  for (const n of notes) if (!bySym.has(n.sym)) bySym.set(n.sym, n);
+  // 共用符头的两声部同音（`buildNotes` 的 `unisonStems`）一个头出两个音，按干的朝向各归各的干
+  const bySym = new Map<Sym, StaffNote[]>();
+  for (const n of notes) bySym.set(n.sym, [...(bySym.get(n.sym) ?? []), n]);
 
   const make = (ns: StaffNote[], stem: StemInfo | null): StaffChord => {
     // **主音取最低的那个**，其余带 `<chord/>`。
@@ -1242,6 +1374,7 @@ function initChords(notes: StaffNote[], stems: StemInfo[], sp: number): StaffCho
       grace: false,
       timed: false,
       voice: 1,
+      ...(vector ? { vector } : {}),
     };
     for (let i = 0; i < ns.length; i++) {
       ns[i].group = ch;
@@ -1255,7 +1388,8 @@ function initChords(notes: StaffNote[], stems: StemInfo[], sp: number): StaffCho
   for (const st of stems) {
     const ns: StaffNote[] = [];
     for (const sym of st.notes) {
-      const n = bySym.get(sym);
+      const cands = bySym.get(sym) ?? [];
+      const n = cands.length > 1 ? cands.find((m) => m.stemUp === st.up && !byNote.has(m)) : cands[0];
       if (n && !byNote.has(n)) ns.push(n);
     }
     if (ns.length) make(ns, st);
@@ -1288,6 +1422,12 @@ function initChords(notes: StaffNote[], stems: StemInfo[], sp: number): StaffCho
       const kind = (c: StaffChord) => new Set(c.notes.map((n) => n.base === 1 / 4 && n.beams === 0 ? "q" : n.base === 1 / 2 ? "h" : "o"));
       const ka = kind(ca), kb = kind(cb);
       if (ca.stem.up !== cb.stem.up && ka.size === 1 && kb.size === 1 && [...ka][0] !== [...kb][0] && !ka.has("o") && !kb.has("o")) continue;
+      // 朝向相反、两截各自挂着符杠的是两组的干碰巧首尾相接：一根干断成两截，只有远端那截够得着符杠
+      //（八段锦新笛 m32 十六分 A4 干朝上、紧挨着下一组八分 B4 干朝下，B4 被并成 A4 的和弦音）
+      if (vector && ca.stem.up !== cb.stem.up && ca.stem.beams.length && cb.stem.beams.length) continue;
+      // 矢量谱上朝向相反、两个声部撞二度的（朝上那个头比朝下那个高一级、错开画在干两侧，两干正好同 x）：
+      // 在这圣善夜钢琴 m54 右手上声部八分 C5 与下声部四分 B♭4/F4，并成一枚就成了四分和弦、八分丢了，整小节多半拍
+      if (vector && ca.stem.up !== cb.stem.up && !endToEnd(ca, cb)) continue;
       for (const n of cb.notes) {
         ca.notes.push(n);
         n.group = ca;
@@ -1393,6 +1533,15 @@ function initChords(notes: StaffNote[], stems: StemInfo[], sp: number): StaffCho
 
 /** 两个和弦的符头盒横向是否相交（`checkFull` 分时间列用）。 */
 const chordOverlapX = (a: StaffChord, b: StaffChord): boolean => !(a.left > b.right || b.left > a.right);
+/**
+ * 两根干同 x、一朝上一朝下，却不是两声部撞二度（朝上那个头比朝下那个高一级、错开画在干两侧）：是先后两个音的干首尾相接，
+ * 不同时刻（八段锦小钗 m74 上声部第三个十六分 E5 干朝上、紧挨着下声部第四个八分 F4 干朝下，被归成一列）。
+ */
+const endToEnd = (a: StaffChord, b: StaffChord): boolean => {
+  if (!a.stem || !b.stem || a.stem.up === b.stem.up) return false;
+  const [up, dn] = a.stem.up ? [a, b] : [b, a];
+  return Math.min(...up.notes.map((n) => n.diatonic)) - Math.max(...dn.notes.map((n) => n.diatonic)) !== 1;
+};
 
 /**
  * `Bar::checkFull`：一个小节里的和弦能不能凑满拍号；能就把 `offset`/`dur` 写回去。
@@ -1410,7 +1559,7 @@ const chordOverlapX = (a: StaffChord, b: StaffChord): boolean => !(a.left > b.ri
  *
  * `anchorOf`：同系统已凑满的谱行给的拍位（`checkBars` 在前几趟都失败后才传），见下面 `byAnchor`；`lead` 容第一列前面空着。
  */
-function checkFull(chords: StaffChord[], expect: number, sp: number, ignoreSmall: boolean, anchorOf?: (ch: StaffChord) => number | undefined, lead = false): boolean {
+export function checkFull(chords: StaffChord[], expect: number, sp: number, ignoreSmall: boolean, anchorOf?: (ch: StaffChord) => number | undefined, lead = false): boolean {
   if (!chords.length) return false;
   const EPS = 1e-6;
   let chs = chords;
@@ -1455,16 +1604,24 @@ function checkFull(chords: StaffChord[], expect: number, sp: number, ignoreSmall
         newGrp = true;
         const sa = cha.stem?.seg;
         const sb = it.stem?.seg;
-        if (sa && sb && Math.abs(sa.cx - sb.cx) < sp / 2) newGrp = false;
+        if (sa && sb && Math.abs(sa.cx - sb.cx) < sp / 2 && !(cha.vector && endToEnd(cha, it))) newGrp = false;
       }
     }
     if (newGrp) grps.push({ chords: [it], offset: 0 });
     else grps[grps.length - 1].chords.push(it);
   }
+  const markSmall = () => {
+    for (const ch of small) {
+      ch.grace = true;
+      for (const n of ch.notes) n.grace = true;
+    }
+  };
   if (!grps.length) {
     if (!measureRest.length && !full.length) return false;
     for (const ch of measureRest) ch.timed = true;
     for (const ch of full) ch.timed = true;
+    // 剔掉小头后只剩一个占满整小节的音（八段锦二胡 m48 全音符前的倚音）：小头照样标倚音，原来这一支提前返回漏标了
+    markSmall();
     return true;
   }
 
@@ -1542,10 +1699,7 @@ function checkFull(chords: StaffChord[], expect: number, sp: number, ignoreSmall
     }
   for (const ch of measureRest) ch.timed = true;
   for (const ch of full) ch.timed = true;
-  for (const ch of small) {
-    ch.grace = true;
-    for (const n of ch.notes) n.grace = true;
-  }
+  markSmall();
   return true;
 }
 
@@ -1644,11 +1798,21 @@ function splitVoice(chords: StaffChord[], expect: number): void {
       for (const n of ch.notes) n.voice = i + 1;
     }
   });
-  for (const grp of extra)
+  // 剔出来的孤层排到真声部**后面**，不并回第一声部：并回去它就接在真旋律前头，这小节成了两倍长
+  //（爱是从神而来 p3 m37 钢琴右手：G4 全音符比下声部第一个八分靠左半格、排在了前面，并回去成了「全音符 + 八个八分」）。
+  // 假全音符照样挤不掉真旋律，只多出一个声部。
+  // 全音符在小节开头起音：头不在真声部第一个音左右一个头宽以内的（落在小节中段，多是符尾、弧认成的假全音符，新编 009 m1 F4），
+  // 照旧并回第一声部——排到后面歌词就跟着错挂一串
+  const start = Math.min(...merged.flat().map((c) => c.left));
+  const atStart = (ch: StaffChord) => ch.left <= start + (ch.right - ch.left) * 1.2;
+  let last = merged.length;
+  for (const grp of extra) {
+    const v = grp.every(atStart) ? ++last : 1;
     for (const ch of grp) {
-      ch.voice = 1;
-      for (const n of ch.notes) n.voice = 1;
+      ch.voice = v;
+      for (const n of ch.notes) n.voice = v;
     }
+  }
 }
 
 /**
@@ -1694,7 +1858,38 @@ function assignVoicesInBar(inBar: StaffNote[], expect: number, borrowed = false)
       return;
     }
   }
+  // **两个声部共用一个休止**（君王将临 m26 女高女低：上「附点二分」、下「二分 + 四分」，第四拍一个四分休止写在谱表中间两声部共用）：
+  // 两边各加上休止正好一小节、且有上下干的头落在同一列（两个声部同时起音；二度相邻的两个头左右错开一个头宽）才拆，
+  // 休止归上声部；下声部提前收尾，MusicXML 里不算错
+  {
+    const rests = arr.filter((n) => n.rest && n.sym.code !== "restHBar");
+    const sp = arr[0].staff.stepDistance() * 2;
+    if (rests.length && up.length && down.length && arr.length === up.length + down.length + rests.length
+      && Math.abs(sumOf(up) + sumOf(rests) - expect) < 1e-6 && Math.abs(sumOf(down) + sumOf(rests) - expect) < 1e-6
+      && up.some((u) => down.some((d) => Math.abs(u.x - d.x) < sp * 2))) {
+      for (const n of down) {
+        n.voice = 2;
+        if (n.group) n.group.voice = 2;
+      }
+      return;
+    }
+  }
   if (up.length < 2 || down.length < 2) return;
+  // 休止没让位到谱表外、贴着外线写的（望十架 p5 m39 低音：上声部「八分休止 + 三个八分」两遍，下声部两个二分，休止心离第五线 2px）：
+  // 休止全归一侧、两个声部正好都凑满才拆
+  {
+    const rests = arr.filter((n) => n.rest && n.sym.code !== "restHBar");
+    if (rests.length && arr.length === up.length + down.length + rests.length && Math.abs(sumOf(up) + sumOf(down) + sumOf(rests) - 2 * expect) < 1e-6) {
+      const side = Math.abs(sumOf(up) + sumOf(rests) - expect) < 1e-6 && Math.abs(sumOf(down) - expect) < 1e-6 ? "up" : Math.abs(sumOf(down) + sumOf(rests) - expect) < 1e-6 && Math.abs(sumOf(up) - expect) < 1e-6 ? "down" : null;
+      if (side) {
+        for (const n of side === "up" ? down : [...down, ...rests]) {
+          n.voice = 2;
+          if (n.group) n.group.voice = 2;
+        }
+        return;
+      }
+    }
+  }
   if (Math.abs(sumOf(up) - expect) >= 1e-6 || Math.abs(sumOf(down) - expect) >= 1e-6) return;
   for (const n of down) {
     n.voice = 2;
@@ -1729,7 +1924,7 @@ export function calcAlters(pg: SPage, ctx: Map<Staff, StaffContext>, notes: Staf
   // 按 (谱行, 小节) 分组，组内按 x
   const byBar = new Map<string, StaffNote[]>();
   for (const n of notes) {
-    if (n.rest) continue;
+    if (n.rest || n.unpitched) continue;
     const st = n.staff;
     const bi = st.bars.findIndex((b) => n.x >= b.left && n.x < b.right);
     const key = `${st.index}#${bi}`;
@@ -1895,6 +2090,9 @@ export function checkBars(
       let full = checkFull(chords, expect, sp, false);
       if (!full) full = checkFull(chords, expect, sp, true);
       if (!full) full = blackenMixed(chords, expect, sp);
+      if (!full) full = unHollowish(chords, expect, sp);
+      if (!full) full = widenCrossHeads(chords, expect, sp);
+      if (!full && chords[0]?.vector) full = extendHalfHook(chords, expect, sp);
       // 同系统已凑满的谱行（钢琴右手之于左手）给拍位，再凑一次（见 `checkFull` 的 `byAnchor`）
       if (!full) {
         const anchorOf = anchorsFor(stf, i);
@@ -1914,6 +2112,7 @@ export function checkBars(
       // 拿它去凑只会把原来按次序写的小节改成按拍位写（宁静一首十来处，音符反掉）
       const overfull = (len: number) => inBar.filter((n) => !n.chordExtra && !n.grace).reduce((a, n) => a + n.duration, 0) > len * 1.3;
       let split = false;
+      if (full) unifyMixed(chords);
       if (full) splitVoice(chords, expect);
       else if (short !== undefined && overfull(short) && (checkFull(chords, short, sp, false) || checkFull(chords, short, sp, true))) (split = true), splitVoice(chords, short);
       else assignVoicesInBar(inBar, expect, notes.some((n) => n.staff === stf && n.crossStaff && n.x >= bar.left && n.x < bar.right));
@@ -2016,6 +2215,87 @@ function blackenMixed(chords: StaffChord[], expect: number, sp: number): boolean
     hit = true;
   }
   return hit && (checkFull(chords, expect, sp, false) || checkFull(chords, expect, sp, true));
+}
+
+/**
+ * **凑满了的小节里，一半空心一半实心的和弦按凑拍用的时值统一成四分**：和弦按首个音的时值凑拍（`guessDur`），
+ * 首个音是四分、凑满了，就说明四分对，同一根干上读成二分的头跟着它（望十架 p3 m29 女高女低 C5/D4 四分，白斑打花的 C5 读成二分）。
+ * 只往实心统一，与 `blackenMixed` 同向：首个音是二分时反过来把四分拉成二分，是爱 p4 m58、p5 m66 两处真四分被拉长。
+ * 带附点的不动：两声部挤在一根干上（向主唱新歌 m2 上声部 D4 附点二分、下声部 B3 八分）。
+ * 与 `blackenMixed` 同一批和弦：有干、无杠无尾、干朝向一致。
+ */
+function unifyMixed(chords: StaffChord[]): void {
+  for (const c of chords) {
+    if (!c.stem || c.grace || c.notes.length < 2 || !c.notes.every((n) => !n.rest && n.beams === 0 && !n.dots)) continue;
+    if (c.notes[0].base !== 1 / 4 || !c.notes.some((n) => n.base === 1 / 2)) continue;
+    if (new Set(c.notes.map((n) => n.stemUp)).size > 1) continue;
+    for (const n of c.notes) if (n.base === 1 / 2) (n.base = 1 / 4), (n.duration = 1 / 4);
+  }
+}
+
+/**
+ * **凑不满的小节里，实心字形只因头心有白才按二分算的和弦逐枚改回四分**：位图路的 `hollowish` 是个弱判据，
+ * 白斑打花的扫描页上真实心头的头心也有三四成白（望十架 p3 m31 女高女低 F5/F4 两枚都读成二分，这一小节多出一拍）。
+ * 一枚一枚试，改完凑得满才留，凑不满就退回。
+ */
+function unHollowish(chords: StaffChord[], expect: number, sp: number): boolean {
+  for (const c of chords) {
+    if (!c.stem || c.grace) continue;
+    const heads = c.notes.filter((n) => !n.rest);
+    if (!heads.length || !heads.every((n) => n.sym.code === "noteheadBlack" && n.base === 1 / 2 && n.beams === 0)) continue;
+    const set = (b: number) => heads.forEach((n) => ((n.base = b), (n.duration = b * (2 - 1 / 2 ** n.dots))));
+    set(1 / 4);
+    if (checkFull(chords, expect, sp, false) || checkFull(chords, expect, sp, true)) return true;
+    set(1 / 2);
+  }
+  return false;
+}
+
+/**
+ * **叉形符头不分空心实心**：Anastasia 的圈 X（吊镲）四分、二分是同一个字形，一律按四分读。
+ * 凑不满时把没杠没尾的叉头逐枚改成二分再凑，凑不上就退回（八段锦钢片琴 m78「⊗ + 二分休止」）。
+ */
+function widenCrossHeads(chords: StaffChord[], expect: number, sp: number): boolean {
+  for (const c of chords) {
+    // 不要求认出干：圈 X 的干接在圈顶正中，挂干那一步按头缘找干接不上
+    if (c.grace || !c.notes.every((n) => n.xHead && n.base === 1 / 4 && n.beams === 0)) continue;
+    for (const n of c.notes) (n.base = 1 / 2), (n.duration = n.base * (2 - 1 / 2 ** n.dots));
+    if (checkFull(chords, expect, sp, false)) return true;
+    for (const n of c.notes) (n.base = 1 / 4), (n.duration = n.base * (2 - 1 / 2 ** n.dots));
+  }
+  return false;
+}
+
+/**
+ * **副杠只印半截**：连杠组末尾两个十六分，第二道杠只从倒数第二根干朝右伸出一截钩、没盖到最后那根干
+ *（八段锦二胡 / 笛子 / 高胡 m1、高胡 m76 末组 E F♯），最后那个音读成八分、整小节多出一个十六分。
+ * 凑不满时把这种组尾的音补到钩那一层再凑，凑不上（按次序加也不是一整小节）就退回；留下的钩改成一道到组尾的杠（`begin` / `end`）。
+ */
+function extendHalfHook(chords: StaffChord[], expect: number, sp: number): boolean {
+  const seq = chords.filter((c) => !c.grace && c.notes[0].beam).sort((a, b) => a.left - b.left);
+  for (let i = 0; i + 1 < seq.length; i++) {
+    const [a, b] = [seq[i], seq[i + 1]];
+    const ba = a.notes[0].beam!;
+    const bb = b.notes[0].beam!;
+    const lv = ba.lastIndexOf("forward hook");
+    if (lv < 1 || bb.length > lv || bb[0] !== "end" || (ba[0] !== "begin" && ba[0] !== "continue")) continue;
+    const k = lv + 1 - bb.length;
+    const saved = b.notes.map((n) => ({ n, base: n.base, beams: n.beams, beam: n.beam }));
+    for (const n of b.notes) {
+      n.base /= 2 ** k;
+      n.duration = n.base * (2 - 1 / 2 ** n.dots);
+      n.beams += k;
+      n.beam = [...bb, ...Array<BeamState>(k).fill("end")];
+    }
+    // 凑不满拍位、但按次序加起来正好一小节的也留下（写出端按次序写）：二胡 m1 前面一个十六分与下一个八分横向挨着、被并成一列，拍位凑不上
+    const full = checkFull(chords, expect, sp, false);
+    if (full || Math.abs(chords.reduce((t, c) => t + (c.grace ? 0 : guessDur(c)), 0) - expect) < 1e-6) {
+      for (const n of a.notes) if (n.beam) n.beam = n.beam.map((st, j) => (j === lv ? "begin" : st));
+      return full;
+    }
+    for (const { n, base, beams, beam } of saved) Object.assign(n, { base, duration: base * (2 - 1 / 2 ** n.dots), beams, beam });
+  }
+  return false;
 }
 
 /** 这一页最后生效的拍号（给下一页当 `carry`）。 */

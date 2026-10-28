@@ -7,11 +7,12 @@
 import type { ElementId, ScoreDoc } from "../model/doc";
 import type { MetaData } from "../smufl/smufl";
 import { staffOptionsOf } from "../layout/painter";
-import { phraseCuts, type FitMeasure } from "../pu/phrase";
+import { phraseCuts, type FitMeasure } from "../jianpu/phrase";
 import { layoutStaff } from "../mixed/layout";
 import { staffChordSpans } from "../mixed/layoutpass";
 import { scoreDocToMusicXml } from "../model/toxml";
 import { musicXmlFormat, type DocFormatId } from "./formats";
+import type { StyleState } from "./stylestate";
 import { t } from "../i18n";
 import { normalizeEol } from "../common/lines";
 import type { App } from "./app";
@@ -21,13 +22,11 @@ export interface MixedHost {
   readonly meta: MetaData;
   readonly docFormat: DocFormatId;
   readonly layoutMode: App["layoutMode"];
-  readonly jpPaper: App["jpPaper"];
-  readonly fontSize: App["fontSize"];
-  readonly layoutPage: App["layoutPage"];
+  /** 渲染设置（纸、字号、五线谱样式表） */
+  readonly style: Pick<StyleState, "jpPaper" | "fontSize" | "layoutPage" | "staffStyle">;
   readonly phraseOn: boolean;
   readonly staffPaper: string;
   readonly staffPage: App["staffPage"];
-  staffStyle(): ReturnType<App["staffStyle"]>;
   getText(): string;
   setStatus(s: string): void;
   /** 五线谱 / 混排档可不可用（按钮显隐） */
@@ -49,11 +48,11 @@ export class MixedSession {
   _srcToMixed = new Map<ElementId, ElementId[]>();
   /** `.musicxml` 五线谱档那份模型是按哪份原文读的（原文变了才重读）。 */
   _mixedXmlText: string | null = null;
-  /** 派生五线谱里各和弦在第几小节（全曲下标）：五线谱上的小节线按小节认（身份标签的 `measure`，`layout/identity.ts`）。 */
+  /** 派生五线谱里各和弦在第几小节（全曲下标）：五线谱上的小节线按小节认（身份标签的 `measure`，`pagetree/identity.ts`）。 */
   _mixedMeasureOf = new Map<ElementId, number>();
 
   /**
-   * 乐句档的五线谱行首：同一套断句（`pu/phrase.ts::phraseCuts`），**尺子换成五线谱引擎**——
+   * 乐句档的五线谱行首：同一套断句（`jianpu/phrase.ts::phraseCuts`），**尺子换成五线谱引擎**——
    * 不带换行投一份、按当前五线谱纸与样式排一遍，量各和弦的自然跨度（`mixed/layoutpass.ts::staffChordSpans`）。
    * 小节中间的断点也要（`midLineStarts`：拆小节、中间隐藏线）；分页交给五线谱自己，`PhraseCut.page` 不用。
    * `doc` 须与投影的那份同一个（`sourceMusicXmlBare` 里那份），元素 id 才对得上。量不出来返回 null，调用方退回简谱行首。
@@ -61,12 +60,12 @@ export class MixedSession {
   staffPhraseLineStarts(doc: ScoreDoc): ReadonlySet<ElementId> | null {
     try {
       const bare = musicXmlFormat.toScoreDoc(scoreDocToMusicXml(doc, { sourceIds: true }));
-      const options = staffOptionsOf(this.host.meta, this.host.staffStyle());
+      const options = staffOptionsOf(this.host.meta, this.host.style.staffStyle());
       options.page = this.host.staffPage;
       const { width, byId } = staffChordSpans(layoutStaff(bare, options));
       if (byId.size === 0) return null;
       const measure: FitMeasure = () => ({ width, spans: byId });
-      const cuts = phraseCuts(doc, 0, { measure });
+      const cuts = phraseCuts(doc, 0, { kind: "phrase", measure });
       if (!cuts) return null;
       return new Set(cuts.flatMap((c) => (c.id === null ? [] : [c.id])));
     } catch (e) {
@@ -77,10 +76,10 @@ export class MixedSession {
 
   /** 派生五线谱要看的设置：简谱的档、纸、字号变了，断点跟着变，得重新派生。 */
   _mixedDeriveKey(): string {
-    const pg = this.host.layoutPage;
+    const pg = this.host.style.layoutPage;
     // 乐句档五线谱自己量宽断句，五线谱的纸与样式也进键
-    const staff = this.host.phraseOn ? ["phrase", this.host.staffPaper, JSON.stringify(this.host.staffStyle())] : [];
-    return [this.host.getText(), this.host.layoutMode, this.host.jpPaper, this.host.fontSize, pg.w, pg.h, ...staff].join("\u0000");
+    const staff = this.host.phraseOn ? ["phrase", this.host.staffPaper, JSON.stringify(this.host.style.staffStyle())] : [];
+    return [this.host.getText(), this.host.layoutMode, this.host.style.jpPaper, this.host.style.fontSize, pg.w, pg.h, ...staff].join("\u0000");
   }
 
   /** 五线谱/混排档的模型备好了没有。`.musicxml` 就是打开时读的那份；文本格式把**当前源文**经

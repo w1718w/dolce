@@ -16,6 +16,13 @@ export const GlyphCodes = {
   noteheadBlack: String.fromCharCode(0xe0a4),
   noteheadSlashVerticalEnds: String.fromCharCode(0xe100),
   noteheadSlashDiamondWhite: String.fromCharCode(0xe104),
+  // 叉形、圈叉符头（打击乐：MusicXML `<notehead>x</notehead>` / `circle-x`）
+  noteheadXWhole: String.fromCharCode(0xe0a7),
+  noteheadXHalf: String.fromCharCode(0xe0a8),
+  noteheadXBlack: String.fromCharCode(0xe0a9),
+  noteheadCircleXWhole: String.fromCharCode(0xe0b1),
+  noteheadCircleXHalf: String.fromCharCode(0xe0b2),
+  noteheadCircleX: String.fromCharCode(0xe0b3),
   // Flags
   flag8thUp: String.fromCharCode(0xe240),
   flag8thDown: String.fromCharCode(0xe241),
@@ -104,6 +111,17 @@ export const GlyphCodes = {
   // Metronome（节拍记号音符）
   metNoteQuarterUp: String.fromCharCode(0xeca5),
   metAugmentationDot: String.fromCharCode(0xecb7),
+  // 波音、颤音、弓法、单音震音（五线谱谱表上方与符干上的记号）
+  ornamentTrill: String.fromCharCode(0xe566),
+  ornamentTurn: String.fromCharCode(0xe567),
+  ornamentShortTrill: String.fromCharCode(0xe56c),
+  ornamentMordent: String.fromCharCode(0xe56d),
+  stringsDownBow: String.fromCharCode(0xe610),
+  stringsUpBow: String.fromCharCode(0xe612),
+  tremolo1: String.fromCharCode(0xe220),
+  tremolo2: String.fromCharCode(0xe221),
+  tremolo3: String.fromCharCode(0xe222),
+  tremolo4: String.fromCharCode(0xe223),
 };
 
 const codeToName: Record<string, string> = {
@@ -117,6 +135,12 @@ const codeToName: Record<string, string> = {
   [GlyphCodes.noteheadHalf]: "noteheadHalf",
   [GlyphCodes.noteheadBlack]: "noteheadBlack",
   [GlyphCodes.noteheadSlashVerticalEnds]: "noteheadSlashVerticalEnds",
+  [GlyphCodes.noteheadXWhole]: "noteheadXWhole",
+  [GlyphCodes.noteheadXHalf]: "noteheadXHalf",
+  [GlyphCodes.noteheadXBlack]: "noteheadXBlack",
+  [GlyphCodes.noteheadCircleXWhole]: "noteheadCircleXWhole",
+  [GlyphCodes.noteheadCircleXHalf]: "noteheadCircleXHalf",
+  [GlyphCodes.noteheadCircleX]: "noteheadCircleX",
   [GlyphCodes.flag8thUp]: "flag8thUp",
   [GlyphCodes.flag8thDown]: "flag8thDown",
   [GlyphCodes.flag16thUp]: "flag16thUp",
@@ -189,6 +213,16 @@ const codeToName: Record<string, string> = {
   [GlyphCodes.dynamicNiente]: "dynamicNiente",
   [GlyphCodes.metNoteQuarterUp]: "metNoteQuarterUp",
   [GlyphCodes.metAugmentationDot]: "metAugmentationDot",
+  [GlyphCodes.ornamentTrill]: "ornamentTrill",
+  [GlyphCodes.ornamentTurn]: "ornamentTurn",
+  [GlyphCodes.ornamentShortTrill]: "ornamentShortTrill",
+  [GlyphCodes.ornamentMordent]: "ornamentMordent",
+  [GlyphCodes.stringsDownBow]: "stringsDownBow",
+  [GlyphCodes.stringsUpBow]: "stringsUpBow",
+  [GlyphCodes.tremolo1]: "tremolo1",
+  [GlyphCodes.tremolo2]: "tremolo2",
+  [GlyphCodes.tremolo3]: "tremolo3",
+  [GlyphCodes.tremolo4]: "tremolo4",
 };
 
 export function glyphCodeName(c: string): string | undefined {

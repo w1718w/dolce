@@ -26,6 +26,8 @@ export const FEATURE_TOPICS_EN: { title: string; body: string[] }[] = [
       "**Pages**: the previous / next buttons in the status bar at the bottom, or `PageUp` / `PageDown`; `Ctrl/⌘+Home` goes to the first page and `Ctrl/⌘+End` to the last.",
       "**Zoom**: the `−` / `100%` / `＋` buttons in the status bar, `Ctrl/⌘ +` / `-` / `0`, or scroll while holding `Ctrl/⌘`.",
       "The **macOS desktop app** also supports trackpad pinch-to-zoom.",
+      "With the **side-by-side original**, the image column zooms on its own (scroll while holding `Ctrl/⌘`, or pinch); drag with the mouse to pan, and double-click an empty spot to fit it back to the column width.",
+      "**Column widths**: drag the dividers between the source, the original and the score to resize them; double-click a divider to reset. Widths are remembered.",
     ],
   },
   {
@@ -66,7 +68,7 @@ export const FEATURE_TOPICS_EN: { title: string; body: string[] }[] = [
     title: "Score views",
     body: [
       "Four views sit above the score: **Expanded** (repeats and verses unrolled, one verse per page — for projection), **As printed** (laid out once like the original, verses stacked), **Staff**, and **Mixed** (staff notation with a jianpu layer). For text formats the staff notation is generated from the source.",
-      "**Line breaking**: “Original” keeps the line structure from import or recognition; “By phrase” re-breaks lines by lyric and musical phrases. Text jianpu is supported too — the source itself is re-broken; click “Original” to restore it exactly (or undo with Ctrl+Z).",
+      "**Line breaking**: “Original” keeps the line structure from import or recognition; “By phrase” re-breaks lines by lyric and musical phrases; “Every N bars” (pick N in the drop-down next to it) puts a fixed number of bars on each line — the pickup bar is not counted, existing page breaks are kept, and the status bar warns if a line does not fit the paper. Text jianpu is supported too — the source itself is re-broken; click “Original” to restore it exactly (or undo with Ctrl+Z).",
       "These tools only appear when the current file supports them.",
     ],
   },

@@ -4,8 +4,8 @@
 // （和弦里用的那一套，不是五线谱的 accidentalFlat）、抬高；缺省写在音名**之前**，`accidental-side: after` 写在后。
 // 原先三路三张名表、三种升降号（ASCII `Bb` 写在后、缩小的 `b` 字符、Unicode `♭`），这里收一份。
 import { Rect } from "../common/geom";
-import { Font } from "../layout/font";
-import { PageItem, TextFrame } from "../layout/pageitem";
+import { Font } from "../pagetree/font";
+import { PageItem, TextFrame } from "../pagetree/pageitem";
 import { MusicCommon } from "../score/jppitch";
 import { GlyphCodes } from "../smufl/smufl";
 import { musicText } from "./prims";
@@ -24,7 +24,7 @@ export function keyNameOfFifths(fifths: number): KeyName {
 }
 
 /** 文字写法的调名（`bE` / `Eb` / `♭E` / `$E` / `#F` / `F`）→ 调名；认不出返回 null。
- *  `$` 是文本谱里降号的写法（`pu/parse.ts`）。 */
+ *  `$` 是文本谱里降号的写法（`fanqie/parse.ts`）。 */
 export function keyNameOf(text: string): KeyName | null {
   const m = /^([b#$♭♯]?)([A-G])([b#$♭♯]?)$/.exec(text.trim());
   if (!m || (m[1] && m[3])) return null;

@@ -3,7 +3,7 @@
 
 import { latinWordBreak } from "../engrave/syllable";
 import { Fraction } from "../common/fraction";
-import { Font } from "../layout/font";
+import { Font } from "../pagetree/font";
 import { GlyphCodes, type MetaData } from "../smufl/smufl";
 import { xmlPos } from "../model/xmlsurface";
 import {
@@ -24,6 +24,7 @@ import {
   SysStaff,
   TimeSig,
   Tuplet,
+  ARPEGGIO_RESERVE,
   arcExtent,
   slurEnds,
   smuflBottom,
@@ -174,6 +175,8 @@ function entryReach(score: StaffLayout, mi: number, byStaff?: Map<string, { offs
         if (flag) ink = Math.max(ink, n.chord.stemX() + smuflWidth(meta, flag));
       }
       for (const a of ent.acc.accidentals) if (a.xpos !== null) left = Math.min(left, a.xpos);
+      // 琶音线画在符头、临时记号左边，要让出它的宽（否则首音的琶音压小节线，八段锦钢片琴 m39）
+      if (ent.notes.some((n) => n.arpeg)) left -= ARPEGGIO_RESERVE;
       const key = ent.offset.toString();
       const cur = out.get(key);
       out.set(key, { left: Math.min(cur?.left ?? 0, left), right: Math.max(cur?.right ?? 0, right), ink: Math.max(cur?.ink ?? 0, ink, right) });
@@ -559,7 +562,7 @@ function autoNaturalWidth(score: StaffLayout, mi: number): number {
   return AUTO_LEFT_DATA + span + AUTO_END_PAD;
 }
 
-/** 源谱版面档：起行照谱里的 `new-system` / `new-page`（都是硬断点），各小节宽仍按自然宽给。 */
+/** 硬断点（源谱版面档、源文写明的换行）：起行照谱里的 `new-system` / `new-page`，各小节宽仍按自然宽给。 */
 function sourceBreaks(score: StaffLayout, input: LayoutInput): Set<number> {
   const breaks = new Set<number>([0]);
   for (let i = 0; i < score.measures.length; i++) score.measures[i]!.width = autoNaturalWidth(score, i);
@@ -568,6 +571,40 @@ function sourceBreaks(score: StaffLayout, input: LayoutInput): Set<number> {
       if (mea.prints.some((pr) => pr.newPage || pr.newSystem)) breaks.add(i);
     });
   }
+  return breaks;
+}
+
+/** 源文写明的换行（ABC，`hardBreaks` 而非源谱版面档）：起行照 `sourceBreaks`，源文的行不并。
+ *  只有连最紧一档（`Slot.tight`）都压不下的行——多半是源文没写换行、整首一行（没写 `$` 的 123 转出的 ABC 就是这样）——
+ *  才在行内按自然宽均分成几行，免得压成墨迹相叠的第四档。 */
+function writtenBreaks(score: StaffLayout, input: LayoutInput): Set<number> {
+  const breaks = sourceBreaks(score, input);
+  const n = score.measures.length;
+  const d = score.defaults;
+  const avail = d.pageWidth - d.leftMargin - d.rightMargin;
+  const tight: Squeeze = { mode: 3, s: 0 };
+  const starts = [...breaks].sort((a, b) => a - b);
+  starts.forEach((from, k) => {
+    const to = starts[k + 1] ?? n;
+    const w = (i: number) => score.measures[i]!.width + (i > from ? midAttrWidth(score, i) : 0);
+    let min = autoLead(score, from) - AUTO_ATTR_GAP + TIGHT_ATTR_GAP;
+    let nat = autoLead(score, from);
+    for (let i = from; i < to; i++) {
+      min += squeezedWidth(score, i, tight) + (i > from ? midAttrWidth(score, i) : 0);
+      nat += w(i);
+    }
+    if (min <= avail) return;
+    const pieces = Math.ceil(nat / avail);
+    let acc = autoLead(score, from);
+    let m = 1;
+    for (let i = from; i < to - 1 && m < pieces; i++) {
+      acc += w(i);
+      if (acc >= (nat * m) / pieces) {
+        breaks.add(i + 1);
+        m++;
+      }
+    }
+  });
   return breaks;
 }
 
@@ -650,14 +687,15 @@ function autoJustifySystems(score: StaffLayout): void {
     for (const m of sys.measures) sum += m.width;
     if (sum <= 0) continue;
     const attrSum = attr.reduce((a, b) => a + b, 0);
-    if (score.keepBreaks) {
+    let scale = Math.max(0, avail - attrSum) / sum;
+    // 源文写明的硬断点（`hardBreaks`）过满的行也照源谱版面档压
+    if (score.keepBreaks || (score.hardBreaks && scale < 1)) {
       justifySourceSystem(score, sys, avail, attr);
       continue;
     }
     const isLast = si === score.systems.length - 1;
     // 末行也拉满，但最多拉到自然宽的 LAST_LINE_MAX_STRETCH 倍：太短的末行（剩一两个小节）照拉满就稀得不成样子，
     // 拉到上限为止、右边留空
-    let scale = Math.max(0, avail - attrSum) / sum;
     if (isLast && scale > LAST_LINE_MAX_STRETCH) scale = LAST_LINE_MAX_STRETCH;
     sys.measures.forEach((m, k) => { m.width = m.width * scale + attr[k]!; });
   }
@@ -1626,7 +1664,9 @@ export function finishMixedScore(score: StaffLayout, input: LayoutInput, partGro
   // 源谱版面档的页眉带着原图的位置与字号（`staffomr/toxml.ts::creditsXml`）：照原样排，不重排
   const placedHeader = score.keepBreaks && score.credits.some((c) => c.type === "title") && score.credits.every((c) => c.y > 0);
   if (autoLayout && !placedHeader) autoLayoutHeader(score);
-  const autoBreaks = autoLayout ? (score.keepBreaks ? sourceBreaks(score, input) : autoLayoutWidths(score, input)) : undefined;
+  const autoBreaks = !autoLayout
+    ? undefined
+    : score.keepBreaks ? sourceBreaks(score, input) : score.hardBreaks ? writtenBreaks(score, input) : autoLayoutWidths(score, input);
   buildSystemsAndPages(score, input, autoBreaks);
   applyStaffVisibility(score, input);
   updateLayoutByPrint(score, input);

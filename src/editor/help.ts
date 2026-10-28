@@ -6,7 +6,7 @@ import type { App } from "./app";
 import { PaintResources, ScorePainter } from "../layout/painter";
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { jpwToScoreDoc } from "../model/fromjpw";
-import { parse123 } from "../j123/parse";
+import { parse123 } from "../abcfamily/parse";
 import type { ScoreDoc } from "../model/doc";
 import type { StyleSheet } from "../style/sheet";
 import { THEMES, computeStyleForPaper, themeOfMode } from "../style/themes";
@@ -182,6 +182,8 @@ const FEATURE_TOPICS_ZH: Topic[] = [
       "**翻页**：底部状态栏 上一页 / 下一页，或键盘 `PageUp` / `PageDown`；`Ctrl/⌘+Home` 跳首页、`Ctrl/⌘+End` 跳末页。",
       "**缩放**：底部状态栏 `−` / `100%` / `＋`，或 `Ctrl/⌘ +` / `-` / `0`，或按住 `Ctrl/⌘` 滚滚轮。",
       "**macOS 桌面版**还支持触控板双指捏合缩放。",
+      "**并排原图**时，原图那一栏可以单独缩放（按住 `Ctrl/⌘` 滚滚轮或双指捏合）、按住鼠标拖动平移，双击空白处回到铺满栏宽。",
+      "**栏宽**：源码、原图、排版之间的分隔条可以拖动调宽度，双击分隔条复位；宽度会记住。",
     ],
   },
   {
@@ -222,7 +224,7 @@ const FEATURE_TOPICS_ZH: Topic[] = [
     title: "谱面布局",
     body: [
       "右侧「排版」顶部的四档：**展开**（反复与多段歌词逐段展开、一段一页，投影用）、**原样**（按原谱排一遍，多段歌词叠排）、**五线谱**、**混排**（五线谱上再叠一层简谱）。文本格式的五线谱由源码自动生成。",
-      "**分行方式**：选择「原始排版」可保留导入或识别时的行结构；选择「按乐句重排」会根据歌词和音乐乐句重新安排换行。文本谱也支持，重排的是左侧代码本身；再点「原始排版」即可逐字还原（Ctrl+Z 也可整体撤销）。",
+      "**分行方式**：选择「原始排版」可保留导入或识别时的行结构；选择「按乐句重排」会根据歌词和音乐乐句重新安排换行；选择「每行 N 小节」（N 在旁边的下拉里选）则每行固定放 N 个小节，弱起小节不计、原有的换页保留，纸放不下时状态栏会提示。文本谱也支持，重排的是左侧代码本身；再点「原始排版」即可逐字还原（Ctrl+Z 也可整体撤销）。",
       "这些工具只会在当前文件支持时出现。",
     ],
   },

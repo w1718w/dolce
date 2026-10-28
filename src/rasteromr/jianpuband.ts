@@ -12,11 +12,13 @@
 // 对不上两条以上就当没有，这一段对别的底本是空转。
 import type { Binary, Rect } from "../omrkit/types";
 import type { LineSeg } from "./prims";
-import type { RasterUnit } from "./staffline";
+import { liftRange, type RasterUnit } from "./staffline";
 import { contentKey } from "../omrkit/contentkey";
 
-/** 简谱小节线的长度（线距的倍数）：《是谁》2.34 格、敬拜万世之王 3.7 格（数字大、上下有高低音点）。 */
-const BAR_LEN = [1.2, 4] as const;
+/** 简谱小节线的长度（线距的倍数）：《是谁》2.34 格、敬拜万世之王 3.7 格（数字大、上下有高低音点）、祢話如甘霖 4.84 格（简谱字号比谱表线距大得多）。 */
+const BAR_LEN = [1.2, 5.5] as const;
+/** 对上的简谱小节线长度不超过它们中位数的几倍 */
+const BAR_LEN_SPREAD = 1.15;
 /** 简谱小节线的下端离谱表顶线至少多远（线距）：再近就是符干、符杠那一带。 */
 const BAR_CLEAR = 0.5;
 /** 往上最多找多远（线距）。 */
@@ -40,27 +42,59 @@ const BAR_SIBLING = 0.75;
  * 下面放得少——再往下是往上的符杠（《是谁》第一行的符杠离小节线下端只有 0.4 格）。
  */
 const PAD_TOP = 0.8;
+/** 叠印的上一行简谱：下一行谱表离这行谱表不过谱表高的几倍才算同一系统（祢話如甘霖两行谱表隔 1.8 倍） */
+const STACK_GAP = 3;
+/** 叠印的上一行简谱：对上这行小节线的成数 */
+const STACK_MATCH = 0.6;
 const PAD_BOTTOM = 0.3;
 
-/** 一条简谱行：它压在哪行谱上、带的盒、行内小节线的 x。 */
+/** 一条简谱行：它压在哪行谱上、带的盒、行内小节线的 x。
+ *  弯、斜的谱行（`lift`）上带随谱线走：`box` 的 y 按谱表中段的线位记，x 处的带要加上 `lift(x)`。 */
 export interface JianpuBand {
   staff: number;
   box: Rect;
   bars: number[];
+  lift?: (x: number) => number;
 }
 
-/** 定位各谱行上方的简谱行。`staves` 给每行谱的五线几何。 */
+/** 定位各谱行上方的简谱行。`staves` 给每行谱的五线几何（弯、斜的另带逐列偏移 `lift`）。 */
 export function findJianpuBands(
   vSegs: LineSeg[],
-  staves: { left: number; right: number; top: number; bottom: number }[],
+  staves: { left: number; right: number; top: number; bottom: number; lift?: (x: number) => number }[],
   unit: RasterUnit,
+  bin?: Binary,
 ): JianpuBand[] {
   const sp = unit.space;
   const out: JianpuBand[] = [];
+  /** 上端吊在一条长横线下（左右任一边伸出两格以上）：是房子括线的竖钩，不是简谱小节线。
+   *  房子的竖钩也与谱表小节线同 x（哈利路亚主复活 m9 一房、二房，渲图上整条带连同二分音的附点被抹掉） */
+  const hooked = (v: LineSeg): boolean => {
+    if (!bin) return false;
+    const x = Math.round((v.x0 + v.x1) / 2);
+    const top = Math.round(Math.min(v.y0, v.y1));
+    const reach = Math.round(unit.lineThick) + 2;
+    for (let y = Math.max(0, top - reach); y <= Math.min(bin.h - 1, top + reach); y++)
+      for (let x0 = x - 1; x0 <= x + 1; x0++) {
+        if (x0 < 0 || x0 >= bin.w || !bin.data[y * bin.w + x0]) continue;
+        let a = x0;
+        let b = x0;
+        while (a > 0 && bin.data[y * bin.w + a - 1]) a--;
+        while (b < bin.w - 1 && bin.data[y * bin.w + b + 1]) b++;
+        if (Math.max(x0 - a, b - x0) >= sp * 2) return true;
+      }
+    return false;
+  };
   staves.forEach((st, k) => {
     const h = st.bottom - st.top;
-    const span = (v: LineSeg) => [Math.min(v.y0, v.y1), Math.max(v.y0, v.y1)] as const;
     const cx = (v: LineSeg) => (v.x0 + v.x1) / 2;
+    // 弯、斜的谱行：竖线的纵向范围减掉所在 x 处的谱线偏移，按谱线是平的来比（斜 1.7 格的页上两头的简谱小节线错开大半根，
+    // 按原图 y 凑「同一高度」凑不齐）
+    const lift = st.lift;
+    const span = (v: LineSeg) => {
+      const d = lift ? lift(cx(v)) : 0;
+      return [Math.min(v.y0, v.y1) - d, Math.max(v.y0, v.y1) - d] as const;
+    };
+    const liftOf = (o: { lift?: (x: number) => number }, x: number) => (o.lift ? o.lift(x) : 0);
     // 谱表小节线：纵贯五线
     const staffBars = vSegs
       .filter((v) => {
@@ -75,8 +109,23 @@ export function findJianpuBands(
       const len = (b - a) / sp;
       return len >= BAR_LEN[0] && len <= BAR_LEN[1] && b <= st.top - sp * BAR_CLEAR && b >= st.top - sp * BAR_REACH && cx(v) >= st.left - sp && cx(v) <= st.right + sp &&
         // 压着别的谱行的是那一行自己的小节线（你的信实广大谱行只隔 5 格，上一行的小节线落进窗口）
-        !staves.some((o) => o !== st && a < o.bottom && b > o.top);
+        !staves.some((o) => o !== st && a < o.bottom + liftOf(o, cx(v)) - liftOf(st, cx(v)) && b > o.top + liftOf(o, cx(v)) - liftOf(st, cx(v))) && !hooked(v);
     });
+    /** `top`~`bot` 这行简谱上方紧挨着的另一行：同 x（对上这行的小节线）、长度相当的短竖线；返回它的纵向范围与小节线 x */
+    const stackedRow = (top: number, bot: number, bars: number[]): [number, number, number[]] | null => {
+      const minLen = (bot - top) * BAR_SIBLING;
+      const ups = vSegs.filter((v) => {
+        const [a, b] = span(v);
+        return b - a >= minLen && b - a <= sp * BAR_LEN[1] && b <= top - sp * 0.3 && b >= top - (bot - top) - sp * 3 &&
+          bars.some((x) => Math.abs(cx(v) - x) <= sp * BAR_DX) && !hooked(v);
+      });
+      const dg = ups.map((v) => ups.filter((o) => same(v, o)).length);
+      const hb = ups[dg.indexOf(Math.max(...dg))];
+      const row = hb ? ups.filter((v) => same(v, hb)) : [];
+      if (row.length < MIN_MATCH || row.length < bars.length * STACK_MATCH) return null;
+      const ys = row.map(span);
+      return [Math.min(...ys.map((q) => q[0])), Math.max(...ys.map((q) => q[1])), row.map(cx).sort((a, b) => a - b)];
+    };
     const matched0 = cands.filter((v) => staffBars.some((x) => Math.abs(cx(v) - x) <= sp * BAR_DX));
     // **对上的要在同一高度**：取与别人纵向重叠（过短者一半）最多的那一簇。
     // 行首谱表左端上方和弦字母的竖笔也对得上（敬拜万世之王末行 y 比简谱小节线高两格），混进来带顶就罩住和弦
@@ -87,7 +136,12 @@ export function findJianpuBands(
     };
     const deg = matched0.map((v) => matched0.filter((o) => same(v, o)).length);
     const hub = matched0[deg.indexOf(Math.max(...deg))];
-    const matched = hub ? matched0.filter((v) => same(v, hub)) : [];
+    const matched1 = hub ? matched0.filter((v) => same(v, hub)) : [];
+    // **长度要整齐**：小节线长度上限放到 5.5 格之后（祢話如甘霖 4.84 格），与上方字母笔画连成一根的也进得来，
+    // 把带顶抬高、压住和弦（敬拜万世之王第三行）。超过中位数 1.15 倍的不要（敬拜第三行那根 4.26 格，其余 3.3~3.5）
+    const lens = matched1.map((v) => span(v)[1] - span(v)[0]).sort((a, b) => a - b);
+    const medLen = lens[lens.length >> 1] ?? 0;
+    const matched = matched1.filter((v) => span(v)[1] - span(v)[0] <= medLen * BAR_LEN_SPREAD);
     if (matched.length < MIN_MATCH || matched.length < staffBars.length * MIN_MATCH_FRAC) return;
     // 带的纵向范围按对上的那几条定（行首那条可能是简谱行自己的起头线，不一定有谱表小节线对着）
     const ys = matched.map(span);
@@ -105,7 +159,20 @@ export function findJianpuBands(
       .sort((a, b) => a - b);
     const y0 = Math.round(top - sp * PAD_TOP);
     const y1 = Math.min(Math.round(bot + sp * PAD_BOTTOM), Math.round(st.top - sp * 0.2));
-    out.push({ staff: k, box: { x: Math.round(st.left - sp), y: y0, w: Math.round(st.right - st.left + sp * 2), h: y1 - y0 }, bars });
+    const box = { x: Math.round(st.left - sp), y: y0, w: Math.round(st.right - st.left + sp * 2), h: y1 - y0 };
+    // **叠印两行简谱**（祢話如甘霖 15–19 小节：一个系统两行谱表，两行简谱都印在上行谱表上方）：
+    // 自上而下与谱表一一对应，紧贴上行谱表的那行其实是下行谱表的旋律。上方再有一行同 x 的简谱小节线、
+    // 下面紧跟着同一系统的下一行谱表时，上面那行归这行谱、贴着的那行归下一行谱
+    const below = staves[k + 1];
+    const upper = below && below.top - st.bottom < h * STACK_GAP ? stackedRow(top, bot, bars) : null;
+    if (upper) {
+      const u0 = Math.round(upper[0] - sp * PAD_TOP);
+      const u1 = Math.min(Math.round(upper[1] + sp * PAD_BOTTOM), y0);
+      out.push({ staff: k, box: { ...box, y: u0, h: u1 - u0 }, bars: upper[2], ...(lift ? { lift } : {}) });
+      out.push({ staff: k + 1, box, bars, ...(lift ? { lift } : {}) });
+      return;
+    }
+    out.push({ staff: k, box, bars, ...(lift ? { lift } : {}) });
   });
   return out;
 }
@@ -133,9 +200,12 @@ export function completeStaffBars(
   const sp = unit.space;
   let n = 0;
   for (const b of bands) {
-    const st = staves[b.staff];
-    const h = st.bottom - st.top;
+    const st0 = staves[b.staff];
+    const h = st0.bottom - st0.top;
     for (const x of b.bars) {
+      // 弯、斜的谱行取这根小节线 x 处的首末线
+      const d = b.lift ? b.lift(x) : 0;
+      const st = { top: st0.top + d, bottom: st0.bottom + d };
       const near = vSegs.filter((v) => {
         const a = Math.min(v.y0, v.y1);
         const e = Math.max(v.y0, v.y1);
@@ -176,13 +246,18 @@ export function completeStaffBars(
  * ——带的下沿离往上的符杠常常不到半格，按矩形一刀切会把符杠削掉。
  * `imgs` 里第一张用来判连通（有谱线的原图），后面几张按同样的像素一并抹。
  */
-export function eraseInBand(imgs: Binary[], band: Rect): number {
+export function eraseInBand(imgs: Binary[], band: Rect, lift?: (x: number) => number): number {
   const bin = imgs[0];
   const x0 = Math.max(0, band.x);
-  const y0 = Math.max(0, band.y);
   const x1 = Math.min(bin.w, band.x + band.w);
-  const y1 = Math.min(bin.h, band.y + band.h);
+  // 弯、斜的谱行：x 处的带上下沿各加 `lift(x)`；外框取包络
+  const [lo, hi] = liftRange(lift, x0, x1);
+  const y0 = Math.max(0, Math.floor(band.y + lo));
+  const y1 = Math.min(bin.h, Math.ceil(band.y + band.h + hi));
   const W = x1 - x0;
+  const dy = new Int32Array(W);
+  if (lift) for (let x = 0; x < W; x++) dy[x] = Math.round(lift(x0 + x));
+  const inBand = (x: number, y: number) => x >= x0 && x < x1 && y >= band.y + dy[x - x0] && y < band.y + band.h + dy[x - x0] && y >= y0 && y < y1;
   const seen = new Uint8Array(W * (y1 - y0));
   let erased = 0;
   const comp: number[] = [];
@@ -190,7 +265,7 @@ export function eraseInBand(imgs: Binary[], band: Rect): number {
   for (let y = y0; y < y1; y++)
     for (let x = x0; x < x1; x++) {
       const i0 = (y - y0) * W + (x - x0);
-      if (seen[i0] || !bin.data[y * bin.w + x]) continue;
+      if (seen[i0] || !bin.data[y * bin.w + x] || !inBand(x, y)) continue;
       // 灌一块；碰到带外的墨就记下「越界」，但带内的部分照灌完（免得同一块反复起灌）
       comp.length = 0;
       let out = false;
@@ -206,7 +281,7 @@ export function eraseInBand(imgs: Binary[], band: Rect): number {
             const ny = py + dy;
             const nx = px + dx;
             if (ny < 0 || ny >= bin.h || nx < 0 || nx >= bin.w || !bin.data[ny * bin.w + nx]) continue;
-            if (ny < y0 || ny >= y1 || nx < x0 || nx >= x1) {
+            if (!inBand(nx, ny)) {
               out = true;
               continue;
             }
@@ -238,11 +313,14 @@ const CUT_SLIVER = 0.15;
 
 export function cutJianpuStrip(bin: Binary, band: JianpuBand): JianpuStrip {
   const { x, y, w, h } = band.box;
+  // 弯、斜的谱行逐列按谱线偏移挪着取（整像素，同 `lyric.ts::stripOf`）
+  const shift = new Int32Array(w);
+  if (band.lift) for (let xx = 0; xx < w; xx++) shift[xx] = Math.round(band.lift(x + xx));
   const data = new Uint8Array(w * h);
   for (let yy = 0; yy < h; yy++)
     for (let xx = 0; xx < w; xx++) {
       const sx = x + xx;
-      const sy = y + yy;
+      const sy = y + yy + shift[xx];
       if (sx >= 0 && sy >= 0 && sx < bin.w && sy < bin.h) data[yy * w + xx] = bin.data[sy * bin.w + sx];
     }
   // 跨过条顶边、在条里只剩薄薄一截（不到条高的 `CUT_SLIVER`）的墨，是上方和弦字母被截下的底
@@ -251,7 +329,7 @@ export function cutJianpuStrip(bin: Binary, band: JianpuBand): JianpuStrip {
   const seen = new Uint8Array(w * h);
   for (let x0 = 0; x0 < w; x0++) {
     const sx = x + x0;
-    if (!data[x0] || seen[x0] || y <= 0 || sx < 0 || sx >= bin.w || !bin.data[(y - 1) * bin.w + sx]) continue;
+    if (!data[x0] || seen[x0] || y + shift[x0] <= 0 || sx < 0 || sx >= bin.w || !bin.data[(y + shift[x0] - 1) * bin.w + sx]) continue;
     const comp: number[] = [x0];
     seen[x0] = 1;
     let maxY = 0;

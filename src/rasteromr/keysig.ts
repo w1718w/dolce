@@ -1,7 +1,7 @@
 // 位图五线谱的**调号与临时记号**：行首调号的笔画判据（升号竖笔、降号台阶）、跨行跨页沿用、系统内互证、行中换调、还原号与临时记号按音高挂。
 // `recognize.ts` 在符头之前后各调一批。
 import type { Binary } from "../omrkit/types";
-import type { Box } from "../staffomr/model";
+import { boxCx, type Box } from "../staffomr/model";
 import type { Rect } from "../omrkit/types";
 import { systemGroups } from "../staffomr/page";
 import { accidentalAlter, isAccidental, type SmuflName } from "../staffomr/glyphs";
@@ -38,7 +38,8 @@ const FLAT_STEM = 1.55;
 export function extendKeyChains(pg: SPage, ctx: Map<Staff, StaffContext>): void {
   for (const c of ctx.values()) {
     if (!c.key.length) continue;
-    const onStaff = (b: Box) => b.top < c.staff.box.bottom && b.bottom > c.staff.box.top;
+    // 弯、斜的谱行按记号所在 x 处的首末线（`Staff.topAt`）
+    const onStaff = (b: Box) => b.top < c.staff.bottomAt(boxCx(b)) && b.bottom > c.staff.topAt(boxCx(b));
     for (;;) {
       const last = c.key[c.key.length - 1];
       const nx = pg.symbols.find((s0) => {
@@ -64,7 +65,8 @@ export function dropHeadsInKey(pg: SPage, ctx: Map<Staff, StaffContext>, settled
   for (const c of ctx.values()) {
     if (!c.clef) continue;
     const clef = c.clef.box;
-    const onStaff = (b: Box) => b.top < c.staff.box.bottom && b.bottom > c.staff.box.top;
+    // 弯、斜的谱行按记号所在 x 处的首末线（`Staff.topAt`）
+    const onStaff = (b: Box) => b.top < c.staff.bottomAt(boxCx(b)) && b.bottom > c.staff.topAt(boxCx(b));
     // `settled`：调号定下来之后再剔一遍，按 `ctx.key` 行首那一串的盒——按竖笔补出的记号不进页面符号表
     //（倚靠主永远膀臂低音谱表四个降号只按块认出两个，第四个 D♭ 的肚子连竖笔收成 D♭3 二分头）
     // 这一串的盒常是从别行照抄来的（`shareKeySignature`），纵向落在别的行上：按出处那行与本行谱左端的差平移回来
@@ -72,7 +74,8 @@ export function dropHeadsInKey(pg: SPage, ctx: Map<Staff, StaffContext>, settled
     const shift = (k: Sym) => {
       if (!settled || onStaff(k.box)) return 0;
       const ky = (k.box.top + k.box.bottom) / 2;
-      const src = [...ctx.values()].find((o) => ky > o.staff.box.top - sp && ky < o.staff.box.bottom + sp);
+      const kx = boxCx(k.box);
+      const src = [...ctx.values()].find((o) => ky > o.staff.topAt(kx) - sp && ky < o.staff.bottomAt(kx) + sp);
       return src ? c.staff.box.left - src.staff.box.left : 0;
     };
     const pool = settled ? headKey(c) : pg.symbols;
@@ -186,7 +189,7 @@ export function pruneMidKeys(pg: SPage, ctx: Map<Staff, StaffContext>, bin: Bina
     const bars = pg.segs.filter((l) => l.isV && l.hasTag("BarLine") && l.bottom > st.box.top && l.top < st.box.bottom).map((l) => l.cx);
     const drop = new Set<Sym>();
     mids.forEach((m, i) => {
-      const ok = bars.some((x) => x < m.x && m.x - x <= sp * 3 && doubleBarRight(bin, st.lineYs, x, sp) !== null);
+      const ok = bars.some((x) => x < m.x && m.x - x <= sp * 3 && doubleBarRight(bin, st.lineYsAt?.(x) ?? st.lineYs, x, sp) !== null);
       if (ok) return;
       const next = mids[i + 1]?.x ?? Infinity;
       for (const k of c.key) if (!head.has(k) && k.box.left >= m.x && k.box.left < next) drop.add(k);
@@ -206,7 +209,7 @@ const MID_KEY_PRECISION = 0.45;
  * 五行一行都没认出，整段升降全错；按竖笔数也只量得出半截）。
  * 转调之后，**下一个系统的行首必然印着新调号**，而行首那几路是认得好的。于是拿它当模板：
  * 双小节线右边一格半以内滑动，与下一系统同种谱号那几行的行首调号逐像素比墨（谱线那几行不算，一像素以内算对上）。
- * 同一系统、同一处至少两行对上同一个读数才收；没对上的行交给 `shareMidKeys` 补。已有行中调号的那处不动。
+ * 同一系统、同一处至少两行对上同一个读数才收；没对上的行交给 `shareMidKeys` 补。已有行中调号而读数与模板不同的，照模板换掉。
  * 一页最后一个系统里的转调没有模板，不管。
  */
 export function findMidKeysByTemplate(pg: SPage, ctx: Map<Staff, StaffContext>, bin: Binary, unit: { space: number; height: number; lineThick?: number }): void {
@@ -214,9 +217,11 @@ export function findMidKeysByTemplate(pg: SPage, ctx: Map<Staff, StaffContext>, 
   const thick = Math.max(1, Math.round(unit.lineThick ?? sp * 0.1));
   const ink = (x: number, y: number) => x >= 0 && y >= 0 && x < bin.w && y < bin.h && bin.data[y * bin.w + x] === 1;
   const near1 = (x: number, y: number) => ink(x, y) || ink(x - 1, y) || ink(x + 1, y) || ink(x, y - 1) || ink(x, y + 1);
-  const onLine = (st: Staff, y: number) => st.lineYs.some((l) => Math.abs(y - l) <= thick);
+  // 线位按 x 取（弯、斜的谱线，`Staff.lineYsAt`）
+  const ysAt = (st: Staff, x: number) => st.lineYsAt?.(x) ?? st.lineYs;
+  const onLine = (st: Staff, y: number, x: number) => ysAt(st, x).some((l) => Math.abs(y - l) <= thick);
   const groups = systemGroups(pg).sort((a, b) => a[0].box.top - b[0].box.top);
-  const found: { c: StaffContext; x: number; fifths: number; syms: Sym[]; gi: number }[] = [];
+  const found: { c: StaffContext; x: number; fifths: number; syms: Sym[]; had: Sym[]; gi: number }[] = [];
   for (const [gi, g] of groups.entries()) {
     const next = groups[gi + 1];
     if (!next) continue;
@@ -232,10 +237,11 @@ export function findMidKeysByTemplate(pg: SPage, ctx: Map<Staff, StaffContext>, 
       for (const x of xs) {
         if (x - prev < sp * 1.5) continue;
         prev = x;
-        const right = doubleBarRight(bin, st.lineYs, x, sp);
+        const right = doubleBarRight(bin, st.lineYsAt?.(x) ?? st.lineYs, x, sp);
         if (right === null) continue;
         prev = right;
-        if (c.key.some((k) => k.box.left > right && k.box.left < right + sp * 3)) continue;
+        // 已认出的行中调号也拿模板再比一遍：簇里漏了一个的（望十架 p6 转两个升号，第二个压着两条粗线、块高出一截字典没认）照模板改
+        const had = c.key.filter((k) => k.box.left > right && k.box.left < right + sp * 3);
         const clefHere = (c.clefs ?? []).filter((q) => q.box.left < right).pop() ?? c.clef;
         let best: { score: number; cand: StaffContext; dx: number; dy: number } | null = null;
         for (const cand of cands) {
@@ -243,18 +249,19 @@ export function findMidKeysByTemplate(pg: SPage, ctx: Map<Staff, StaffContext>, 
           const csp = cand.staff.stepDistance() * 2;
           if (Math.abs(csp - st.stepDistance() * 2) > sp * 0.12) continue;
           const head = headKey(cand);
-          if (keyFifths(head) === fifthsAt(c, right)) continue;
+          if (keyFifths(head) === (had.length ? keyFifths(had) : fifthsAt(c, right))) continue;
           const tx0 = Math.round(Math.min(...head.map((k) => k.box.left)));
           const tx1 = Math.round(Math.max(...head.map((k) => k.box.right)));
-          const ty0 = Math.round(cand.staff.lineYs[0] - sp * 2);
-          const ty1 = Math.round(cand.staff.lineYs[4] + sp * 2);
+          const cys = ysAt(cand.staff, (tx0 + tx1) / 2);
+          const ty0 = Math.round(cys[0] - sp * 2);
+          const ty1 = Math.round(cys[4] + sp * 2);
           const tpl: [number, number][] = [];
-          for (let y = ty0; y <= ty1; y++) if (!onLine(cand.staff, y)) for (let x = tx0; x <= tx1; x++) if (ink(x, y)) tpl.push([x - tx0, y - cand.staff.lineYs[0]]);
+          for (let y = ty0; y <= ty1; y++) if (!onLine(cand.staff, y, (tx0 + tx1) / 2)) for (let x = tx0; x <= tx1; x++) if (ink(x, y)) tpl.push([x - tx0, y - cys[0]]);
           if (tpl.length < sp * 2) continue;
           for (let dx = Math.round(sp * 0.2); dx <= Math.round(sp * 1.5); dx++)
             for (let dy = -Math.round(sp * 0.3); dy <= Math.round(sp * 0.3); dy++) {
               const ox = right + dx;
-              const oy = st.lineYs[0] + dy;
+              const oy = ysAt(st, ox + (tx1 - tx0) / 2)[0] + dy;
               let hit = 0;
               for (const [px, py] of tpl) if (near1(ox + px, Math.round(oy + py))) hit++;
               const recall = hit / tpl.length;
@@ -264,7 +271,7 @@ export function findMidKeysByTemplate(pg: SPage, ctx: Map<Staff, StaffContext>, 
               let tot = 0;
               let back = 0;
               for (let y = Math.round(oy - sp * 2); y <= Math.round(oy + sp * 6); y++) {
-                if (onLine(st, y)) continue;
+                if (onLine(st, y, ox + (tx1 - tx0) / 2)) continue;
                 for (let x = ox; x <= ox + tx1 - tx0; x++) {
                   if (!ink(x, y)) continue;
                   tot++;
@@ -277,24 +284,26 @@ export function findMidKeysByTemplate(pg: SPage, ctx: Map<Staff, StaffContext>, 
               best = { score: recall, cand, dx, dy };
             }
         }
-              if (!best) continue;
+        if (!best) continue;
         const head = headKey(best.cand);
         const tx0 = Math.min(...head.map((k) => k.box.left));
-        const ddy = st.lineYs[0] + best.dy - best.cand.staff.lineYs[0];
+        const tx1 = Math.max(...head.map((k) => k.box.right));
+        const ddy = ysAt(st, right + best.dx + (tx1 - tx0) / 2)[0] + best.dy - ysAt(best.cand.staff, (tx0 + tx1) / 2)[0];
         const syms = head.map((k, i) => {
           const b = k.box;
           const sym = makeSymObj(pg.objs.length + pg.segs.length + 1 + i, { box: { x: Math.round(right + best!.dx + b.left - tx0), y: Math.round(b.top + ddy), w: Math.round(b.right - b.left), h: Math.round(b.bottom - b.top) }, code: k.code }, unit.height).sym;
           sym.addTag("Key");
           return sym;
         });
-        found.push({ c, x: right, fifths: keyFifths(head), syms, gi });
+        found.push({ c, x: right, fifths: keyFifths(head), syms, had, gi });
       }
     }
   }
   for (const f of found) {
     const peers = found.filter((o) => o.gi === f.gi && Math.abs(o.x - f.x) <= sp * MID_KEY_DX && o.fifths === f.fifths);
     if (new Set(peers.map((o) => o.c)).size < 2) continue;
-    f.c.key.push(...f.syms);
+    const drop = new Set(f.had);
+    f.c.key = [...f.c.key.filter((k) => !drop.has(k)), ...f.syms];
     f.c.key.sort((a, b) => a.box.left - b.box.left);
   }
 }
@@ -523,7 +532,7 @@ export function extendKeyByCarry(ctx: Map<Staff, StaffContext>, carry: CarryKey 
     // 调号可能是别的行传过来的（`carrySystemKeys`），墨要到记号自己那一行去看
     const cy = (last.box.top + last.box.bottom) / 2;
     const home = [...ctx.values()].reduce((a, q) => (Math.abs(staffMid(q) - cy) < Math.abs(staffMid(a) - cy) ? q : a), c);
-    if (span < sp * CARRY_PITCH * (carry.n - 0.5) && !inkPastKey(bin, home.staff.lineYs, last.box.right, sp)) continue;
+    if (span < sp * CARRY_PITCH * (carry.n - 0.5) && !inkPastKey(bin, home.staff.lineYsAt?.(last.box.right) ?? home.staff.lineYs, last.box.right, sp)) continue;
     c.key = [...head, ...Array.from({ length: carry.n - head.length }, () => last), ...c.key.filter((k) => !head.includes(k))];
   }
 }
@@ -755,16 +764,18 @@ export function extendKeyByStrokes(pg: SPage, ctx: Map<Staff, StaffContext>, bin
     const cb = c.clef.box;
     const clef = { x: cb.left, y: cb.top, w: cb.right - cb.left, h: cb.bottom - cb.top };
     const bass = c.clef.code === "fClef";
-    let flats = flatsByStrokes(bin, c.staff.lineYs, clef, bass, unit.space, unit.lineThick ?? 0);
+    // 调号区的线位取谱号右边一格处（弯、斜的谱线按 `lineYsAt`）
+    const keyYs = c.staff.lineYsAt?.(clef.x + clef.w + unit.space) ?? c.staff.lineYs;
+    let flats = flatsByStrokes(bin, keyYs, clef, bass, unit.space, unit.lineThick ?? 0);
     // 粗线低分辨率页：高音谱号的行另按探出谱表的竖笔数一遍，取多的（见 `flatsByStairs`）
     if (!bass && isCoarseKey(unit.space, unit.lineThick ?? 0)) {
-      const st = flatsByStairs(bin, c.staff.lineYs, clef, unit.space, unit.lineThick ?? 0);
+      const st = flatsByStairs(bin, keyYs, clef, unit.space, unit.lineThick ?? 0);
       if (st.length > flats.length) flats = st;
     }
     rows.push({
       c,
       flats,
-      sharps: sharpsByStrokesLoose(bin, c.staff.lineYs, clef, bass, unit.space),
+      sharps: sharpsByStrokesLoose(bin, keyYs, clef, bass, unit.space),
     });
   }
   const pick = (of: (r: (typeof rows)[number]) => Rect[]) => {
@@ -823,6 +834,15 @@ export function extendKeyByStrokes(pg: SPage, ctx: Map<Staff, StaffContext>, bin
       count.set(sig, (count.get(sig) ?? 0) + 1);
     }
     if ([...count.values()].some((v) => v >= 2)) for (const c of cs) own.add(c);
+    // 同种记号、个数比 k 少，但按块与竖笔两路数得一样、系统里也没有哪行竖笔数得更多的，同样是这个系统自己的调
+    //（望十架 p1：上一个系统行中转一个降号，下一个系统四行按块、按竖笔都是一个降号，被全页过半的五个降号盖掉）
+    const rs = rows.filter((r) => cs.includes(r.c));
+    const agree = rs.filter((r) => {
+      const h = headOf(r.c);
+      return h.length > 0 && h.length < k && h.every((q) => q.code === code) && strokesOf(r).length === h.length;
+    });
+    const j = agree[0] ? headOf(agree[0].c).length : 0;
+    if (agree.length >= 2 && agree.every((r) => headOf(r.c).length === j) && rs.every((r) => strokesOf(r).length <= j)) for (const c of cs) own.add(c);
   }
   // **按块多认的收回来**：比 k 多的行只是少数（不到三分之一）、而竖笔没有哪一行数过 k——多出来的是调号后面
   // 头一个音的临时记号（三博士歌一个升号，有一行按块读成三个，`shareKeySignature` 见别的行都是它的前缀就全页照它补）

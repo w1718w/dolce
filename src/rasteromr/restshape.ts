@@ -3,7 +3,7 @@ import type { Binary } from "../omrkit/types";
 import type { Rect } from "../omrkit/types";
 import { type SmuflName } from "../staffomr/glyphs";
 import { type LineSeg } from "./prims";
-import { type RasterUnit } from "./staffline";
+import { lineYAt, type LineRef, type RasterUnit } from "./staffline";
 
 /** 开口内腔（`openCavities`）：射线窗外扩多少格、内腔至少多少格²、中心离谱表上下至多几格。 */
 const OPEN_CAVITY_PAD = 0.3;
@@ -13,14 +13,14 @@ const OPEN_CAVITY_AREA = 0.06;
 /** 盒落在某行谱的**行首那一段**里吗（谱号 + 调号的地盘）。见 `bootstrapQuarterRest` 那一段。 */
 export function nearStaffStart(
   box: { x: number; y: number; h: number },
-  groups: { lines: { y: number }[] }[],
+  groups: { lines: LineRef[] }[],
   lefts: number[],
   unit: RasterUnit,
 ): boolean {
   const cy = box.y + box.h / 2;
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
-    if (cy < g.lines[0].y - unit.space || cy > g.lines[4].y + unit.space) continue;
+    if (cy < lineYAt(g.lines[0], box.x) - unit.space || cy > lineYAt(g.lines[4], box.x) + unit.space) continue;
     if (box.x < lefts[i] + unit.space * STAFF_START) return true;
   }
   return false;
@@ -35,6 +35,8 @@ const EIGHTH_REST_H = [1.7, 2.4] as const;
 const EIGHTH_REST_FILL = [0.3, 0.5] as const;
 
 const EIGHTH_REST_SLANT = 0.1;
+/** 斜笔收尾的小钩：盒最下这么多（占高）的行，跨度放到这么多格（见 `isEighthRest`）。 */
+const EIGHTH_REST_FOOT = [0.35, 0.9] as const;
 
 /**
  * **八分休止按形状认**：顶上三成有一个够宽的球，下半截每行只有一笔细墨，而且这一笔
@@ -66,7 +68,16 @@ export function symbolInk(nl: Binary, bin: Binary, box: Rect, reach: number): nu
   return n;
 }
 
-export function isEighthRest(bin: Binary, b: Rect, area: number, unit: RasterUnit, minH: number = EIGHTH_REST_H[0], minFill: number = EIGHTH_REST_FILL[0]): boolean {
+export function isEighthRest(
+  bin: Binary,
+  b: Rect,
+  area: number,
+  unit: RasterUnit,
+  minH: number = EIGHTH_REST_H[0],
+  minFill: number = EIGHTH_REST_FILL[0],
+  /** 斜笔收尾带钩的备选判据（见下）：只给整块认的那一路（`stages/heads.ts`），回填、拼块那几路的块本就是拼出来的，开了会多收谱号碎块 */
+  hook = false,
+): boolean {
   const sp = unit.space;
   const w = b.w / sp;
   const h = b.h / sp;
@@ -88,14 +99,52 @@ export function isEighthRest(bin: Binary, b: Rect, area: number, unit: RasterUni
   if (!topRows.length || Math.max(...topRows.map((r) => r.ink)) < sp * 0.55) return false;
   const low = rows.filter((r) => r.y >= b.y + b.h * 0.55);
   if (low.length < b.h * 0.3) return false;
+  /** 那几行中心的斜率（最小二乘，x 对 y）：往下每行左移一成以上像素。实测斜笔 −0.2，符干 0 上下 */
+  const slanted = (rs: typeof rows) => {
+    const my = rs.reduce((a, r) => a + r.y, 0) / rs.length;
+    const mx = rs.reduce((a, r) => a + (r.x0 + r.x1) / 2, 0) / rs.length;
+    let sxy = 0, syy = 0;
+    for (const r of rs) { sxy += (r.y - my) * ((r.x0 + r.x1) / 2 - mx); syy += (r.y - my) ** 2; }
+    return syy > 0 && sxy / syy <= -EIGHTH_REST_SLANT;
+  };
   // 按**跨度**量，不按墨量：符干旁蹭着一截圆滑线的，墨不多、跨度宽（齐来称颂的 G3 −1.3）
-  if (low.some((r) => r.x1 - r.x0 + 1 > sp * 0.4)) return false;
-  // 下半截那一笔中心的斜率（最小二乘，x 对 y）：往下每行左移一成以上像素。实测斜笔 −0.2，符干 0 上下
-  const my = low.reduce((a, r) => a + r.y, 0) / low.length;
-  const mx = low.reduce((a, r) => a + (r.x0 + r.x1) / 2, 0) / low.length;
-  let sxy = 0, syy = 0;
-  for (const r of low) { sxy += (r.y - my) * ((r.x0 + r.x1) / 2 - mx); syy += (r.y - my) ** 2; }
-  return syy > 0 && sxy / syy <= -EIGHTH_REST_SLANT;
+  if (!low.some((r) => r.x1 - r.x0 + 1 > sp * 0.4)) return slanted(low);
+  if (!hook) return false;
+  // 手写的斜笔收尾带个小钩、坐在谱线上（是爱 p5 m67 低音谱表上方，钩宽 0.45 格，压线那一行连着线沿 0.85 格）：
+  // 最下 `EIGHTH_REST_FOOT[0]` 那几行跨度放到 `EIGHTH_REST_FOOT[1]` 格（盒本身不过 `EIGHTH_REST_W` 上限，挡得住一格多宽的符头），
+  // 斜率只用脚以上的细笔，要够 0.2 个盒高
+  // 宽度只量斜笔那一条：逐行取与上一行笔画最近的那段连续墨，旁边分开的噪点不算（是爱 p4 m57 斜笔左边几粒扫描噪点）。
+  // 旁边另有一道逐行连着的笔、连了三成行以上的，是字不是休止（赞美三一真神 P2 m9 歌词里两道平行竖笔的字）
+  const runsAt = (y: number) => {
+    const out: [number, number][] = [];
+    for (let x = b.x; x < b.x + b.w; x++) {
+      if (!bin.data[y * bin.w + x]) continue;
+      if (out.length && x === out[out.length - 1][1] + 1) out[out.length - 1][1] = x;
+      else out.push([x, x]);
+    }
+    return out;
+  };
+  const traced: typeof rows = [];
+  let prev = Infinity, twin = 0, chain = 0;
+  let others: [number, number][] = [];
+  for (const r of rows.filter((q) => q.y >= b.y + b.h * 0.4)) {
+    const rs = runsAt(r.y);
+    if (!rs.length) continue;
+    const pick = prev === Infinity ? rs[rs.length - 1] : rs.reduce((p, q) => (Math.abs((q[0] + q[1]) / 2 - prev) < Math.abs((p[0] + p[1]) / 2 - prev) ? q : p));
+    prev = (pick[0] + pick[1]) / 2;
+    const rest = rs.filter((q) => q !== pick);
+    chain = rest.some((q) => others.some((o) => q[0] <= o[1] && o[0] <= q[1])) ? chain + 1 : rest.length ? 1 : 0;
+    twin = Math.max(twin, chain);
+    others = rest;
+    traced.push({ y: r.y, x0: pick[0], x1: pick[1], ink: pick[1] - pick[0] + 1 });
+  }
+  if (twin > traced.length * 0.3) return false;
+  const footY = b.y + b.h * (1 - EIGHTH_REST_FOOT[0]);
+  if (traced.some((r) => r.y >= b.y + b.h * 0.55 && r.x1 - r.x0 + 1 > sp * (r.y >= footY ? EIGHTH_REST_FOOT[1] : 0.4))) return false;
+  const thin = traced.filter((r) => r.y < footY);
+  if (thin.length < b.h * 0.2 || thin.some((r) => r.x1 - r.x0 + 1 > sp * 0.4)) return false;
+  // 斜笔下半截也得是斜的：印刷歌词里的字（望十架「光」「千」「子」）上头一笔斜撇、下头一根直竖，整体斜率也过得去
+  return slanted(thin) && slanted(thin.slice(Math.floor(thin.length / 2)));
 }
 
 /** 从块里的墨出发，在去线图上 8 连通回填整个连通域；出了窗口（左右各 1 格、上 0.5 格、下 2.6 格）就不算。 */
@@ -189,7 +238,7 @@ export function crossRuns(bin: Binary, x0: number, x1: number, y0: number, y1: n
  * 不只左右两半并成的块，整块的也按这套判（附点全音符叠头、「阿们」叠头，内腔被谱线切碎、模板配不上）。
  * 我灵镇静 m8 的 A4/F4、m25 的 A3/F3：内腔是两道竖缝（宽高比 0.5），内腔那一路与模板都认不出。
  */
-export function wholesByShape(bin: Binary, nl: Binary, box0: Rect, unit: RasterUnit, grid: (y: number) => number | null, stems: LineSeg[] = []): Rect[] {
+export function wholesByShape(bin: Binary, nl: Binary, box0: Rect, unit: RasterUnit, grid: (y: number, x?: number) => number | null, stems: LineSeg[] = []): Rect[] {
   const sp = unit.space;
   // **盒收到头上**：加线比头宽，块里带着整条加线时盒宽出一截（以马内利来临歌 m24 加一线上的 C4，43 像素的盒里头只有 30）。
   // 墨横满盒宽九成的行是线，不算；按其余行的墨定左右边
@@ -314,7 +363,7 @@ export function wholesByShape(bin: Binary, nl: Binary, box0: Rect, unit: RasterU
   if (!byRot && !thin && (lr < WHOLE_LR || ud < WHOLE_UD || side < WHOLE_SIDE || mid > side * WHOLE_MID)) return [];
   const out: Rect[] = [];
   for (let k = 0; k < n; k++) {
-    const cy = grid(box.y + (k + 0.5) * hh);
+    const cy = grid(box.y + (k + 0.5) * hh, box.x + box.w / 2);
     if (cy === null) return [];
     out.push({ x: box.x, y: Math.round(cy - hh / 2), w: box.w, h: Math.round(hh) });
   }
@@ -583,7 +632,8 @@ export function flatAccidentalBox(bin: Binary, b: Rect, unit: RasterUnit): Rect 
       seen.add(i);
       const x = i % bin.w, y = (i - x) / bin.w;
       x0 = Math.min(x0, x), x1 = Math.max(x1, x), y0 = Math.min(y0, y), y1 = Math.max(y1, y);
-      for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) if (ink(nx, ny) && !seen.has(ny * bin.w + nx)) stack.push(ny * bin.w + nx);
+      // 只灌到竖笔右边一个降号宽：肚子贴着右边的头时，头圈的残墨灌进来就宽出 `FLAT_W`（爱是从神而来 p5 m60 右手 ♭）
+      for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) if (nx <= st.x + sp * FLAT_W[1] - 2 && ink(nx, ny) && !seen.has(ny * bin.w + nx)) stack.push(ny * bin.w + nx);
     }
     const box = { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
     if (x0 < st.x - 1 || box.w < sp * FLAT_W[0] || box.w > sp * FLAT_W[1] || x1 - st.xr < sp * FLAT_BELLY) continue;
@@ -605,9 +655,14 @@ export function flatAccidentalBox(bin: Binary, b: Rect, unit: RasterUnit): Rect 
   return null;
 }
 
-export function offStaffRest(box: { y: number; h: number }, lines: { y: number }[], unit: RasterUnit): boolean {
+/** 各线在 x 处的 y（弯、斜的谱线按曲线取），按名义线位排、五条一组。 */
+function linesAt(lines: LineRef[], x: number): number[] {
+  return [...lines].sort((a, b) => a.y - b.y).map((l) => lineYAt(l, x));
+}
+
+export function offStaffRest(box: Rect, lines: LineRef[], unit: RasterUnit): boolean {
   const cy = box.y + box.h / 2;
-  const ys = [...lines].map((l) => l.y).sort((a, b) => a - b);
+  const ys = linesAt(lines, box.x + box.w / 2);
   for (let i = 0; i + 4 < ys.length; i += 5) {
     if (cy < ys[i] && ys[i] - cy <= unit.space * QREST_OFF) return true;
     if (cy > ys[i + 4] && cy - ys[i + 4] <= unit.space * QREST_OFF) return true;
@@ -615,9 +670,9 @@ export function offStaffRest(box: { y: number; h: number }, lines: { y: number }
   return false;
 }
 
-export function midOfStaff(box: { y: number; h: number }, lines: { y: number }[], unit: RasterUnit): boolean {
+export function midOfStaff(box: Rect, lines: LineRef[], unit: RasterUnit): boolean {
   const cy = box.y + box.h / 2;
-  const ys = [...lines].map((l) => l.y).sort((a, b) => a - b);
+  const ys = linesAt(lines, box.x + box.w / 2);
   for (let i = 0; i + 4 < ys.length; i += 5) if (Math.abs(cy - ys[i + 2]) <= unit.space * 0.9) return true;
   return false;
 }
@@ -626,24 +681,29 @@ export function midOfStaff(box: { y: number; h: number }, lines: { y: number }[]
 export const isBarRest = (code: string) => code === "restHalf" || code === "restWhole" || code === "restHBar";
 
 /**
- * 扁矩形休止分全、半：**全休止吊在第二线下，二分休止坐在中线上**。
- * 两者形状一样，只差位置（中心差半格），按中心在第二线与中线的哪一半判。
+ * 扁矩形休止分全、半：**全休止吊在线下，二分休止坐在线上**（标准位置是吊在第二线下、坐在中线上）。
+ * 两者形状一样，只差贴着哪条线，按中心落在上方那条线与下方那条线之间的哪一半判（谱表外照线距往外推）。
+ * 只认标准位置不够：两声部时上声部的休止抬高一两格（生之颂钢琴 m13 左手二分休止坐在第二线上，中心比中线高一格，读成整小节休止）。
  * 全休止仍记 `restHBar`（整小节休止，时值随拍号），二分休止记 `restHalf`
  * ——原先一律记成整小节休止，《是谁》首小节「二分休止 + 四分休止 + 两个八分」因此多出三拍。
  */
-export function restKind(box: { y: number; h: number }, lines: { y: number }[], unit: RasterUnit): SmuflName {
+export function restKind(box: Rect, lines: LineRef[], unit: RasterUnit): SmuflName {
   const cy = box.y + box.h / 2;
-  const ys = [...lines].map((l) => l.y).sort((a, b) => a - b);
+  const ys = linesAt(lines, box.x + box.w / 2);
   for (let i = 0; i + 4 < ys.length; i += 5) {
     if (cy < ys[i] - unit.space || cy > ys[i + 4] + unit.space) continue;
-    return cy > (ys[i + 1] + ys[i + 2]) / 2 ? "restHalf" : "restHBar";
+    const five = ys.slice(i, i + 5);
+    const k = five.filter((y) => y <= cy).length - 1;
+    const above = k >= 0 ? five[k] : five[0] - unit.space;
+    const below = k < 0 ? five[0] : k < 4 ? five[k + 1] : five[4] + unit.space;
+    return (cy - above) / (below - above) >= 0.5 ? "restHalf" : "restHBar";
   }
   return "restHBar";
 }
 
-export function nearRestLine(box: { y: number; h: number }, lines: { y: number }[], unit: RasterUnit): boolean {
+export function nearRestLine(box: Rect, lines: LineRef[], unit: RasterUnit): boolean {
   const cy = box.y + box.h / 2;
-  const ys = [...lines].map((l) => l.y).sort((a, b) => a - b);
+  const ys = linesAt(lines, box.x + box.w / 2);
   for (let i = 0; i + 4 < ys.length; i += 5) {
     for (const k of [1, 2]) if (Math.abs(cy - ys[i + k]) <= unit.space * 0.6) return true;
   }

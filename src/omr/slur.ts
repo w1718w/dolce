@@ -33,6 +33,14 @@ function flatTop(bin: Binary, b: Rect, numH: number): boolean {
   return topAt(b.x + dx) - b.y <= numH * 0.15 && topAt(b.x + b.w - 1 - dx) - b.y <= numH * 0.15;
 }
 
+/** 括线端头的竖钩：左右各 4% 宽以内有一列墨段过框高一半。 */
+function hookedEnd(bin: Binary, b: Rect): boolean {
+  const run = (x: number) => { let n = 0; for (let y = b.y; y < b.y + b.h; y++) if (bin.data[y * bin.w + x]) n++; return n; };
+  const span = Math.max(1, Math.round(b.w * 0.04));
+  for (let i = 0; i < span; i++) if (run(b.x + i) >= b.h * 0.5 || run(b.x + b.w - 1 - i) >= b.h * 0.5) return true;
+  return false;
+}
+
 /**
  * 一个弧连通块里**套着的内弧**：两条弧共用一个端点（外弧罩三音、内弧只罩后两音）时，
  * 内弧的收尾一段与外弧交叠、被 4-连通粘成同一个块，包围盒只剩外弧那一条。
@@ -185,6 +193,19 @@ export function tupletCandidates(bin: Binary, comps: Component[], rows: StaffRow
       for (let x = b.x; x < rright(b); x++) if (bin.data[y * bin.w + x]) ink++;
     return ink / Math.max(1, b.w * b.h);
   };
+  // 底下四分之一那几行有几段墨（几只脚）：半截括线只有外端那一只脚落下来，里端翘向数字；和弦字母「m」三只脚站在基线上
+  //（青年诗歌 22《将一生奉献》末行和弦「F#m Bm」：「B」当了数字、两个「m」当了两半括线，墨占比都正好 0.5，读成三连音）
+  const legs = (b: Rect): number => {
+    const y0 = rbottom(b) - Math.max(1, Math.round(b.h * 0.25));
+    let n = 0, on = false;
+    for (let x = b.x; x < rright(b); x++) {
+      let ink = false;
+      for (let y = y0; y < rbottom(b) && !ink; y++) ink = bin.data[y * bin.w + x] === 1;
+      if (ink && !on) n++;
+      on = ink;
+    }
+    return n;
+  };
   for (const row of rows) {
     if (row.nums.length < 2) continue;
     const rowTop = median(row.nums.map((n) => n.bbox.y));
@@ -248,10 +269,29 @@ export function tupletCandidates(bin: Binary, comps: Component[], rows: StaffRow
         if (rbottom(b) < nb.y || b.y > rbottom(nb)) return false;   // 纵向不重叠
         // 方括号式「┌3┐」（1218 746）的钩比细弧墨多：实测 0.39、0.42，宽 0.6 字号上下。
         // 平顶括线拆剩的一截直线（青年诗歌 5 前奏第二组：弧尾连着点被 splitArcTail 切走，剩 37×5 的实心横段）够扁也算
-        return inkFill(b) <= 0.5 || b.h <= numH * 0.2;
+        return (inkFill(b) <= 0.5 || b.h <= numH * 0.2) && legs(b) < 3;
       });
       const left = arcAt(-1), right = arcAt(1);
-      if (!left || !right) continue;
+      if (!left || !right) {
+        // 另一种印法：括线是**一整条弧**、小号数字居中悬在弧顶上方（青年诗歌 60《经历基督作牧人》`1̇1̇1̇` 上 183×35 的弧，
+        // 「3」11×20、底离弧顶 9px，字号 49）。罩几个音由调用方拿 OCR 读出的数去对
+        if (num.fusedArc) continue;
+        // 数字得单独印着：和弦「G7」的 7 也悬在弧上，读数还恰好等于弧下的音数（爱是不保留二房 `G7` 罩着七个音）
+        if (above.some((c) => c.bbox !== nb && c.bbox.h >= nb.h * 0.5 && c.bbox.y < rbottom(nb) && rbottom(c.bbox) > nb.y &&
+          c.bbox.x < rright(nb) + numH * 0.5 && rright(c.bbox) > nb.x - numH * 0.5)) continue;
+        const arc = above.find((c) => {
+          const b = c.bbox;
+          return b !== nb && b.w >= numH * 1.2 && b.h <= numH * 0.9 && b.y >= rbottom(nb) - numH * 0.1 &&
+            b.y <= rbottom(nb) + numH * 0.5 && Math.abs(rcx(b) - rcx(nb)) <= b.w * 0.2 && inkFill(b) <= 0.5;
+        });
+        if (!arc) continue;
+        const notes = row.nums.filter((n) => between(rcx(n.bbox), arc.bbox.x - numH * 0.3, rright(arc.bbox) + numH * 0.3) &&
+          rcy(n.bbox) > rbottom(arc.bbox));
+        if (notes.length < 2) continue;
+        probe("tuplet.overArc");
+        out.push({ numeral: nb, arcs: [arc], notes });
+        continue;
+      }
       const x0 = Math.min(left.bbox.x, nb.x), x1 = Math.max(rright(right.bbox), rright(nb));
       // 括线罩着的音在数字以下：括线自己被收成了「音」的（半截括线连着端点的高音点，读成 7）不算
       const notes = row.nums.filter((n) => between(rcx(n.bbox), x0 - numH * 0.5, x1 + numH * 0.5) && rcy(n.bbox) > rbottom(nb));
@@ -350,7 +390,7 @@ function joinBrokenArcs(bin: Binary, comps: Component[], numH: number): Componen
   return joined.length ? [...comps.filter((c) => !used.has(c)), ...joined] : comps;
 }
 
-export function detectSlurs(bin: Binary, comps0: Component[], rows: StaffRow[], numH: number): SlurRefit[] {
+export function detectSlurs(bin: Binary, comps0: Component[], rows: StaffRow[], numH: number, arcsOut?: Component[]): SlurRefit[] {
   const refits: SlurRefit[] = [];
   const comps = joinBrokenArcs(bin, comps0, numH);
   const arcsOf = (row: StaffRow): Component[] => {
@@ -368,7 +408,9 @@ export function detectSlurs(bin: Binary, comps0: Component[], rows: StaffRow[], 
       // 但只凭宽高比会误伤恰好扁到 12 的长弧（2038《谁一直在街上呼喊》末两条 312×26、313×26 正好 12，
       // 行末 `1̇ 7 6` 的嵌套弧和拖向下一行的 tie 一起丢了）——再看上缘：括线顶是一条平线，离两端 8% 处
       // 仍在最高处；弧在那里已经往下掉了大半个拱高。
-      if (b.w >= numH * 6 && b.w / b.h >= 12 && flatTop(bin, b, numH)) { probe("arc.endingBracketReject"); return false; }
+      // 平顶之外还要有**竖钩**（或干脆是条直线）：两端掉得快的长弧（青年诗歌 60《经历基督作牧人》跨 `3·♯2 3 2 | 1` 那条 608×25，
+      // 两端 6% 以内就掉到底，8% 处只低 2px）也过得了 flatTop；括线的端头是竖笔，某列墨段近整框高，弧的端头只是细斜笔
+      if (b.w >= numH * 6 && b.w / b.h >= 12 && flatTop(bin, b, numH) && (b.h <= numH * 0.2 || hookedEnd(bin, b))) { probe("arc.endingBracketReject"); return false; }
       // 弧高上限放到 ~1 字号：跨相邻两音的弧其拱高可达一个字号（实测耶稣普治 w130 h32、numH39，
       // 卡在旧的 0.8 字号=31 上被整条漏掉）；仍 < 数字块高(≥0.55~2 字号且 w/h<2)，靠 w/h≥2 兜住不误纳数字。
       // 跨多音的**长弧**拱得更高（实测「主祢真伟大」跨 `5__|5---|5` 的 tie：w205 h28、numH22，
@@ -418,6 +460,7 @@ export function detectSlurs(bin: Binary, comps0: Component[], rows: StaffRow[], 
     return arcs;
   };
   const perRow = rows.map((row) => (row.nums.length ? arcsOf(row) : []));
+  arcsOut?.push(...perRow.flat());
 
   // **跨行圆滑线**：一条弧跨过换行时，谱面上画成两半——上一行行末一段拖到右界，下一行行首一段
   // 从左界起笔。两半各自都罩得住音符，照行内判据会变成两条闭合的弧，跨行那条就丢了

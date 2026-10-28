@@ -1,4 +1,4 @@
-// 歌词对位格的判据——**读写两端共用这一份**（`j123/parse.ts::attachLyrics` 与 `abcfamily/emit.ts::lyricLines`）。
+// 歌词对位格的判据——**读写两端共用这一份**（`abcfamily/parse.ts::attachLyrics` 与 `abcfamily/emit.ts::lyricLines`）。
 // 两边口径一旦不一，交错写法下每行起点就差一格，后面整行错位。
 
 import type { Element, Part } from "../model/doc";
@@ -14,7 +14,7 @@ export type LyricSlotRule = "123" | "abc";
  *  ABC `&` 的临时声部（`voice > 1`，§7.4）不占：`w:` 按声部对位，词只跟主分支走，
  *  否则一小节里两条并行旋律会把词挤成两份、后面整行错位。
  *  `mainVoice`：本声部的主分支号。文本谱读进来的多声部，第 n 声部的元素 `voice` 就是 n
- *  （`model/frompu.ts`），`Q2` 下的 `C1:` 挂在 voice 2 上——按「>1」判会把整声部的词全丢掉。 */
+ *  （`fanqie/fromfanqie.ts`），`Q2` 下的 `C1:` 挂在 voice 2 上——按「>1」判会把整声部的词全丢掉。 */
 export function isLyricSlot(el: Element, rule: LyricSlotRule = "123", mainVoice = 1): boolean {
   if (el.voice > mainVoice) return false;
   if (el.kind !== "chord") return false;

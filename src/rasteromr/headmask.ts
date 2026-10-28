@@ -16,7 +16,7 @@
 // 而且**分「骑线 / 在间」两类**，骑线那一类的模板里自然带着谱线，
 // 粘连于是不算「差异」。
 import type { Binary, Rect } from "../omrkit/types";
-import type { RasterUnit } from "./staffline";
+import { lineYAt, type LineRef, type RasterUnit } from "./staffline";
 import type { SmuflName } from "../staffomr/glyphs";
 import type { LineSeg } from "./prims";
 
@@ -40,11 +40,10 @@ const ON_LINE = 0.25;
 const MIN_SAMPLES = 20;
 
 /** 从已经认出来的**实心**符头平均出模板。在**去谱线之前**的图上取——模板要带着谱线。 */
-export function buildHeadMasks(bin: Binary, heads: { box: Rect; code: SmuflName }[], unit: RasterUnit, lineYs: number[]): HeadMask[] {
+export function buildHeadMasks(bin: Binary, heads: { box: Rect; code: SmuflName }[], unit: RasterUnit, lines: LineRef[]): HeadMask[] {
   const sp = unit.space;
   const w = Math.max(3, Math.round(sp * WIN_W));
   const h = Math.max(3, Math.round(sp * WIN_H));
-  const ys = [...lineYs].sort((a, b) => a - b);
   const buckets = [
     { sum: new Float32Array(w * h), n: 0, onLine: true },
     { sum: new Float32Array(w * h), n: 0, onLine: false },
@@ -53,7 +52,8 @@ export function buildHeadMasks(bin: Binary, heads: { box: Rect; code: SmuflName 
     if (hd.code !== "noteheadBlack") continue;
     const cx = hd.box.x + hd.box.w / 2;
     const cy = hd.box.y + hd.box.h / 2;
-    const b = buckets[ys.some((y) => Math.abs(y - cy) <= sp * ON_LINE) ? 0 : 1];
+    // 骑不骑线按头所在 x 处的线位（弯、斜的谱线按曲线取）
+    const b = buckets[lines.some((l) => Math.abs(lineYAt(l, cx) - cy) <= sp * ON_LINE) ? 0 : 1];
     const x0 = Math.round(cx - w / 2);
     const y0 = Math.round(cy - h / 2);
     for (let y = 0; y < h; y++) {
@@ -106,7 +106,7 @@ const MIN_POOLED = 12;
  * 左右常偏几像素，直接平均出来内腔不白、圈不实（一片 0.3~0.6 的灰），沿干找叠头时真头只打 0.2 上下；
  * 对齐三轮后 001 m12 的 B♭4 0.19 → 0.31、126 m1 的 E♭4 0.48 → 0.57（`recognize.ts` 沿干找头那一处用）。
  */
-export function buildHollowMasks(bin: Binary, heads: { box: Rect; code: SmuflName }[], unit: RasterUnit, lineYs: number[], minSamples = 3, align = 0): HeadMask[] {
+export function buildHollowMasks(bin: Binary, heads: { box: Rect; code: SmuflName }[], unit: RasterUnit, lines: LineRef[], minSamples = 3, align = 0): HeadMask[] {
   const hollow = heads.filter((h) => h.code === "noteheadHalf" || h.code === "noteheadWhole");
   if (hollow.length < minSamples) return [];
   const sp = unit.space;
@@ -142,8 +142,8 @@ export function buildHollowMasks(bin: Binary, heads: { box: Rect; code: SmuflNam
     }
     return { w, h, p, n: list.length, onLine };
   };
-  if (!lineYs.length) return [avg(hollow, false)];
-  const on = hollow.filter((hd) => lineYs.some((y) => Math.abs(y - (hd.box.y + hd.box.h / 2)) <= sp * ON_LINE));
+  if (!lines.length) return [avg(hollow, false)];
+  const on = hollow.filter((hd) => lines.some((l) => Math.abs(lineYAt(l, hd.box.x + hd.box.w / 2) - (hd.box.y + hd.box.h / 2)) <= sp * ON_LINE));
   const off = hollow.filter((hd) => !on.includes(hd));
   const all = avg(hollow, false);
   return [
@@ -289,8 +289,8 @@ export function splitHeadCluster(
   area: number,
   masks: HeadMask[],
   unit: RasterUnit,
-  grid: (y: number) => number | null,
-  onLine: (y: number) => boolean,
+  grid: (y: number, x?: number) => number | null,
+  onLine: (y: number, x?: number) => boolean,
   /** 跳过尺寸闸（调用方自己把关，见 `recognize.ts` 里判别器那一遍）。 */
   anySize = false,
   /**
@@ -337,11 +337,20 @@ export function splitHeadCluster(
       if (sx >= 0 && sx < bin.w) work.data[y * wx + x] = bin.data[sy * bin.w + sx];
     }
   }
-  const ys = new Set<number>();
-  for (let y = box.y - sp * 0.3; y <= box.y + box.h + sp * 0.3; y += sp * 0.25) {
-    const g = grid(y);
-    if (g !== null) ys.add(g);
-  }
+  // 音高格按每个候选的 x 各取一组：斜、弯的谱线上块一宽，在块中心取的线位到块两端就差出一两个像素，
+  // 头心吸到错的一级（信心使我得胜 m15 低音 B♭2 八分，粘着符尾那一块的中心偏右，读成 C3）
+  const ysMemo = new Map<number, number[]>();
+  const ysAt = (x: number): number[] => {
+    let ys = ysMemo.get(x);
+    if (ys) return ys;
+    const set = new Set<number>();
+    for (let y = box.y - sp * 0.3; y <= box.y + box.h + sp * 0.3; y += sp * 0.25) {
+      const g = grid(y, x);
+      if (g !== null) set.add(g);
+    }
+    ysMemo.set(x, (ys = [...set]));
+    return ys;
+  };
   const step = Math.max(1, Math.round(sp * 0.15));
   const picked: { x: number; y: number }[] = [];
   const hw0 = sp * 1.25;
@@ -350,9 +359,9 @@ export function splitHeadCluster(
     let best: { x: number; y: number; s: number } | null = null;
     for (let x = box.x; x <= box.x + box.w; x += step) {
       if (picked.some((p) => Math.abs(p.x - x) < sp * SEP_X_MIN)) continue;
-      for (const y of ys) {
+      for (const y of ysAt(x)) {
         if (picked.some((p) => Math.abs(p.x - x) < sp * SEP_X && Math.abs(p.y - y) < sp * SEP_Y)) continue;
-        const m = masks.find((k) => k.onLine === onLine(y)) ?? masks[0];
+        const m = masks.find((k) => k.onLine === onLine(y, x)) ?? masks[0];
         const sc = scoreAt(work, m, x - ox, y - oy);
         if (sc < (verify ? VERIFY_SCORE_MIN : minScore)) continue;
         if (!best || sc > best.s) best = { x, y, s: sc };
@@ -430,6 +439,8 @@ const CHORD_SCORE_STACKED = 0.35;
 const CHORD_SCORE_LEDGER = 0.38;
 /** 端上贴串那一档放宽时，头心要实（空心叠头被收成一个实心头：父恩广大 E3/C3 二分、善牧的全音符）。 */
 const STACKED_CORE = 0.9;
+/** 贴串那一档的邻头，头心上下 0.25 格两行的连续墨下限（头宽的倍数，见 `stackedAt`）。 */
+const STACKED_BODY = 0.7;
 /** 贴串放宽只给够高的块（两个头加一截干）：扫描件上 1.3~2 格的小块也凑得出「两行满头宽」（望十架多收假头）。 */
 const STACKED_H = 3;
 /** 头正长在块端（`edgeAt`）那一档：模板分门槛、头心离「块边往里半个头高」的容差（格）、另一端干尖的行宽上限（头宽的倍数）。
@@ -465,8 +476,8 @@ export function headFromStemBlock(
   area: number,
   masks: HeadMask[],
   unit: RasterUnit,
-  grid: (y: number) => number | null,
-  onLine: (y: number) => boolean,
+  grid: (y: number, x?: number) => number | null,
+  onLine: (y: number, x?: number) => boolean,
   nl?: Binary,
 ): { head: Rect; extra: Rect[]; stemX: number; stemY0: number; stemY1: number } | null {
   const sp = unit.space;
@@ -503,9 +514,13 @@ export function headFromStemBlock(
   };
   const stackedAt = (x: number, y: number): boolean => {
     if (coreInk(x, y) < STACKED_CORE || rowSpan(bin, box, y) < hwFull) return false;
+    // 邻位要真是个头：除了那一行，上下各 0.25 格两行在去线图上也要有大半个头宽的连续墨。只看那一行时，
+    // 邻位落在谱线上、正贴着一个头的顶（底）边，那一行被谱线撑满（去线图上头盒里那段线也留着），
+    // 线位上夹在两个贴着的头中间的假位置（所信有根基 m18 F4/D4 之间的 E4，上邻 G4 正是谱线）就凑成了「贴着一个三度的头」
+    const body = (g: number) => !nl || [-1, 1].every((d) => rowRun(nl, box, g + d * sp * 0.25) >= hwFull * STACKED_BODY);
     for (const dy of [-1, 1]) {
-      const g = grid(y + dy * sp);
-      if (g !== null && Math.abs(g - y) >= sp * 0.8 && Math.abs(g - y) <= sp * 1.2 && rowSpan(bin, box, g) >= hwFull) return true;
+      const g = grid(y + dy * sp, x);
+      if (g !== null && Math.abs(g - y) >= sp * 0.8 && Math.abs(g - y) <= sp * 1.2 && rowSpan(bin, box, g) >= hwFull && body(g)) return true;
     }
     return false;
   };
@@ -524,11 +539,11 @@ export function headFromStemBlock(
     for (let x = box.x; x <= box.x + box.w; x += step) {
       const ys = new Set<number>();
       for (let y = ya; y <= yb; y += sp * 0.25) {
-        const g = grid(y);
+        const g = grid(y, x);
         if (g !== null && g >= ya - sp * 0.3 && g <= yb + sp * 0.3) ys.add(g);
       }
       for (const y of ys) {
-        const m = masks.find((k) => k.onLine === onLine(y)) ?? masks[0];
+        const m = masks.find((k) => k.onLine === onLine(y, x)) ?? masks[0];
         const s = scoreAt(bin, m, x, y);
         if (s >= (m.pooled ? STEM_SCORE_MIN_POOLED : STEM_SCORE_MIN) && (!best || s > best.s)) best = { x, y, s };
         else if (s >= CHORD_SCORE_STACKED && (!bestStacked || s > bestStacked.s) && stackedAt(x, y)) bestStacked = { x, y, s };
@@ -605,9 +620,9 @@ export function headFromStemBlock(
     const yb = atTop ? best.y + sp * CHORD_REACH : Math.max(best.y, box.y + box.h - hh / 2);
     for (let x = Math.round(best.x - sp * 0.4); x <= best.x + sp * 0.4; x += step)
       for (let y = ya; y <= yb; y += sp * 0.25) {
-        const g = grid(y);
+        const g = grid(y, x);
         if (g === null || g < ya || g > yb || taken.some((t) => Math.abs(t - g) < sp * 0.8)) continue;
-        const m = masks.find((q) => q.onLine === onLine(g)) ?? masks[0];
+        const m = masks.find((q) => q.onLine === onLine(g, x)) ?? masks[0];
         const sc = scoreAt(bin, m, x, g);
         // 那一行的墨要有一个头宽：光有符干的地方（线宽那么窄）不收
         // 紧挨着已收的头一个三度、那一行墨满一个头宽的：三个头上下贴成一串，模板要头的上下是白的，
@@ -650,8 +665,8 @@ function twoStemHead(
   masks: HeadMask[],
   sp: number,
   step: number,
-  grid: (y: number) => number | null,
-  onLine: (y: number) => boolean,
+  grid: (y: number, x?: number) => number | null,
+  onLine: (y: number, x?: number) => boolean,
 ): { head: Rect; extra: Rect[]; stemX: number; stemY0: number; stemY1: number } | null {
   const hw = Math.round(sp * 1.25);
   const hh = Math.round(sp * 0.95);
@@ -705,8 +720,8 @@ function displacedSecond(
   masks: HeadMask[],
   sp: number,
   step: number,
-  grid: (y: number) => number | null,
-  onLine: (y: number) => boolean,
+  grid: (y: number, x?: number) => number | null,
+  onLine: (y: number, x?: number) => boolean,
   best: { x: number; y: number; s: number },
   hw: number,
 ): { x: number; y: number; s: number } | null {
@@ -716,9 +731,9 @@ function displacedSecond(
   const mx = 2 * stemX - best.x;
   let got: { x: number; y: number; s: number } | null = null;
   for (const dy of [-0.5, 0.5]) {
-    const g = grid(best.y + dy * sp);
+    const g = grid(best.y + dy * sp, mx);
     if (g === null || Math.abs(Math.abs(g - best.y) - sp * 0.5) > sp * 0.2) continue;
-    const m = masks.find((q) => q.onLine === onLine(g)) ?? masks[0];
+    const m = masks.find((q) => q.onLine === onLine(g, mx)) ?? masks[0];
     for (let x = Math.round(mx - sp * 0.3); x <= mx + sp * 0.3; x += step) {
       if (x - hw * 0.4 < box.x || x + hw * 0.4 > box.x + box.w) continue;
       const s = scoreAt(bin, m, x, g);
@@ -730,7 +745,7 @@ function displacedSecond(
 
 /** 块里第 `y` 行最左到最右的墨的跨度（像素）。光有符干的行只有线宽那么宽，有头的行一整个头宽。 */
 /** 头所在那一端的块边上有一条加线：离块边 0.2 格内、宽过 1.6 格、不厚过 0.3 格、离谱线整数个线距。 */
-function ledgerEnd(bin: Binary, box: Rect, headY: number, sp: number, onLine: (y: number) => boolean): boolean {
+function ledgerEnd(bin: Binary, box: Rect, headY: number, sp: number, onLine: (y: number, x?: number) => boolean): boolean {
   const atTop = headY - box.y < box.y + box.h - headY;
   const rows: number[] = [];
   for (let k = 0; k <= Math.round(sp * 0.2); k++) {
@@ -740,20 +755,22 @@ function ledgerEnd(bin: Binary, box: Rect, headY: number, sp: number, onLine: (y
   if (!rows.length || rows.length > Math.max(2, sp * 0.3)) return false;
   const cy = rows.reduce((a, b) => a + b, 0) / rows.length;
   // 加线在谱表外 k 个线距处：往谱表那边挪 k 格落在谱线上
-  return [1, 2, 3, 4].some((k) => onLine(cy + k * sp) || onLine(cy - k * sp));
+  const bx = box.x + box.w / 2;
+  return [1, 2, 3, 4].some((k) => onLine(cy + k * sp, bx) || onLine(cy - k * sp, bx));
 }
 
 /**
  * 间里的头上沿或下沿紧挨着一条**加线**（那一行比头宽得多、本身不是谱线、往谱表挪整格落在谱线上）：
  * 加线压着头的一边，模板那一侧不白，分数掉一截（耶和华是我的牧者 m9 吊在下加一线下的 B3，0.40）。
  */
-function besideLedger(bin: Binary, box: Rect, g: number, sp: number, onLine: (y: number) => boolean): boolean {
-  if (onLine(g)) return false;
+function besideLedger(bin: Binary, box: Rect, g: number, sp: number, onLine: (y: number, x?: number) => boolean): boolean {
+  const bx = box.x + box.w / 2;
+  if (onLine(g, bx)) return false;
   for (const dir of [-1, 1])
     for (let k = -2; k <= 2; k++) {
       const y = g + (dir * sp) / 2 + k;
-      if (onLine(y) || rowSpan(bin, box, y) < sp * 1.6) continue;
-      if ([1, 2, 3, 4].some((n) => onLine(y + n * sp) || onLine(y - n * sp))) return true;
+      if (onLine(y, bx) || rowSpan(bin, box, y) < sp * 1.6) continue;
+      if ([1, 2, 3, 4].some((n) => onLine(y + n * sp, bx) || onLine(y - n * sp, bx))) return true;
     }
   return false;
 }
@@ -769,6 +786,16 @@ function rowSpan(bin: Binary, box: Rect, y: number): number {
       b = x;
     }
   return a < 0 ? 0 : b - a + 1;
+}
+
+/** 块里第 `y` 行最长的一段连续墨。 */
+function rowRun(bin: Binary, box: Rect, y: number): number {
+  const yy = Math.round(y);
+  if (yy < 0 || yy >= bin.h) return 0;
+  let run = 0;
+  let best = 0;
+  for (let x = Math.max(0, box.x); x < Math.min(bin.w, box.x + box.w); x++) (run = bin.data[yy * bin.w + x] ? run + 1 : 0), (best = Math.max(best, run));
+  return best;
 }
 
 /** 块里 `[y0,y1)` 那一段最密的那一列（符干的 x）。 */
@@ -790,18 +817,18 @@ function stemColumn(bin: Binary, box: Rect, y0: number, y1: number): number {
 /** 一条带里得分最高的头（门槛同单头那一档）。 */
 function bandTop(
   bin: Binary, masks: HeadMask[], box: Rect, sp: number, step: number,
-  grid: (y: number) => number | null, onLine: (y: number) => boolean, [ya, yb]: [number, number],
-  allowY: (y: number) => boolean = () => true, rowOk: (y: number) => boolean = () => true,
+  grid: (y: number, x?: number) => number | null, onLine: (y: number, x?: number) => boolean, [ya, yb]: [number, number],
+  allowY: (y: number, x?: number) => boolean = () => true, rowOk: (y: number, x?: number) => boolean = () => true,
 ): { x: number; y: number; s: number } | null {
   let bb: { x: number; y: number; s: number } | null = null;
   for (let x = box.x; x <= box.x + box.w; x += step) {
     const ys = new Set<number>();
     for (let y = ya; y <= yb; y += sp * 0.25) {
-      const g = grid(y);
-      if (g !== null && g >= ya - sp * 0.3 && g <= yb + sp * 0.3 && allowY(g) && rowOk(g)) ys.add(g);
+      const g = grid(y, x);
+      if (g !== null && g >= ya - sp * 0.3 && g <= yb + sp * 0.3 && allowY(g, x) && rowOk(g, x)) ys.add(g);
     }
     for (const y of ys) {
-      const m = masks.find((k) => k.onLine === onLine(y)) ?? masks[0];
+      const m = masks.find((k) => k.onLine === onLine(y, x)) ?? masks[0];
       const s = scoreAt(bin, m, x, y);
       if (s >= (m.pooled ? STEM_SCORE_MIN_POOLED : STEM_SCORE_MIN) && (!bb || s > bb.s)) bb = { x, y, s };
     }
@@ -845,8 +872,8 @@ export function solidHeadsAlongStems(
   nl: Binary,
   masks: HeadMask[],
   unit: RasterUnit,
-  grid: (y: number) => number | null,
-  onLine: (y: number) => boolean,
+  grid: (y: number, x?: number) => number | null,
+  onLine: (y: number, x?: number) => boolean,
   stems: LineSeg[],
   heads: Rect[],
   avoid: Rect[],
@@ -885,10 +912,10 @@ export function solidHeadsAlongStems(
     const y1 = atTop ? bot - sp * ALONG_FREE_SOLID : ry - sp * 0.8;
     const seen = new Set<number>();
     for (let y = y0; y <= y1; y += sp * 0.25) {
-      const g = grid(y);
+      const g = grid(y, vx);
       if (g === null || g < y0 - sp * 0.1 || g > y1 + sp * 0.1 || seen.has(g)) continue;
       seen.add(g);
-      const m = masks.find((q) => q.onLine === onLine(g)) ?? masks[0];
+      const m = masks.find((q) => q.onLine === onLine(g, vx)) ?? masks[0];
       let bestB: { x: number; s: number } | null = null;
       for (let cx = Math.round(vx - hw / 2 - tol); cx <= vx + hw / 2 + tol; cx++) {
         // 头盒要有一侧贴着干

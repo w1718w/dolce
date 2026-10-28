@@ -20,7 +20,7 @@
 // - 调号是声部级的（`MeasureAttrs.key`，MusicXML 的 `<key number>` 按谱表分调号语料 0 例，模型未分）；
 //   谱号按谱表取。`attrsAt(part, staff, i)` 是查询入口，将来模型分谱表调号时只改它。
 // - 派生量**不存进 `ScoreDoc`**（`Note.degree` 是例外：它是简谱来源的一手数据，MusicXML 来源由
-//   `assignDegrees` 补上），见 `../dev/docs/待办.md`（私有仓库） §3.1「派生量不存进 ScoreDoc」。
+//   `assignDegrees` 补上）。
 //
 // 无 DOM 依赖（Node CLI 要 import）。
 
@@ -97,6 +97,18 @@ export class AccidentalCarry {
     return offset !== expected ? ACC_BY_OFFSET[offset] : undefined;
   }
 
+  /** 写出前核对：照面上的记号读回（`pitch`）会不会读偏成别的音高；会就返回要改印的记号（本位写 `natural`）。
+   *  不管改不改都按读回的口径更新延续状态。 */
+  repair(degree: Degree, actual: Pitch, key: Key): Accidental | undefined {
+    const offset = actual.alter - keyAlter(STEPS.indexOf(actual.step), key.fifths);
+    const read = this.pitch(degree, key);
+    if (read.alter === actual.alter) return undefined;
+    const acc = ACC_BY_OFFSET[offset];
+    if (!acc) return undefined;
+    this.pitch({ ...degree, accidental: acc }, key);
+    return acc;
+  }
+
   /** 度数（带面上的记号）→ 音高，并更新延续状态。拼写字母取自调号（`jppitch.ts::jpPitch`）。 */
   pitch(degree: Degree, key: Key): Pitch {
     if (degree.accidental) {
@@ -106,6 +118,23 @@ export class AccidentalCarry {
     }
     const p = jpPitch(degree.number, degree.octaveShift, key.fifths);
     return { step: p.step as Pitch["step"], alter: p.alter + (this.offsets.get(degree.number) ?? 0), octave: p.octave };
+  }
+}
+
+/** 一小节里一条谱表上**按线/间延续**的临时记号（五线谱口径）：同字母同八度沿用前一个音的变音，起点是调号；
+ *  记号按绝对变音命名。与 `AccidentalCarry` 的简谱口径两处不同：`1=F` 的 `#4` 是 B 本位，谱表上印还原号；
+ *  `#4 4'` 简谱后一个沿用升半音，谱表上是另一条线，要再印一次。 */
+export class StaffAccidentalCarry {
+  private alters = new Map<string, number>();
+  constructor(private readonly fifths: number) {}
+
+  /** 这个音在谱表上要印的记号；`tied` 是延音线接过来的音：不印，也不改延续状态 */
+  mark(pitch: Pitch, tied = false): Accidental | undefined {
+    if (tied) return undefined;
+    const k = pitch.step + pitch.octave;
+    const expected = this.alters.get(k) ?? keyAlter(STEPS.indexOf(pitch.step), this.fifths);
+    this.alters.set(k, pitch.alter);
+    return pitch.alter !== expected ? ACC_BY_OFFSET[pitch.alter] : undefined;
   }
 }
 
@@ -157,7 +186,7 @@ function applyAttrs(r: ResolvedAttrs, m: Measure, staff: number): void {
 // ───────────────────────── 记谱八度 ─────────────────────────
 
 /** 八度谱号（`treble-8` 这类）的名字：`G`/2 高音、`F`/4 低音、`C`/3 中音、`C`/4 次中音，再加 `-8`/`+8`。
- *  123 `V:n clef=treble-8` 读写共用（`j123/fields.ts::parseVoiceClef`、`emit123.ts`）。 */
+ *  123 `V:n clef=treble-8` 读写共用（`abcfamily/fields.ts::parseVoiceClef`、`emit123.ts`）。 */
 const CLEF_NAMES: readonly [string, Clef["sign"], number][] = [["treble", "G", 2], ["bass", "F", 4], ["alto", "C", 3], ["tenor", "C", 4]];
 
 export function clefFromName(name: string): Clef | null {
@@ -279,7 +308,12 @@ export const TYPE_QUARTERS: Readonly<Record<string, number>> = {
 export function nominalQuarters(el: Element, divisions: number): number {
   const d = el.duration;
   if (!d) return 0;
-  const base = d.type ? TYPE_QUARTERS[d.type] : undefined;
+  // 整小节休止常记成 `<type>whole`、时值却是一整小节（2/4、3/4 里也一样；八段锦小钗 m52）：按实际时值
+  const wholeRest = el.kind === "chord" && !!el.rest && d.type === "whole" && !d.timeMod;
+  // 不可见休止是占位（ABC `x5` 这种写不成单个音符的时值，写出端只能就近标个 `<type>half`）：也按实际时值，
+  // 不然拆成整拍的 0 时余下那半拍丢了，后面的音整个往前错
+  const spacerRest = el.kind === "chord" && !!el.rest && el.printObject === false && !d.timeMod;
+  const base = d.type && !wholeRest && !spacerRest ? TYPE_QUARTERS[d.type] : undefined;
   if (base !== undefined) {
     let q = base;
     let add = base;
@@ -356,6 +390,11 @@ const midiOf = (p: Pitch): number => p.octave * 12 + [0, 2, 4, 5, 7, 9, 11][STEP
 /** MIDI 音高（中央 C = 60）。 */
 export const midiPitch = (p: Pitch): number => midiOf(p) + 12;
 
+/** 音的高低（比较用）：有绝对音高按 MIDI，简谱来源按度数与八度。 */
+export function noteHeight(n: Note): number {
+  return n.pitch ? midiOf(n.pitch) : n.degree ? n.degree.octaveShift * 7 + n.degree.number : -Infinity;
+}
+
 /** 和弦里简谱印的那个音：音高最高者；没有绝对音高（简谱来源）时取度数最高者，再没有取第一个。 */
 export function topNote(ch: Chord): Note | undefined {
   let best: Note | undefined;
@@ -364,7 +403,7 @@ export function topNote(ch: Chord): Note | undefined {
   const normal = ch.notes.some((n) => n.typeSize !== "cue");
   for (const n of ch.notes) {
     if (normal && n.typeSize === "cue") continue;
-    const v = n.pitch ? midiOf(n.pitch) : n.degree ? n.degree.octaveShift * 7 + n.degree.number : -Infinity;
+    const v = noteHeight(n);
     if (v > bestV) {
       best = n;
       bestV = v;

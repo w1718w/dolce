@@ -94,6 +94,8 @@ export interface JpNum {
   // 上波音 → `notations.ornaments: ["inverted-mordent"]`（123 `!sby!`、文本谱 `&sby`）；
   // 下波音 → `["mordent"]`（123 `!xby!`、文本谱 `&xby`）；.jpwabc 装不下。
   ornament?: "upper-mordent" | "lower-mordent";
+  // 下滑音（数字右上方一笔向右下弯、带箭头的细线，见 jianpu.ts）→ `notations.articulations: ["xhy"]`（123 `!xhy!`，转 MusicXML 是 falloff）。
+  fall?: boolean;
   // 倚音（谱面上是主音符左上角的小号数字，底下压着一两条减时线、再由一小段弧连到主音符）。
   // 一个主音符可以带一串（`"yy:5 4# 4b"`），故是数组、按 x 排序。
   // → 主音符之前的 `grace` Chord（不占拍位，123 `{5}`）；文本谱 `"yy:…"`。
@@ -132,12 +134,13 @@ export interface StaffRow {
   // → 右线 `style: "light-light"`（123 `||`）、文本谱 `||`。反复线 `:‖` 的两根也会落进来，
   // 下游一律让 repeatBackward 优先，两者不叠。
   doubleBarXs?: number[];
-  // 本行**中间**的终止线（细+粗 ‖）位置，取右侧粗线的 x。只在多声部谱（连谱号括着的声部行）里认：
-  // 四声部本子在「阿们」前印一道。→ 右线 `style: "light-heavy"`（123 `|]`、文本谱 `|||`）。
+  // 本行**中间**的终止线（细+粗 ‖）位置，取右侧粗线的 x。多声部谱（连谱号括着的声部行）里见了就认：
+  // 四声部本子在「阿们」前印一道；单声部行要线前印着 Fine（曲终在曲中，D.S./D.C. 跳回来唱到这里）。
+  // → 右线 `style: "light-heavy"`（123 `|]`、文本谱 `|||`）。
   endBarXs?: number[];
   // 本行歌词行首印着的**段号**（`1.`、`3.5.`），下标 = 段号所属的 verse（0 基）。
   // 段号在装配时本就被丢弃、不占音符位，这里另存一份原样输出：文本谱写成歌词行前置说明
-  // `C1:<1.>…`（pu/parse.ts::stripLyricAnnotation，排在细竖线与首字之间）。
+  // `C1:<1.>…`（fanqie/parse.ts::stripLyricAnnotation，排在细竖线与首字之间）。
   // 只在段号成套可信时才填（见 lyrics.ts 的 verseLabels）；模型那路记在该段首字的 `Lyric.verseLabel`（123 `w:<1.>`）。
   lyricLabels?: string[];
   // 多声部谱（四声部诗歌本）：本行属第几个系统、是其中第几声部（都 0 基，自上而下）。
@@ -177,6 +180,7 @@ export interface RecognizedScore {
   // 标题行。`.jpwabc` 的 `.Title` 段没有这个字段（既定，不扩语法），走那一路会丢。
   subtitle?: string;
   credits?: string[]; // 著作者整行文本（作词/作曲…），→ `identification.creators`（123 `C:`）
+  creditsTopLeft?: string[]; // 印在标题左边（左上角）的署名，→ `pageText.topLeft`（诗歌本 `TL:`、123 `I:topleft`）
   tempo?: number; // 速度 ♩=NN → `Song.tempos`（123 `Q:1/4=NN`）
   tempoBeat?: { num: number; den: number }; // 速度的拍单位（附点四分 `♩.=` 为 3/8），缺省四分 → `Song.tempoBeat`
   headerRegions?: TextRegion[]; // 页眉文本的源图定位（识别模式按原位叠加）

@@ -34,6 +34,9 @@ export class Lexer123 extends AbcFamilyLexer {
   protected override readonly arcNextTilde = true;
   /** 大写 `X` 是节奏音符（ABC 里 X 不是音名、123 也没占用）。 */
   protected override readonly rhythmLetters = "X";
+  /** `&`：小节内的第二声部（ABC §7.4，规范 §4.3）。 */
+  protected override readonly voiceOverlay = true;
+  protected override readonly rhythmPositions = true;
 
   /** 不带引号的和弦：**大写 A–G 开头（或 `#`/`b` 紧跟大写 A–G）、读到空白为止、后面必须跟空格**。
    *  123 音乐体里 A–G 没有别的用处（音符是数字、节奏音符是 `X`、行内字段以 `[` 起头），不会撞；
@@ -50,9 +53,12 @@ export class Lexer123 extends AbcFamilyLexer {
     return res;
   }
 
-  /** 123 的休止是 `0`，当成 degree 0 的音符走 `scanNote`，这里不单独认。 */
-  protected scanRest(): DurationScan | null {
-    return null;
+  /** 123 的休止是 `0`，当成 degree 0 的音符走 `scanNote`，这里只认整小节休止 `Z` / `Zn`
+   *  （ABC §4.6 同写法：`Z` 一小节，`Z4` 四小节，五线谱、简谱都印成一个多小节休止）。 */
+  protected scanRest(line: string, i: number): DurationScan | null {
+    const m = /^Z(\d*)/.exec(line.slice(i));
+    if (!m) return null;
+    return { beams: 0, dots: 0, bars: m[1] ? Math.max(1, Number(m[1])) : 1, next: i + m[0].length };
   }
 
   /** 时值修饰：`_` 减时线（可多条）与 `.` 附点（可多个），两者可交替出现。 */
@@ -71,6 +77,35 @@ export class Lexer123 extends AbcFamilyLexer {
     }
     if (j === i) return null;
     return { beams, dots, next: j };
+  }
+
+  /** 和音 `[13]` `[1,5]` `[#46']`（照 ABC §4.17 的 `[CEG]`）：`[` 后紧跟两个以上的音（不含休止）、中间不留空格、`]` 收住；
+   *  时值写在 `]` 后面、几个音共用（`[13]_.`），括号里的音不带时值，可后跟 `~` 单连这一个音（`[1~3]`）。
+   *  这样与房号 `[1 …`（后面跟空格）分得开。 */
+  protected override scanChordGroup(line: string, i: number): { text: string; notes: NoteScan[]; dur: DurationScan | null } | null {
+    if (line[i] !== "[") return null;
+    // 同时敲的几个节奏音符 `[X@E5X@F5]`（打击乐谱一拍里钹与鼓同时），只许全是 `X`
+    const rh = /^\[((?:X(?:@[A-G]\d)?){2,})\]/.exec(line.slice(i));
+    if (rh) return { text: rh[0], notes: [], dur: this.scanDuration(line, i + rh[0].length) };
+    const notes: NoteScan[] = [];
+    let k = i + 1;
+    while (k < line.length && line[k] !== "]") {
+      const n = this.scanNote(line, k);
+      if (!n || n.degree === 0 || n.beams || n.dots) return null;
+      notes.push(n);
+      k = n.next;
+      // 音后的 `~`：只这一个音连到下一个和音里的同音（同 ABC `[C-E]` 的 tie）
+      if (line[k] === "~") k++;
+    }
+    if (line[k] !== "]" || notes.length < 2) return null;
+    return { text: line.slice(i, k + 1), notes, dur: this.scanDuration(line, k + 1) };
+  }
+
+  /** `[` 后不留空格一直写到 `]`、又不是合规和音的（`[03]` `[1X]` `[13_]` `[1]`）：房号后面总跟空格，这只能是写错的和音 */
+  protected override malformedChordGroup(line: string, i: number): { message: string; len: number } | null {
+    const m = /^\[[\d#bnX][^\s[\]|"!]*\]/.exec(line.slice(i));
+    if (!m || this.scanChordGroup(line, i)) return null;
+    return { message: tr("diag.j123.badChordGroup", { text: m[0] }), len: m[0].length };
   }
 
   /** 音符：`[#b n]数字['`,]*[_.]*`。变音记号**前置**（简谱惯例，与 ABC 的 `^_=` 不同）。 */

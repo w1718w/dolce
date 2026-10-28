@@ -66,6 +66,7 @@ function collectTexts(pg: SPage): { texts: PObj[]; hlines: Box[] } {
   for (const o of pg.objs) {
     if (!o.run) continue;
     if (o.symbols.length) continue; // 音乐字体的对象归 findSymbols
+    if (o.hasTag("MultiRest")) continue; // 多小节休止的小节数（`findMultiRests`）
     let inStaff = false;
     const cy = (o.box.top + o.box.bottom) / 2;
     for (const st of pg.staves) {
@@ -80,7 +81,9 @@ function collectTexts(pg: SPage): { texts: PObj[]; hlines: Box[] } {
     if (inStaff) continue;
     texts.push(o);
   }
-  const hlines = pg.segs.filter((s) => s.isH && !s.hasAnyTag()).map((s) => s.box);
+  // 歌词延长线是细线：厚过 0.3 格的是符杠（八段锦小钗 p2：系统 9 一截十六分副杠与下一行谱上方的「大鼓」同高，被当锚收成了歌词）
+  const sp = pg.normalStaffSpace || pg.space;
+  const hlines = pg.segs.filter((s) => s.isH && !s.hasAnyTag() && s.lw < sp * 0.3).map((s) => s.box);
   return { texts, hlines };
 }
 
@@ -148,8 +151,46 @@ export function analyzeText(pg: SPage): TextAnalysis {
         f.box.left <= t.box.left && f.box.right >= t.box.right && f.box.top <= t.box.top && f.box.bottom >= t.box.bottom &&
         f.box.right - f.box.left < t.box.right - t.box.left + 4 * sp && f.box.bottom - f.box.top < t.box.bottom - t.box.top + 4 * sp,
     );
+  // 「【A】」：方头括号夹着的字母 / 数字是排练号（八段锦），括号与字是三段文字。不先收，`A` 合和弦文法，
+  // 后面「紧跟和弦右边的后缀」那一步再把同一行的速度文字一路收成和弦。括号一并归框字，出 XML 时不另出一条（`attachDirectionTexts`）
+  // 系统左上角的小节号：印在谱表左端正上方（常套个方框，八段锦）——横向不出谱表左缘三格、底边离谱表顶不出四格的纯数字。
+  // 要先于歌词收：框的上下边是横线，歌词那一步「纵向跨过横线」会把框里的数收成歌词
   for (const t of texts) {
-    if (kind.has(t) || framed(t)) continue;
+    if (kind.has(t) || !/^\s*\d+\s*$/.test(objText(t))) continue;
+    if (pg.staves.some((st) => t.box.left < st.box.left + 3 * sp && t.box.right > st.box.left - 4 * sp && t.box.bottom <= st.box.top && st.box.top - t.box.bottom < 4 * sp)) kind.set(t, "measureNumber");
+  }
+  for (const t of texts) {
+    if (kind.has(t)) continue;
+    const h = t.box.bottom - t.box.top;
+    let close: PObj;
+    if (/^【[A-Z0-9]{1,3}】$/.test(objText(t).trim())) {
+      // 括号连字一段印出（高音笙「【A】」）
+      kind.set(t, "boxed");
+      close = t;
+    } else {
+      if (objText(t).trim() !== "【") continue;
+      const row = texts.filter((u) => u !== t && overlapY(u.box, t.box) && u.box.left >= t.box.right - h * 0.2 && u.box.left - t.box.right < h * 2).sort((a, b) => a.box.left - b.box.left);
+      const c = row.find((u) => objText(u).trim() === "】");
+      const inner = c ? row.filter((u) => u.box.right <= c.box.left + h * 0.2 && objText(u).trim()) : [];
+      if (!c || inner.length !== 1 || !/^[A-Z0-9]{1,3}$/.test(objText(inner[0]).trim())) continue;
+      kind.set(inner[0], "boxed");
+      kind.set(t, "boxed");
+      kind.set(c, "boxed");
+      close = c;
+    }
+    // 紧跟在排练号右边的同一行字是速度 / 表情（「【A】欢快 热烈地」，没印节拍器的分谱上只有这几个字）
+    let prev = close;
+    for (;;) {
+      const next = texts
+        .filter((u) => !kind.has(u) && objText(u).trim() && overlapY(u.box, prev.box) && u.box.left > prev.box.left && u.box.left - prev.box.right < 3 * sp)
+        .sort((a, b) => a.box.left - b.box.left)[0];
+      if (!next) break;
+      kind.set(next, "tempo");
+      prev = next;
+    }
+  }
+  for (const t of texts) {
+    if (kind.has(t) || framed(t) || t.hasAnyTag()) continue;
     const raw = objText(t).replace(/\s+/g, "");
     if (!raw) continue;
     if (isWholeChord(raw)) kind.set(t, "harmony");
@@ -178,6 +219,25 @@ export function analyzeText(pg: SPage): TextAnalysis {
       // 放到两格：同一行里相邻的两个和弦间隔十格开外，不会误并。
       if (dist < -hh / 4 || dist > Math.max(hh / 2, 2 * sp)) continue;
       kind.set(t, "harmony");
+      break;
+    }
+  }
+
+  // 弦乐、管乐的演奏法字（`pizz` `arco` `solo`……）：印在谱表上方一行，歌词那一步会把它们收成歌词（八段锦大提琴、倍大提琴）
+  // 一个词常断成两段印（「p」+「izz」：字距调整把 TJ 劈开），右邻贴着（缝不到三成字高）的拼起来再查
+  for (const t of texts) {
+    if (kind.has(t)) continue;
+    const run = [t];
+    for (;;) {
+      const last = run[run.length - 1];
+      const h = last.box.bottom - last.box.top;
+      const next = texts.find((u) => !run.includes(u) && !kind.has(u) && overlapY(u.box, last.box) && u.box.left >= last.box.right - h * 0.1 && u.box.left - last.box.right < h * 0.3 && objText(u).trim());
+      if (!next) break;
+      run.push(next);
+    }
+    for (let k = run.length; k >= 1; k--) {
+      if (!PLAY_WORDS.has(run.slice(0, k).map((u) => objText(u).trim()).join("").toLowerCase().replace(/\.$/, ""))) continue;
+      for (const u of run.slice(0, k)) kind.set(u, "expression");
       break;
     }
   }
@@ -388,6 +448,7 @@ export function analyzeText(pg: SPage): TextAnalysis {
   for (const l of pg.segsWithTag("SysLine")) {
     for (const t of texts) {
       if (kind.has(t)) continue;
+      if (/^[\d\s-]+$/.test(objText(t))) continue; // 纯数字是小节号（八段锦系统左上角套框的小节号，框的竖边会被当系统线）
       if (t.box.left > l.box.right) continue;
       if (!overlapY(l.box, t.box)) continue;
       if (xSpace(l.box, t.box) > 6 * sp) continue;
@@ -395,10 +456,20 @@ export function analyzeText(pg: SPage): TextAnalysis {
     }
   }
 
+  // 没有系统线段可比的（Anastasia 的谱表左端是 `bracket` 字形，八段锦）：正对着某行谱、在谱表左缘左边八格以内的字
+  for (const t of texts) {
+    if (kind.has(t) || !objText(t).trim() || /^[\d\s-]+$/.test(objText(t))) continue; // 纯数字是小节号
+    const cy = (t.box.top + t.box.bottom) / 2;
+    // 大谱表的名字印在两行之间（扬琴）
+    const inGap = (st: Staff) => cy > st.box.bottom && pg.staves.some((b) => b !== st && b.box.top > cy && b.box.top - st.box.bottom < 6 * sp);
+    if (pg.staves.some((st) => t.box.right <= st.box.left && (overlapY(st.box, t.box) || inGap(st)) && st.box.left - t.box.right < 8 * sp)) kind.set(t, "instrument");
+  }
+
   // ── findTempo ─────────────────────────────────────────────────────────────
   // 带 `=` 的那一段（`♩= 72`）连同同一行里**间距不超过三格**的左右邻居。
+  // 已被排练号那一步收成速度的也照样往两边收（新笛「【A】热烈地 ♩ = 144」：`= 144` 先归了速度，左边的 ♩ 没人收）
   for (const eq of pg.objs) {
-    if (!eq.run || eq.hasAnyTag() || kind.has(eq)) continue;
+    if (!eq.run || eq.hasAnyTag() || (kind.has(eq) && kind.get(eq) !== "tempo")) continue;
     if (!objText(eq).includes("=")) continue;
     const row = pg.objs.filter((o) => o.run && overlapY(o.box, eq.box)).sort((a, b) => a.box.left - b.box.left);
     const idx = row.indexOf(eq);
@@ -453,7 +524,8 @@ export function analyzeText(pg: SPage): TextAnalysis {
   for (const t of texts) {
     if (kind.has(t)) continue;
     const s0 = objText(t).trim();
-    if (s0.length < 2 || /^[\d\s-]+$/.test(s0) || !/[A-Za-z]/.test(s0)) continue;
+    // 中文的也算（八段锦钢片琴首行上方「欢快 热烈地」，没印节拍器、也没有排练号领着）
+    if (s0.length < 2 || /^[\d\s-]+$/.test(s0) || !/[A-Za-z\u3400-\u9fff]/.test(s0)) continue;
     const cy = (t.box.top + t.box.bottom) / 2;
     if (pg.staves.some((st) => t.box.left >= st.box.left && t.box.right <= st.box.right && cy >= st.box.top - sp * 5 && cy <= st.box.top + sp)) kind.set(t, "expression");
   }
@@ -508,6 +580,11 @@ export function analyzeText(pg: SPage): TextAnalysis {
 }
 
 /** `findExpression` 的表情术语表，照抄 musicpp 原文（小写比对）。 */
+/** 演奏法字（去掉末尾句点、小写比对），先于歌词收成表情文字。 */
+const PLAY_WORDS = new Set([
+  "pizz", "arco", "solo", "soli", "tutti", "div", "unis", "con sord", "senza sord", "sul pont", "sul tasto", "col legno", "trem", "spicc", "gliss",
+]);
+
 const EXPRESSIONS = new Set(
   [
     "a tempo", "unis.", "cresc.", "sub.", "sim.", "l.h.", "r.h.", "rubato",
@@ -537,7 +614,12 @@ export interface Syllable {
   /** 字形所属的字体家族与设备字号（查字典与建库都要，别再回头去 objs 里找）。 */
   font: string;
   sizeDev: number;
+  /** 印在这个字前面的段号（「1.」「2、」照印的写）：只挂在一段词的首字上，跟着字走（行后来拆开、改段号都不丢） */
+  label?: string;
 }
+
+/** 位图路在折叠歌词时剔掉的行首段号（`rasteromr/pagefinish.ts` 记），`buildLyricLines` 挂到这个对象的首字上 */
+export const lyricObjLabel = new WeakMap<PObj, string>();
 
 /**
  * 去掉**重描**出来的重复音节。
@@ -590,9 +672,12 @@ export function splitSyllables(o: PObj, dict?: TextGlyphLookup): Syllable[] {
   const synth = run.font.startsWith("#");
   const out: Syllable[] = [];
   let cur: { chars: string[]; left: number; right: number; glyphs: VecGlyph[] } | null = null;
+  /** 首字前的段号「1.」：不是音节，挂到下一个音节上 */
+  let label: string | undefined;
   const flush = (hyphen: boolean) => {
     if (!cur) return;
     const text = cur.chars.join("").trim();
+    if (!out.length && label === undefined && /^[1-9]\d?[.．、]$/.test(text)) label = text;
     // **半角标点紧贴在前一个音节后面的，并回去**（「祂!」「拜,」）：另起一个音节就占掉下一个音，
     // 后面的字整体错一格（宣主荣耀 m6 起女高唱成「祂 ! 哈 利」）
     const last = out[out.length - 1];
@@ -606,7 +691,7 @@ export function splitSyllables(o: PObj, dict?: TextGlyphLookup): Syllable[] {
     // 纯数字的不是歌词：那是**小节号**（`findMeasureNumber` 只认得贴着系统线的那些，
     // 印在框里的漏网）与行首的段号「1.」。GT 那边也把段号剔掉了。
     if (text && !/^[-_–—]+$/.test(text) && !/^\d+[.．、]?$/.test(text)) {
-      out.push({ text, cx: (cur.left + cur.right) / 2, left: cur.left, right: cur.right, hyphen, glyphs: cur.glyphs, font: run.font, sizeDev: run.sizeDev });
+      out.push({ text, cx: (cur.left + cur.right) / 2, left: cur.left, right: cur.right, hyphen, glyphs: cur.glyphs, font: run.font, sizeDev: run.sizeDev, ...(label !== undefined && !out.length ? { label } : {}) });
     }
     cur = null;
   };
@@ -817,7 +902,12 @@ export function buildLyricLines(
   for (const [staff, rs] of byStaff) {
     rs.sort((a, b) => a.top - b.top);
     rs.forEach((r, i) => {
-      const syllables = dedupeSyllables(r.objs.flatMap((o) => splitSyllables(o, dict)).sort((a, b) => a.cx - b.cx));
+      const syllables = dedupeSyllables(r.objs.flatMap((o) => {
+        const ss = splitSyllables(o, dict);
+        const lab = lyricObjLabel.get(o);
+        if (lab !== undefined && ss[0] && ss[0].label === undefined) ss[0].label = lab;
+        return ss;
+      }).sort((a, b) => a.cx - b.cx));
       if (syllables.length) out.push({ staff, verse: i + 1, top: r.top, bottom: r.bottom, syllables });
     });
   }
@@ -831,7 +921,7 @@ interface NoteLike {
   rest: boolean;
   x: number;
   voice?: number;
-  lyrics?: { verse: number; text: string; hyphen: boolean; cont: boolean; size?: number; baseY?: number }[];
+  lyrics?: { verse: number; text: string; hyphen: boolean; cont: boolean; size?: number; baseY?: number; box?: Box; label?: string }[];
   chord?: string;
   chordSize?: number;
   chordLater?: { text: string; frac: number; size?: number }[];
@@ -855,25 +945,81 @@ export function attachLyrics(notes: NoteLike[], lines: LyricLine[], sameCol = 0)
     const baseY = han ? line.bottom! - (line.bottom! - line.top) * HAN_BASELINE_RISE : undefined;
     const cand = notes.filter((n) => n.staff === line.staff && !n.rest && (!line.voice || (line.voice === 1) === (n.voice === 1))).sort((a, b) => a.x - b.x);
     if (!cand.length) continue;
+    // 从 `from` 起往前推到「再往前就更远」为止。**同 x 的音（两个声部叠在一起）不算「更远」**，要越过去接着找：
+    // 原来碰到距离相等就停，一行从中间起头的词（位图路从主歌行尾拆出来的副歌起句）整串卡在第一个音上
+    const nearest = (cx: number, from: number) => {
+      let ni = from;
+      for (let j = ni + 1; j < cand.length && cand[j].x - cx <= Math.abs(cand[ni].x - cx); j++)
+        if (Math.abs(cand[j].x - cx) < Math.abs(cand[ni].x - cx)) ni = j;
+      return ni;
+    };
+    // 挂完一个音节往后挪一个音。同一列（x 差不到 `sameCol`）的其余和弦成员一并跳过：一个和弦只挂一个音节。
+    // 位图路才传（0.3 个线距）：只挪一个音，下一个音节常落到同一和弦的另一个成员上，
+    // 两个音节挤在同一拍，按拍位展开从高到低排，词序就反了（信心使我得胜「they like a」读成「they a like」）
+    const after = (i: number) => {
+      while (sameCol > 0 && i + 1 < cand.length && Math.abs(cand[i + 1].x - cand[i].x) < sameCol) i++;
+      return i + 1 < cand.length ? i + 1 : i;
+    };
+    const syls = line.syllables;
+    /** 各音节挂到 `cand` 的第几个音 */
+    const at: number[] = [];
     let ni = 0;
+    for (let k = 0; k < syls.length; ) {
+      // **挤排的一串字**（相邻汉字首尾相接）：照就近挂，字格比音偏出半个音距就会跳过一个音，后面整串往后错一个
+      //（新编 f08 m5「等快乐这样」挤在一起印、整串比音偏右二三十像素，「快」的格心离后一个音更近，跳过 B4，
+      // 一直错到 m7 丢了「最」，串尾「样」被挤到下一小节、离字 95 像素）。这一串另按「首字就近、之后一字一音」挂一遍：
+      // 就近挂法有字被挤到离它超过一个字宽的音上、顺序挂法一个都没有，才用顺序挂法。
+      // 只比离散不行：两个字的串偏移总是差不多齐，两个声部错开印的音（333「主声」「耶稣」）也会被改成顺序
+      let e = k + 1;
+      while (e < syls.length && crammed(syls[e - 1], syls[e])) e++;
+      if (e - k < 2) {
+        const n = nearest(syls[k].cx, ni);
+        at.push(n);
+        ni = after(n);
+        k++;
+        continue;
+      }
+      const byNear: number[] = [];
+      for (let q = k, p = ni; q < e; q++) {
+        p = nearest(syls[q].cx, p);
+        byNear.push(p);
+        p = after(p);
+      }
+      const bySeq: number[] = [byNear[0]];
+      for (let q = k + 1; q < e; q++) {
+        const last = bySeq[bySeq.length - 1];
+        let n = after(last);
+        if (n === last) break; // 音不够了
+        // 下一列里有几个声部（x 差不到 `sameCol`）的，取离字心最近的那个，同就近挂法
+        for (let j = n + 1; j < cand.length && Math.abs(cand[j].x - cand[n].x) < sameCol; j++)
+          if (Math.abs(cand[j].x - syls[q].cx) < Math.abs(cand[n].x - syls[q].cx)) n = j;
+        bySeq.push(n);
+      }
+      /** 有字挂到了离字心超过一个字宽的音上 */
+      const strays = (idx: number[]) => idx.some((n, i) => Math.abs(syls[k + i].cx - cand[n].x) > syls[k + i].right - syls[k + i].left);
+      const use = bySeq.length === e - k && strays(byNear) && !strays(bySeq) ? bySeq : byNear;
+      at.push(...use);
+      ni = after(use[use.length - 1]);
+      k = e;
+    }
     // 上一个音节末尾带连字符 → 这一个是**词中的续段**，MusicXML 的 `syllabic`
     // 要出 `middle`/`end` 而不是 `single`（`a-bid-eth` 的中段）。
     let cont = false;
-    for (const syl of line.syllables) {
-      // 往前推到「再往前就更远」为止。**同 x 的音（两个声部叠在一起）不算「更远」**，要越过去接着找：
-      // 原来碰到距离相等就停，一行从中间起头的词（位图路从主歌行尾拆出来的副歌起句）整串卡在第一个音上
-      for (let j = ni + 1; j < cand.length && cand[j].x - syl.cx <= Math.abs(cand[ni].x - syl.cx); j++)
-        if (Math.abs(cand[j].x - syl.cx) < Math.abs(cand[ni].x - syl.cx)) ni = j;
-      const n = cand[ni];
-      (n.lyrics ??= []).push({ verse: line.verse, text: syl.text, hyphen: syl.hyphen, cont, ...(syl.sizeDev > 0 ? { size: syl.sizeDev } : {}), ...(above ? { above } : {}), ...(baseY !== undefined ? { baseY } : {}) });
+    syls.forEach((syl, k) => {
+      (cand[at[k]].lyrics ??= []).push({ verse: line.verse, text: syl.text, hyphen: syl.hyphen, cont, ...(syl.label !== undefined ? { label: syl.label } : {}), ...(syl.sizeDev > 0 ? { size: syl.sizeDev } : {}), ...(above ? { above } : {}), ...(baseY !== undefined ? { baseY } : {}), box: { left: syl.left, right: syl.right, top: line.top, bottom: line.bottom ?? line.top + (syl.right - syl.left) } });
       cont = syl.hyphen;
-      // 同一列（x 差不到 `sameCol`）的其余和弦成员一并跳过：一个和弦只挂一个音节。
-      // 位图路才传（0.3 个线距）：只挪一个音，下一个音节常落到同一和弦的另一个成员上，
-      // 两个音节挤在同一拍，按拍位展开从高到低排，词序就反了（信心使我得胜「they like a」读成「they a like」）
-      while (sameCol > 0 && ni + 1 < cand.length && Math.abs(cand[ni + 1].x - n.x) < sameCol) ni++;
-      if (ni + 1 < cand.length) ni++;
-    }
+    });
   }
+}
+
+/** 挤排：两个相邻汉字音节之间的缝不到窄的那个字宽的这么多（f08「等快乐这样」缝 −8~11 像素、字宽五十上下） */
+const CRAMMED_GAP = 0.3;
+const HAN_RE = /[㐀-鿿]/;
+
+/** 两个相邻音节是挤排的一串：都是汉字、首尾相接 */
+function crammed(a: Syllable, b: Syllable): boolean {
+  if (!HAN_RE.test(a.text) || !HAN_RE.test(b.text)) return false;
+  return b.left - a.right < CRAMMED_GAP * Math.min(a.right - a.left, b.right - b.left);
 }
 
 /**
@@ -996,10 +1142,46 @@ export function attachHarmonies(pg: SPage, notes: NoteLike[], harmonies: PObj[],
 
 /** 节拍器文字（`q = c 76`、`♩= 72`）：音符字形（正文字体里的 `q`/`h`/`e`，或乐谱字形的 ♩）+ `=` + 可带 `c.`/`ca.` 的数字。 */
 const METRO_TEXT_RE = /([qhe♩♪𝅗𝅥])?\.?\s*=\s*(ca?\.?\s*)?(\d{2,3})/;
+const METRO_GLYPH: Record<string, string> = { metNoteQuarterUp: "♩", metNote8thUp: "♪", metNoteHalfUp: "𝅗𝅥" };
 const METRO_UNIT: Record<string, string> = { q: "quarter", "♩": "quarter", h: "half", "𝅗𝅥": "half", e: "eighth", "♪": "eighth" };
+
+/** 表情文字：同一行、贴着（缝不到三成字高）的几段并成一条（一个词断成几段印：`p` + `izz`）。 */
+function exprLines(objs: PObj[]): PObj[][] {
+  const out: PObj[][] = [];
+  for (const o of [...objs].sort((a, b) => a.box.left - b.box.left)) {
+    const line = out.find((l) => {
+      const last = l[l.length - 1];
+      return overlapY(last.box, o.box) && o.box.left >= last.box.right - 1 && o.box.left - last.box.right < (o.box.bottom - o.box.top) * 0.3;
+    });
+    if (line) line.push(o);
+    else out.push([o]);
+  }
+  return out;
+}
+
+/** 排练号：「【」「A」「】」分三段印的（八段锦）从左到右收成一条，别的框里字各自一条 */
+function boxedItems(objs: PObj[]): PObj[][] {
+  const out: PObj[][] = [];
+  // 按左缘排好后别的行的排练号会插在中间（中胡 p2 m65「【D】」与另一行「【C】」交错）：每行各开各的
+  const open: PObj[][] = [];
+  for (const o of [...objs].sort((a, b) => a.box.left - b.box.left)) {
+    const s = objText(o).trim();
+    const k = open.findIndex((g) => overlapY(g[0].box, o.box));
+    if (k >= 0) {
+      open[k].push(o);
+      if (s.endsWith("】")) open.splice(k, 1);
+      continue;
+    }
+    out.push([o]);
+    if (s === "【") open.push(out[out.length - 1]);
+  }
+  return out;
+}
 
 /** 同一条速度里相邻两段的横向间隙上限（格）：与 `analyzeText` 把 `=` 两边的段收进速度那一步同口径。 */
 const TEMPO_JOIN_GAP = 3;
+/** 只有文字的一条速度接后面以节拍器起头的一条：横向间隙上限（格） */
+const TEMPO_WORDS_GAP = 5;
 
 /**
  * `analyzeText` 认出的**速度**（`Andante`、`q = c 76`）与**表情**（`rit.`）挂到音符上，出 `<direction>`。
@@ -1014,11 +1196,11 @@ const TEMPO_JOIN_GAP = 3;
  */
 export function attachDirectionTexts(
   pg: SPage,
-  notes: { staff: Staff; x: number; chordExtra?: boolean; grace?: boolean; words?: { text: string; above: boolean; size?: number; rehearsal?: boolean }[]; metronome?: StaffNote["metronome"]; tempoText?: string; tempoSize?: number }[],
+  notes: { staff: Staff; x: number; chordExtra?: boolean; grace?: boolean; words?: { text: string; above: boolean; size?: number; rehearsal?: boolean; bracket?: boolean; box?: Box }[]; metronome?: StaffNote["metronome"]; tempoText?: string; tempoSize?: number; tempoBox?: Box }[],
   text: TextAnalysis,
 ): void {
   const sp = pg.normalStaffSpace || pg.space;
-  const tempo = [...text.tempo].filter((o) => objText(o).trim()).sort((a, b) => a.box.left - b.box.left);
+  const tempo = [...text.tempo].filter((o) => objText(o).trim() || o.symbols.some((y) => METRO_GLYPH[y.code])).sort((a, b) => a.box.left - b.box.left);
   const lines: PObj[][] = [];
   for (const o of tempo) {
     const line = lines.find((l) => {
@@ -1028,15 +1210,35 @@ export function attachDirectionTexts(
     if (line) line.push(o);
     else lines.push([o]);
   }
+  // 术语与节拍器字号不同、隔得比段间远的（八段锦小钗「欢快 热烈地」…「♩ = 144」隔 3.4 格）：
+  // 左边一条只有文字、右边一条以节拍器起头，同一行、隔得不到 TEMPO_WORDS_GAP 格，也并成一条
+  const isMetro = (l: PObj[]) => l[0].symbols.some((y) => METRO_GLYPH[y.code]) || /^\s*[qhe♩♪]?\s*=/.test(objText(l[0]));
+  const hasEq = (l: PObj[]) => l.some((o) => objText(o).includes("="));
+  for (let i = 0; i < lines.length; i++) {
+    const a = lines[i];
+    if (hasEq(a)) continue;
+    const last = a[a.length - 1];
+    const j = lines.findIndex((b, k) => k !== i && isMetro(b) && overlapY(last.box, b[0].box) && b[0].box.left >= last.box.right - 1 && xSpace(last.box, b[0].box) <= sp * TEMPO_WORDS_GAP);
+    if (j < 0) continue;
+    a.push(...lines[j]);
+    lines.splice(j, 1);
+    if (j < i) i--;
+  }
   const items = [
     ...lines.map((l) => ({ objs: l, tempo: true, boxed: false })),
-    ...text.expression.map((o) => ({ objs: [o], tempo: false, boxed: false })),
-    ...text.boxed.map((o) => ({ objs: [o], tempo: false, boxed: true })),
+    ...exprLines(text.expression).map((l) => ({ objs: l, tempo: false, boxed: false })),
+    ...boxedItems(text.boxed).map((objs) => ({ objs, tempo: false, boxed: true })),
   ];
   for (const { objs, tempo: isTempo, boxed } of items) {
     // 没有 ToUnicode 的字体抽出来是控制字符（牵我的手 `= 60` 的数字读成 `\u0018\u0012`）：剥掉，解不出数的等号也不留
-    const parts = objs.map((o) => objText(o).replace(/[\u0000-\u001f]/g, "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    // 节拍器的音符是乐谱字体的字形（Anastasia 的 `metNoteQuarterUp`），文字层里是空串：换回 `♩`，好让下面认出单位
+    const parts = objs.map((o) => (o.symbols.length ? o.symbols.map((y) => METRO_GLYPH[y.code] ?? "").join("") : objText(o).replace(/[\u0000-\u001f]/g, "").replace(/\s+/g, " ").trim())).filter(Boolean);
     if (!parts.length) continue;
+    // 方头括号夹着的排练号照谱面连括号写（「【A】」，`enclosure="none"`）
+    const bracket = boxed && /^【.+】$/.test(parts.join(""));
+    if (boxed && !bracket && !parts.join("").replace(/[【】]/g, "")) continue;
+    // 一个词断成几段印的（`p` + `izz`）段与段之间不加空格
+    const glue = (i: number) => (i && objs[i].box.left - objs[i - 1].box.right < (objs[i].box.bottom - objs[i].box.top) * 0.3 ? "" : " ");
     const box = {
       left: Math.min(...objs.map((o) => o.box.left)),
       right: Math.max(...objs.map((o) => o.box.right)),
@@ -1057,15 +1259,18 @@ export function attachDirectionTexts(
     }
     if (!stf) continue;
     const row = notes.filter((n) => n.staff === stf && !n.chordExtra && !n.grace).sort((a, b) => a.x - b.x);
-    const note = row.find((n) => n.x >= box.left - sp) ?? row[row.length - 1];
+    // 分段印的「【」不算挂音的左端（照括号挂会落到前一个音上，琵琶 m49）
+    const anchor = bracket && objs.length > 1 && objText(objs[0]).trim() === "【" ? objs[1].box.left : box.left;
+    const note = row.find((n) => n.x >= anchor - sp) ?? row[row.length - 1];
     if (!note) continue;
-    const s = parts.join(" ");
+    const s = bracket ? parts.join("") : objs.length === parts.length ? parts.map((p, i) => glue(i) + p).join("").trim() : parts.join(" ");
     const metro = isTempo && s.includes("=") ? METRO_TEXT_RE.exec(s) : null;
     if (metro) {
       const bpm = Number(metro[3]);
       // 印在圆括号里（`Andante (q = 76)`）：等号段前紧挨左括号或数后紧跟右括号
       const paren = /[(（]\s*$/.test(s.slice(0, metro.index)) || /^\s*[)）]/.test(s.slice(metro.index + metro[0].length));
       note.metronome = { unit: METRO_UNIT[metro[1] ?? "q"] ?? "quarter", bpm, ...(metro[2] ? { text: `c. ${bpm}` } : {}), ...(paren ? { parentheses: true } : {}) };
+      note.tempoBox = box;
       const words = s.slice(0, metro.index).replace(/[\s(（]+$/, "").trim();
       if (words) {
         note.tempoText = words;
@@ -1075,6 +1280,6 @@ export function attachDirectionTexts(
     }
     const plain = isTempo ? s.replace(/\s*=\s*$/, "") : s;
     if (!plain) continue;
-    (note.words ??= []).push({ text: plain, above: cy < (stf.box.top + stf.box.bottom) / 2, ...(size > 0 ? { size } : {}), ...(boxed ? { rehearsal: true } : {}) });
+    (note.words ??= []).push({ text: plain, above: cy < (stf.box.top + stf.box.bottom) / 2, ...(size > 0 ? { size } : {}), ...(boxed ? { rehearsal: true } : {}), ...(bracket ? { bracket: true } : {}), box });
   }
 }

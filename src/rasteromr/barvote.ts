@@ -75,8 +75,8 @@ const SYS_LINE_DX = 6;
 export function bridgeFaintSysLines(pg: SPage, bin: Binary, sp: number): void {
   const groups = systemGroups(pg);
   const linked = (a: Staff, b: Staff) => {
-    const y0 = Math.round(a.box.bottom + sp * 0.5);
-    const y1 = Math.round(b.box.top - sp * 0.5);
+    const y0 = Math.round(a.bottomAt(a.box.left) + sp * 0.5);
+    const y1 = Math.round(b.topAt(b.box.left) - sp * 0.5);
     if (y1 - y0 < sp * 2) return false;
     const ink = (x: number, y: number) => x >= 0 && x < bin.w && bin.data[y * bin.w + x] === 1;
     // 下面那行的左端量短了（淡得只剩后半截）时，线在两行左端之间的某一列；差得太远的是缩进不同的两个系统，只看上面那行的
@@ -99,8 +99,8 @@ export function bridgeFaintSysLines(pg: SPage, bin: Binary, sp: number): void {
   const flush = () => {
     if (run.length > 1) {
       const sts = run.flat();
-      const top = Math.min(...sts.map((s) => s.box.top));
-      const bottom = Math.max(...sts.map((s) => s.box.bottom));
+      const top = Math.min(...sts.map((s) => s.topAt(s.box.left)));
+      const bottom = Math.max(...sts.map((s) => s.bottomAt(s.box.left)));
       const left = Math.min(...sts.map((s) => s.box.left));
       pg.objs.push(makeSysBracketObj(pg.objs.length + pg.segs.length + 1, { x: left - sp, y: top, w: sp * 0.5, h: bottom - top }));
     }
@@ -129,9 +129,10 @@ export function inkSystemBarlines(pg: SPage, bin: Binary, sp: number): void {
   const barAt = makeBarAt(bin, sp);
   for (const g of systemGroups(pg)) {
     if (g.length < 2) continue;
-    const lands = (y: number) => g.some((st) => Math.abs(y - st.box.top) <= tol || Math.abs(y - st.box.bottom) <= tol);
+    // 谱表上下界按竖线的 x 取（弯、斜的谱线，`Staff.topAt`）
+    const lands = (y: number, x: number) => g.some((st) => Math.abs(y - st.topAt(x)) <= tol || Math.abs(y - st.bottomAt(x)) <= tol);
     const barOn = (l: Seg, st: Staff) =>
-      l.isV && (!l.hasAnyTag() || l.hasTag("BarLine")) && l.top <= st.box.top + tol && l.bottom >= st.box.bottom - tol && lands(l.top) && lands(l.bottom) && Math.abs(st.box.left - l.cx) >= sp;
+      l.isV && (!l.hasAnyTag() || l.hasTag("BarLine")) && l.top <= st.topAt(l.cx) + tol && l.bottom >= st.bottomAt(l.cx) - tol && lands(l.top, l.cx) && lands(l.bottom, l.cx) && Math.abs(st.box.left - l.cx) >= sp;
     for (const a of g)
       for (const l of pg.segs.filter((q) => barOn(q, a))) {
         const lack = g.filter((b) => b !== a && !pg.segs.some((m) => barOn(m, b) && Math.abs(m.cx - l.cx) <= xTol));
@@ -142,7 +143,7 @@ export function inkSystemBarlines(pg: SPage, bin: Binary, sp: number): void {
         if (xs.some((x) => x === null)) continue;
         lack.forEach((b, i) => {
           const x = xs[i]!;
-          pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: x, y0: b.box.top, x1: x, y1: b.box.bottom, lw: l.lw, maxLw: l.lw });
+          pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: x, y0: b.topAt(x), x1: x, y1: b.bottomAt(x), lw: l.lw, maxLw: l.lw });
         });
       }
     // **各行都没抽出竖段的小节线**：淡印的页上下两行同时漏（助我进深歌每个系统漏一两条，上面那一趟要有一行抽得出才补得了）。
@@ -156,8 +157,8 @@ export function inkSystemBarlines(pg: SPage, bin: Binary, sp: number): void {
       if (xs.some((q) => q === null)) continue;
       if (g.slice(1).some((b, i) => have(b, xs[i]!))) continue;
       const lw = Math.max(1, first.lines[0]?.lw ?? 1);
-      pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: x, y0: first.box.top, x1: x, y1: first.box.bottom, lw, maxLw: lw });
-      g.slice(1).forEach((b, i) => pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: xs[i]!, y0: b.box.top, x1: xs[i]!, y1: b.box.bottom, lw, maxLw: lw }));
+      pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: x, y0: first.topAt(x), x1: x, y1: first.bottomAt(x), lw, maxLw: lw });
+      g.slice(1).forEach((b, i) => pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: xs[i]!, y0: b.topAt(xs[i]!), x1: xs[i]!, y1: b.bottomAt(xs[i]!), lw, maxLw: lw }));
       x += Math.round(sp);
     }
   }
@@ -176,7 +177,7 @@ export function dropLoneBarlines(pg: SPage, bin: Binary, sp: number): void {
   const barAt = makeBarAt(bin, sp);
   for (const g of systemGroups(pg)) {
     if (g.length < 2) continue;
-    const on = (l: Seg, st: Staff) => l.bottom > st.box.top + sp && l.top < st.box.bottom - sp;
+    const on = (l: Seg, st: Staff) => l.bottom > st.topAt(l.cx) + sp && l.top < st.bottomAt(l.cx) - sp;
     const bars = pg.segs.filter((l) => l.isV && l.hasTag("BarLine") && g.some((st) => on(l, st)));
     for (const l of bars) {
       const own = g.filter((st) => on(l, st));
@@ -198,14 +199,17 @@ export function dropLoneBarlines(pg: SPage, bin: Binary, sp: number): void {
  * 剩下的两截各自伸出谱表三四分之一格、又不落在任何一行的外线上，`findBarlines` 当它是符干，这一处的小节线就丢了。
  * 两截各盖满一行谱（两端离外线不过 `THROUGH_END` 格）、同 x、中间那一段原图上**每行都有墨**，就是同一根。
  */
-export function joinThroughBars(bin: Binary, segs: LineSeg[], staves: [number, number][], sp: number): LineSeg[] {
+export function joinThroughBars(bin: Binary, segs: LineSeg[], staves: ((x: number) => [number, number])[], sp: number): LineSeg[] {
   const top = (v: LineSeg) => Math.min(v.y0, v.y1);
   const bot = (v: LineSeg) => Math.max(v.y0, v.y1);
   const cx = (v: LineSeg) => (v.x0 + v.x1) / 2;
   const tol = sp * THROUGH_END;
   /** 这一截盖满第几行谱（没有返回 -1） */
-  const coverOf = (v: LineSeg) => staves.findIndex(([a, b]) => Math.abs(top(v) - a) <= tol && Math.abs(bot(v) - b) <= tol);
-  const rows = [...staves].sort((a, b) => a[0] - b[0]);
+  // 各行谱的首末线按竖段所在 x 取（弯、斜的谱线）
+  const coverOf = (v: LineSeg) => staves.findIndex((f) => {
+    const [a, b] = f(cx(v));
+    return Math.abs(top(v) - a) <= tol && Math.abs(bot(v) - b) <= tol;
+  });
   const cand = segs.filter((v) => bot(v) - top(v) > Math.abs(v.x1 - v.x0) && coverOf(v) >= 0).sort((a, b) => top(a) - top(b));
   const used = new Set<LineSeg>();
   const out: LineSeg[] = [];
@@ -217,7 +221,10 @@ export function joinThroughBars(bin: Binary, segs: LineSeg[], staves: [number, n
       for (const b of cand) {
         if (b === a || used.has(b) || top(b) <= bot(cur) || Math.abs(cx(b) - cx(cur)) > sp * 0.2) continue;
         // 中间不能隔着别的谱行
-        if (rows.some(([ra, rb]) => ra > bot(cur) + tol && rb < top(b) - tol)) continue;
+        if (staves.some((f) => {
+          const [ra, rb] = f(cx(cur));
+          return ra > bot(cur) + tol && rb < top(b) - tol;
+        })) continue;
         const x = Math.round((cx(b) + cx(cur)) / 2);
         let solid = true;
         for (let y = Math.ceil(bot(cur)); y <= Math.floor(top(b)) && solid; y++) {
@@ -241,7 +248,7 @@ export function joinThroughBars(bin: Binary, segs: LineSeg[], staves: [number, n
   // 符干不会把上下两行谱都盖满；剪到所盖各行最外的两条线上，就是一根正经的贯穿小节线。
   const clip = (v: LineSeg): LineSeg => {
     if (bot(v) - top(v) <= Math.abs(v.x1 - v.x0)) return v;
-    const cov = rows.filter(([ra, rb]) => top(v) <= ra + sp * 0.3 && bot(v) >= rb - sp * 0.3);
+    const cov = staves.map((f) => f(cx(v))).sort((p, q) => p[0] - q[0]).filter(([ra, rb]) => top(v) <= ra + sp * 0.3 && bot(v) >= rb - sp * 0.3);
     if (cov.length < 2) return v;
     const ya = cov[0][0];
     const yb = cov[cov.length - 1][1];
@@ -265,7 +272,7 @@ export function voteSystemBarlines(pg: SPage, bin: Binary, sp: number): void {
   const barAt = makeBarAt(bin, sp);
   for (const g of systemGroups(pg)) {
     if (g.length < 3) continue;
-    const on = (l: Seg, st: Staff) => l.bottom > st.box.top + sp && l.top < st.box.bottom - sp;
+    const on = (l: Seg, st: Staff) => l.bottom > st.topAt(l.cx) + sp && l.top < st.bottomAt(l.cx) - sp;
     const bars = pg.segs.filter((l) => l.isV && l.hasTag("BarLine") && g.some((st) => on(l, st))).sort((a, b) => a.cx - b.cx);
     // 归簇：与簇里最后一根相距不过 xTol
     const clusters: Seg[][] = [];
@@ -284,7 +291,7 @@ export function voteSystemBarlines(pg: SPage, bin: Binary, sp: number): void {
           if (rows.includes(st)) continue;
           // 行末那一根各行右端参差，离本行右端一格半以内的不补（本行的右界就是它）
           if (x > st.box.right - sp * 1.5 || x < st.box.left + sp) continue;
-          pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: x, y0: st.box.top, x1: x, y1: st.box.bottom, lw, maxLw: lw }).addTag("BarLine");
+          pushSeg(pg, pg.objs.length + pg.segs.length + 1, { x0: x, y0: st.topAt(x), x1: x, y1: st.bottomAt(x), lw, maxLw: lw }).addTag("BarLine");
         }
       } else if (rows.length * 3 <= g.length) {
         const others = g.filter((st) => !rows.includes(st));
@@ -346,8 +353,8 @@ function makeBarAt(bin: Binary, sp: number): (st: Staff, cx: number, range: numb
   };
   /** st 这一行在 cx 左右 range 像素内有没有一根小节线模样的竖墨；有则返回它的列。`through`：不查上下伸不伸出谱表 */
   return (st: Staff, cx: number, range: number, strict = false, through = false): number | null => {
-    const top = Math.round(st.box.top);
-    const bottom = Math.round(st.box.bottom);
+    const top = Math.round(st.topAt(cx));
+    const bottom = Math.round(st.bottomAt(cx));
     const rows = bottom - top + 1;
     for (let d = 0; d <= range; d++)
       for (const x of d ? [Math.round(cx) - d, Math.round(cx) + d] : [Math.round(cx)]) {
