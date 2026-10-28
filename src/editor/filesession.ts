@@ -8,10 +8,10 @@ import { isTauriRuntime, saveBytes } from "./fileio";
 import { DOC_EXT, acceptAttr, isProjectFile } from "../common/filetypes";
 import { clearDraft, loadDraft, saveDraft, type Draft } from "./autosave";
 import { formatOf, type DocFormatId, type FormatAdapter } from "./formats";
-import { describeLosses, planSave } from "../model/capability";
+import { describeLosses, planSave } from "../convert/capability";
 import { packProject, PROJECT_EXT, type ProjectSnapshot } from "./omrproject";
 import { clearLastFile, loadLastFile, saveLastFile } from "./settings";
-import { targetSpec, type ConvertTarget } from "../model/convert";
+import { targetSpec, type ConvertTarget } from "../convert/targets";
 import { showConfirmDialog } from "./dialogs";
 import { t } from "../i18n";
 import { targetLabel } from "../i18n/labels";
@@ -28,7 +28,7 @@ export interface FileHost {
   importBytes(bytes: Uint8Array, name: string): void;
   openProject(bytes: Uint8Array, name: string, opts?: { draft?: boolean }): Promise<boolean>;
   adoptText(format: DocFormatId, text: string, filePath: string | null): void;
-  loadBookSheet(): Promise<void>;
+  readonly style: { loadBookSheet(): Promise<void> };
   onDocumentOpened(): Promise<void>;
   /** 当前文档的 `ScoreDoc`（丢失清单要用） */
   scoreDoc(): ScoreDoc | null;
@@ -59,7 +59,7 @@ export class FileSession {
         if (!(await this.host.openProject(bytes, path))) throw new Error("bad project");
       } else this.host.importBytes(bytes, path);
       this.host.filePath = path;
-      void this.host.loadBookSheet();
+      void this.host.style.loadBookSheet();
       return true;
     } catch {
       // 文件已被移动/删除/不可读 — 忘掉它，回退到示例
@@ -148,7 +148,7 @@ export class FileSession {
     this.rememberLastFile(dest);
   }
 
-  /** 跨格式另存为：**先算会丢什么，列给用户，确认了再写**（`model/capability.ts`）。
+  /** 跨格式另存为：**先算会丢什么，列给用户，确认了再写**（`convert/capability.ts`）。
    *  同格式存回不走这条——那是原文进原文出。 */
   async saveAsFormat(target: ConvertTarget): Promise<void> {
     const doc = this.host.scoreDoc();

@@ -8,8 +8,10 @@ import { mergeToChars } from "../omrkit/charcells";
 import { surfaceFromBinary, type Surface } from "../omrkit/surface";
 import { clusterByY, median, overlapRatioX, overlapRatioY, unionRect, unionRects } from "../omrkit/geom";
 import { accidentalOf } from "./accidental";
+import { isSlashInk } from "./inkprobe";
 import { probe } from "./probe";
-import { CREDIT_PREFIX_RE, CREDIT_SUFFIX_RE, CREDIT_ROLE_TAIL_RE, LATIN_NAME_RE, CREDIT_YEAR_RE, LATIN_PAREN_RE, effectiveCharH, betterTitle } from "../omrkit/headertext";
+import { chordCoverage, isAnnotationLine } from "../omrkit/chordgrammar";
+import { CREDIT_PREFIX_RE, CREDIT_SUFFIX_RE, CREDIT_ROLE_TAIL_RE, LATIN_NAME_RE, CREDIT_YEAR_RE, LATIN_PAREN_RE, LATIN_BARE_NAME_RE, YEARS_RE, effectiveCharH, betterTitle } from "../omrkit/headertext";
 import { charsForText, gapWideAt, recoverHanziGaps, recoverSpacesByInk } from "../omrkit/textspace";
 
 const rcyOf = (r: Rect) => r.y + r.h / 2;
@@ -28,6 +30,8 @@ export interface HeaderInfo {
   numberSide?: "left" | "right";
   /** 著作者整行文本（如 "作词：叶薇心"），下游作为 credit 写入 WordsByAndMusicBy。 */
   credits: string[];
+  /** 印在标题左边的署名（左上角），按行。→ `pageText.topLeft`（诗歌本 `TL:`、123 `I:topleft`）。 */
+  creditsTopLeft?: string[];
   /** 调号五度圈数（识别到 "1=♭B" 等时给出，否则 undefined→上游用默认 0）。 */
   fifths?: number;
   /** 印的是小调（`Em 4/4`、「A 小调」）：`fifths` 已是关系大调的，主音唱名 6。 */
@@ -89,7 +93,9 @@ function parseMeta(lines: HLine[]): MetaInfo {
   // 升降号**印在音名右上角**的写法（`1=E♭`）同样要认，但只在 `1=` 锚定的形里认——不带 `1=`
   // 的裸后缀形（"Ab"、"Fb"）在英文碎片里遍地都是，一放开就满页误判。
   for (const l of lines) {
-    const acc = l.text.match(/1\s*[=＝]\s*([b#♭♯])\s*([A-G])/) || l.text.match(/([b#♭♯])\s*([A-G])(?![a-z])/);
+    // 裸形 `♭B` 不认整行和弦（青年诗歌 49《祂来过》首谱行上方的 `ᵇB(C)Am(Bm)` 落进页眉，调号 `F/G` 读成了 ♭B，那两个和弦也让给了页眉）
+    const chordRow = isAnnotationLine(l.text) && chordCoverage(l.text).count >= 2;
+    const acc = l.text.match(/1\s*[=＝]\s*([b#♭♯])\s*([A-G])/) || (chordRow ? null : l.text.match(/([b#♭♯])\s*([A-G])(?![a-z])/));
     if (acc) { const f = toFifths(acc[2], acc[1]); if (f !== undefined) { res.fifths = f; res.fifthsLine = l; break; } }
     const post = l.text.match(/1\s*[=＝]\s*([A-G])\s*([b#♭♯])(?![a-z])/);
     if (post) { const f = toFifths(post[1], post[2]); if (f !== undefined) { res.fifths = f; res.fifthsLine = l; break; } }
@@ -373,11 +379,13 @@ function joinRowPieces(ls: readonly HLine[]): HLine[] {
 }
 
 /** 拉开字距排的标题（青年诗歌 2「真　　爱」）：det 一字一框、框距近两个字高，`joinRowPieces` 的 1.5 字高门槛并不上，
- *  单字又过不了「至少两个汉字」的标题门。**同一排、字号相近、页上最大一号的单个汉字**逐个并成一行——
- *  只并单字框，带别的字符的框（书眉「002—青年诗歌」、调号）不动。 */
+ *  单字又过不了「至少两个汉字」的标题门。**同一排、字号相近、页上最大一号的纯汉字短框**逐个并成一行——
+ *  带别的字符的框（书眉「002—青年诗歌」、调号）不动。det 也会切成「两字 + 一字」、两框还交叠一截
+ *  （青年诗歌 49「祂　來　過」读成 `祂來` | `過`，后框左缘探进前框 50px），故收 1~3 字、容半个字高的交叠。 */
 function joinSpacedTitleChars(ls: readonly HLine[]): HLine[] {
-  const maxH = Math.max(0, ...ls.map((l) => l.charH));
-  const single = (l: HLine) => /^[一-鿿]$/.test(l.text.trim()) && l.charH >= maxH * 0.8;
+  // 尺子只量纯汉字框：书眉「青年诗歌—049」的大号斜体页码把框撑到 128，标题「過」102 就不够八成
+  const maxH = Math.max(0, ...ls.filter((l) => /^[一-鿿]+$/.test(l.text.trim())).map((l) => l.charH));
+  const single = (l: HLine) => /^[一-鿿]{1,3}$/.test(l.text.trim()) && l.charH >= maxH * 0.8;
   const sorted = ls.filter(single).sort((a, b) => a.bbox.x - b.bbox.x);
   const used = new Set<HLine>();
   const merged: HLine[] = [];
@@ -389,7 +397,7 @@ function joinSpacedTitleChars(ls: readonly HLine[]): HLine[] {
       if (used.has(b) || b === a) continue;
       const h = Math.max(cur.charH, b.charH);
       const gap = b.bbox.x - (cur.bbox.x + cur.bbox.w);
-      if (Math.abs(b.cy - cur.cy) > h * 0.3 || h > Math.min(cur.charH, b.charH) * 1.25 || gap < 0 || gap > h * 4) continue;
+      if (Math.abs(b.cy - cur.cy) > h * 0.3 || h > Math.min(cur.charH, b.charH) * 1.25 || gap < -h * 0.5 || gap > h * 4) continue;
       if (n === 1) used.add(a);
       used.add(b);
       n += 1;
@@ -400,6 +408,31 @@ function joinSpacedTitleChars(ls: readonly HLine[]): HLine[] {
     if (n > 1) merged.push(cur);
   }
   return merged.length ? [...ls.filter((l) => !used.has(l)), ...merged] : [...ls];
+}
+
+/** 破折号连着的两截标题（青年诗歌 60「经历基督——作牧人」）：det 切成「经历基督」|「——作牧人」两框、还交叠半个字高，
+ *  标题只取得到一截（宽的那截），副标题也因标题中心偏了过不了居中那道门。**同一排、字号都是页上最大一号**的两框，
+ *  交界处有破折号（前框以它收尾或后框以它起头）、其余全是汉字的才并：书眉「060—青年诗歌」带数字，不动。 */
+function joinDashTitle(ls: readonly HLine[]): HLine[] {
+  const maxH = Math.max(0, ...ls.filter((l) => /^[一-鿿]+$/.test(l.text.trim())).map((l) => l.charH));
+  const piece = (l: HLine) => /^[—–－-]*[一-鿿]+[—–－-]*$/.test(l.text.trim()) && l.charH >= maxH * 0.8;
+  const sorted = ls.filter(piece).sort((a, b) => a.bbox.x - b.bbox.x);
+  for (let i = 0; i + 1 < sorted.length; i++) {
+    const a = sorted[i]!, b = sorted[i + 1]!;
+    const ta = a.text.trim(), tb = b.text.trim();
+    const h = Math.max(a.charH, b.charH);
+    const gap = b.bbox.x - (a.bbox.x + a.bbox.w);
+    if (Math.abs(b.cy - a.cy) > h * 0.3 || h > Math.min(a.charH, b.charH) * 1.25 || gap < -h || gap > h * 1.5) continue;
+    if (!/[—–－-]$/.test(ta) && !/^[—–－-]/.test(tb)) continue;
+    if (/^[—–－-]/.test(ta) || /[—–－-]$/.test(tb)) continue;
+    probe("header.dashTitle");
+    const bbox = unionRect(a.bbox, b.bbox);
+    const text = (ta + tb).replace(/[—–－-]+/, "——");
+    const chars = a.chars && b.chars ? [...a.chars, ...b.chars] : undefined;
+    const joined: HLine = { text, charH: h, cx: bbox.x + bbox.w / 2, cy: bbox.y + bbox.h / 2, n: a.n + b.n, bbox, chars };
+    return [...ls.filter((l) => l !== a && l !== b), joined];
+  }
+  return [...ls];
 }
 
 function mergeStackedColumns(comps: Component[], numH: number): Component[] {
@@ -490,7 +523,7 @@ export async function recognizeHeader(
         w: Math.round(r.w + pad * 2), h: Math.round(r.h + pad * 2) }));
     }
     if (dets.length) {
-      const lines: HLine[] = splitInlineKey(dets.map((d) => ({ text: d.text, charH: d.bbox.h, cx: d.bbox.x + d.bbox.w / 2, cy: d.bbox.y + d.bbox.h / 2, n: 1, bbox: d.bbox, chars: d.chars })));
+      const lines: HLine[] = await splitMixedRows(splitInlineKey(dets.map((d) => ({ text: d.text, charH: d.bbox.h, cx: d.bbox.x + d.bbox.w / 2, cy: d.bbox.y + d.bbox.h / 2, n: 1, bbox: d.bbox, chars: d.chars }))));
       if ((globalThis as { __omrDebug?: boolean }).__omrDebug) console.log("[header/det]", lines.map((l) => `${Math.round(l.charH)}px@${Math.round(l.cx)},${Math.round(l.cy)}w${Math.round(l.bbox.w)}=${JSON.stringify(l.text)}`).join("  "));
       probe("header.det");
       await classify(lines);
@@ -557,6 +590,58 @@ export async function recognizeHeader(
   await classify(lines);
   return out;
 
+  /**
+   * det 把一排高矮悬殊的几段并成一框（赞美诗歌1384 942《万古磐石》：左上两行小字署名的头一行、`1=♭B`、竖排 3/4、
+   * 大号标题连成一片 124px 高的框，rec 读成「作：热新1=B3万古磐石」——被当成署名，标题整个丢了）。回源图按墨拆：
+   * 框里的连通块（另有更小的 det 框套着的归那一框）按横向交叠并成列，**左端**一串同排的矮列（墨高不到右端大字的
+   * 五成五、至少三列）、**右端**一串够高够方的大字（至少两列）两头都凑得出才拆，各自重新 rec；夹在中间的
+   * （调号）也单独 rec，几何法认成拍号的墨剔掉不读。两头凑不齐就原样——寻常的「曲号 标题」「4/4 标题」都不动。
+   */
+  async function splitMixedRows(ls: HLine[]): Promise<HLine[]> {
+    const out: HLine[] = [];
+    const src = surfaceFromBinary(bin);
+    const inBox = (c: Component, b: Rect) => c.cx >= b.x && c.cx <= b.x + b.w && c.cy >= b.y && c.cy <= b.y + b.h;
+    const inMeter = (b: Rect) => !!geoMeters?.some((m) => overlapRatioX(m.bbox, b) > 0.5 && overlapRatioY(m.bbox, b) > 0.5);
+    for (const l of ls) {
+      if (l.bbox.h < numH * 1.8) { out.push(l); continue; }
+      const area = l.bbox.w * l.bbox.h;
+      const own = comps.filter((c) => inBox(c, l.bbox) && !ls.some((o) => o !== l && o.bbox.w * o.bbox.h < area && inBox(c, o.bbox)))
+        .sort((a, b) => a.bbox.x - b.bbox.x);
+      // 列：横向交叠过窄者三成的并成一列（竖排拍号的分子、分母、分数线并成一列；挨着的两个字只蹭到边的不并）
+      const cols: Rect[] = [];
+      for (const c of own) {
+        const last = cols[cols.length - 1];
+        const ov = last ? Math.min(last.x + last.w, c.bbox.x + c.bbox.w) - Math.max(last.x, c.bbox.x) : -1;
+        if (last && ov > Math.min(last.w, c.bbox.w) * 0.3) cols[cols.length - 1] = unionRect(last, c.bbox);
+        else cols.push({ ...c.bbox });
+      }
+      // 右端大字：够高（框高六成）、够方（宽过高七成）
+      let r = cols.length;
+      while (r > 0 && cols[r - 1].h >= l.bbox.h * 0.6 && cols[r - 1].w >= cols[r - 1].h * 0.7) r--;
+      if (cols.length - r < 2) { out.push(l); continue; }
+      const bigH = median(cols.slice(r).map((b) => b.h));
+      // 左端矮字：与这一串的墨带上下交叠过矮者一半；冒号点、言字旁的点这类小碎块中心落在墨带里就跟着走
+      let band = cols[0], k = 1;
+      if (band.h >= bigH * 0.55) { out.push(l); continue; }
+      for (; k < r; k++) {
+        const b = cols[k];
+        if (b.h < band.h * 0.3) { if (rcyOf(b) >= band.y && rcyOf(b) <= band.y + band.h) { band = unionRect(band, b); continue; } break; }
+        const ov = Math.min(band.y + band.h, b.y + b.h) - Math.max(band.y, b.y);
+        if (b.h >= bigH * 0.55 || ov < Math.min(band.h, b.h) * 0.5) break;
+        band = unionRect(band, b);
+      }
+      if (k < 3) { out.push(l); continue; }
+      const segs = [cols.slice(0, k), cols.slice(k, r).filter((b) => !inMeter(b)), cols.slice(r)].filter((s) => s.length);
+      const texts = await recognizeTexts(segs.map((s) => buildStrip(src, s)));
+      probe("header.splitMixedRow");
+      segs.forEach((s, i) => {
+        const bbox = unionRects(s);
+        out.push({ text: texts[i], charH: bbox.h, cx: bbox.x + bbox.w / 2, cy: bbox.y + bbox.h / 2, n: s.length, bbox });
+      });
+    }
+    return out;
+  }
+
   // 归类：以 作/词/曲/编/译 开头紧跟冒号(作词：/词曲：…) → credits；其余最大字号中文行作标题。
   // 著作者前缀须**行首**紧贴冒号——否则长句经文副标题("…正如他作更美之约…来8：6")也会因含"作"+"："被误判。
   /** 读一组紧挨着的调号块（音名 + 可选升降号，1~3 块）：位置明显偏高、竖长、形状判得出 ♭/♯ 的是升降号
@@ -608,18 +693,7 @@ export async function recognizeHeader(
    *  - **`=`**：两道上下对齐的扁横，左边紧挨一个读得出 1 的块——`二`/`三` 的横笔、`♩=95` 的 `=` 都靠这一条挡掉；
    *    音名组取 `=` 右侧紧挨着的块。
    *  - **拍号**：几何法认出的页眉分数拍号（geoMeters）或斜杠式拍号，音名组取它左侧紧挨着的块（不写 `1=` 的谱）。 */
-  /** 斜杠 `/`：墨集中在右上—左下那条对角带上（左上、右下两角基本空着）。 */
-  function isSlash(b: Rect): boolean {
-    let diag = 0, off = 0;
-    for (let y = Math.round(b.y); y < Math.round(b.y + b.h); y++) {
-      for (let x = Math.round(b.x); x < Math.round(b.x + b.w); x++) {
-        if (!bin.data[y * bin.w + x]) continue;
-        const u = (x - b.x) / Math.max(1, b.w - 1), v = (y - b.y) / Math.max(1, b.h - 1);
-        if (Math.abs(u + v - 1) <= 0.35) diag++; else off++;
-      }
-    }
-    return diag >= 8 && off <= diag * 0.15;
-  }
+  function isSlash(b: Rect): boolean { return isSlashInk(bin, b); }
 
   /** `=` 的一道横：扁、薄、不比一个字宽。 */
   // 宽上限 1.6 字号（原 1.2）：多段歌词的页上 numH 常被偏旁碎块压小（补充本 151 估成 19，数字实高 35），
@@ -652,8 +726,9 @@ export async function recognizeHeader(
    *  超过 max 块返回空（不是一个孤立的符号组）。 */
   function chainFrom(pool: Component[], edge: number, dir: 1 | -1, band: Rect, firstGap: number,
     max = 3, skip: (k: Component) => boolean = () => false): Component[] {
+    // 起点容 2px 交叠：连成一块的「♭B」左缘压进 `=` 右缘 1px（942《万古磐石》），严格比就整块漏掉
     const cands = pool
-      .filter((k) => !isBar(k) && !skip(k) && (dir > 0 ? k.bbox.x >= edge : k.bbox.x + k.bbox.w <= edge))
+      .filter((k) => !isBar(k) && !skip(k) && (dir > 0 ? k.bbox.x >= edge - 2 : k.bbox.x + k.bbox.w <= edge + 2))
       .filter((k) => k.bbox.y <= band.y + band.h && k.bbox.y + k.bbox.h >= band.y)
       .sort((a, b) => dir * (a.bbox.x - b.bbox.x));
     const group: Component[] = [];
@@ -770,8 +845,10 @@ export async function recognizeHeader(
         edge = next.bbox.x + next.bbox.w;
       }
       if (dbg) console.log("[header/tempoChain]", digits.map((k) => `${k.bbox.x},${k.bbox.y} ${k.bbox.w}x${k.bbox.h}`).join(" | "));
-      if (digits.length < 2 || digits.length > 3) continue;
-      const ds = await ocr.recognizeNumerals(bin, digits.map((k) => k.bbox));
+      // 粘成一块的几位（赞美诗歌1384 946 `♩=140` 的「40」53×39）：按宽高比估位数、在中段墨最少的那一列切开逐位读
+      const cells = digits.flatMap((k) => splitGluedDigits(k.bbox));
+      if (cells.length < 2 || cells.length > 3) continue;
+      const ds = await ocr.recognizeNumerals(bin, cells);
       if (dbg) console.log("[header/tempoDigits]", ds.join(","));
       if (ds.some((d) => d === undefined)) continue;
       const bpm = Number(ds.join(""));
@@ -779,6 +856,23 @@ export async function recognizeHeader(
       return { bpm, beat: dotted ? { num: 3, den: 8 } : { num: 1, den: 4 }, bbox: unionRects([note.bbox, eq, ...digits.map((k) => k.bbox)]) };
     }
     return undefined;
+  }
+
+  /** 数字宽约字高六成五：宽出一位以上的块按位数切开，每刀落在等分点前后两成宽里墨最少的那一列。 */
+  function splitGluedDigits(b: Rect): Rect[] {
+    const n = Math.round(b.w / (b.h * 0.65));
+    if (n < 2 || n > 3) return [b];
+    probe("tempo.splitGlued");
+    const ink = (x: number) => { let c = 0; for (let y = b.y; y < b.y + b.h; y++) c += bin.data[y * bin.w + x]!; return c; };
+    const cuts = [b.x];
+    for (let i = 1; i < n; i++) {
+      const mid = b.x + Math.round((b.w * i) / n), span = Math.round((b.w / n) * 0.2);
+      let best = mid;
+      for (let x = mid - span; x <= mid + span; x++) if (ink(x) < ink(best)) best = x;
+      cuts.push(best);
+    }
+    cuts.push(b.x + b.w);
+    return cuts.slice(0, -1).map((x, i) => ({ x, y: b.y, w: Math.max(1, cuts[i + 1]! - x), h: b.h }));
   }
 
   async function keyByGlyphs(titleLine: HLine | null, slashes: SlashGroup[]): Promise<{ fifths: number; bbox: Rect; viaMeter?: boolean } | undefined> {
@@ -858,7 +952,9 @@ export async function recognizeHeader(
     const sameRowDet = (b: Rect, h: number) => overlapRatioY(b, tl.bbox) >= 0.3 && h >= tl.charH * 0.5 &&
       (b.x + b.w / 2 >= tl.bbox.x + tl.bbox.w || b.x + b.w / 2 <= tl.bbox.x);
     const byDist = (a: Rect, b: Rect) => Math.abs(a.x + a.w / 2 - tl.cx) - Math.abs(b.x + b.w / 2 - tl.cx);
-    const det = ls.filter((l) => l !== tl && /^\s*\d{1,4}\s*[.．、]?\s*$/.test(l.text) && sameRowDet(l.bbox, l.charH))
+    // 竖排拍号的墨（geoMeters）不算：det 常把分子或整个拍号单框成一个「4」，比真曲号离标题近（赞美诗歌1384 936、940 曲号读成 4）
+    const meterBox = (b: Rect) => !!geoMeters?.some((m) => overlapRatioX(m.bbox, b) > 0.5 && overlapRatioY(m.bbox, b) > 0.5);
+    const det = ls.filter((l) => l !== tl && /^\s*\d{1,4}\s*[.．、]?\s*$/.test(l.text) && sameRowDet(l.bbox, l.charH) && !meterBox(l.bbox))
       .sort((a, b) => byDist(a.bbox, b.bbox))[0];
     if (det) return { text: det.text.replace(/\D/g, ""), bbox: det.bbox };
     // 曲号与不写 `1=` 的调号拍号挨着印，det 并成一行（旷野人声 16《爱心的功课》：`16bE4/4`）：
@@ -933,7 +1029,7 @@ export async function recognizeHeader(
   }
 
   async function classify(lines: HLine[]) {
-    const ls = joinSpacedTitleChars(lines);
+    const ls = joinDashTitle(joinSpacedTitleChars(lines));
     const creditRe = CREDIT_PREFIX_RE;
     const creditSuffixRe = CREDIT_SUFFIX_RE;
     const creditRoleTailRe = CREDIT_ROLE_TAIL_RE;
@@ -945,8 +1041,44 @@ export async function recognizeHeader(
     const creditAt: Rect[] = [];   // 本函数收下的每条署名所在行框（与 out.credits 同序），末尾按栏重排用
     let titleLine: HLine | null = null;
     const rest: HLine[] = [];
+    // 署名续行：同一职能的第二、三位作者另起一行、只印名字（赞美诗歌1384 936「词曲：洪启元」下面叠着「陈学明」「游智婷」，
+    // 940「作词：万美兰」下面「洪启元」）。纯汉字人名、字号与上一行相近、紧贴在上一条带职能词的署名（或它的续行）下面，
+    // 且整行落在那条署名冒号后的名字那截里——左缘不到职能词（另起一条「作曲：…」的左缘与「作词」齐）。分行印的各记一条（同 GT 口径）。
+    const contOf = new Map<HLine, HLine>();       // 续行 → 它挂的那条带职能词的署名行
+    for (const ln of [...ls].sort((a, b) => a.bbox.y - b.bbox.y)) {
+      if (!/^[一-鿿·]{2,8}$/.test(ln.text.trim()) || ln.charH >= maxCharH) continue;
+      const up = ls.find((o) => {
+        const root = contOf.get(o) ?? (creditRe.test(o.text.trim()) ? o : undefined);
+        if (!root || o === ln) return false;
+        const gap = ln.bbox.y - (o.bbox.y + o.bbox.h);
+        const h = Math.max(ln.charH, o.charH);
+        return gap > -h * 0.4 && gap < h * 0.6 && h <= Math.min(ln.charH, o.charH) * 1.3 && overlapRatioX(ln.bbox, o.bbox) >= 0.6 &&
+          ln.bbox.x >= root.bbox.x + root.bbox.w * 0.25 && ln.bbox.x + ln.bbox.w <= root.bbox.x + root.bbox.w + h * 0.5;
+      });
+      if (up) contOf.set(ln, contOf.get(up) ?? up);
+    }
+    // 不带职能词的英文署名与它下面的年份行（LATIN_BARE_NAME_RE）：整行在最大字号那行中文（标题）的左边或右边，
+    // 年份行紧贴在名字行下、左缘对齐。居中的英文副标题落在标题宽度里，不进来。
+    const bigHan = ls.filter((l) => hanziCount(l.text) >= 2).sort((a, b) => b.charH - a.charH)[0];
+    const beside = (l: HLine) => !!bigHan && (l.bbox.x + l.bbox.w <= bigHan.bbox.x || l.bbox.x >= bigHan.bbox.x + bigHan.bbox.w);
+    const latinCredits = new Set(ls.filter((l) => l !== bigHan && l.charH < maxCharH && LATIN_BARE_NAME_RE.test(l.text.trim()) && beside(l)));
+    for (const ln of ls) {
+      if (!YEARS_RE.test(ln.text.trim())) continue;
+      const up = [...latinCredits].find((o) => {
+        const gap = ln.bbox.y - (o.bbox.y + o.bbox.h);
+        const h = Math.max(ln.charH, o.charH);
+        return gap > -h * 0.4 && gap < h * 0.6 && Math.abs(ln.bbox.x - o.bbox.x) < h;
+      });
+      if (up) latinCredits.add(ln);
+    }
     for (const ln of ls) {
       const txt = ln.text.trim();
+      if (contOf.has(ln)) {
+        probe("header.creditContinuation");
+        out.credits.push(txt); creditAt.push(ln.bbox);
+        out.regions.push({ text: txt, bbox: ln.bbox, chars: charsForText(txt, ln.chars) });
+        continue;
+      }
       const sm = ln.charH < maxCharH ? creditSuffixRe.exec(txt) : null;
       if (sm && !creditRe.test(txt)) {
         // 名字与职能词之间谱面上有没有空当，回源图量（rec 从不吐空格）：脚步是「盛晓玫 词曲」，
@@ -981,6 +1113,13 @@ export async function recognizeHeader(
         const yi = t.search(/\d/);
         const cr = spaceIfGap(t, yi, ln, [...t.slice(0, yi)].filter((c) => c !== " ").length);
         probe("header.creditYear");
+        out.credits.push(cr); creditAt.push(ln.bbox);
+        out.regions.push({ text: cr, bbox: ln.bbox, chars: charsForText(cr, ln.chars) });
+        continue;
+      }
+      if (latinCredits.has(ln)) {
+        const cr = YEARS_RE.test(txt) ? txt : recoverSpacesByInk(bin, txt, ln.bbox, ln.chars);
+        probe("header.creditLatinBare");
         out.credits.push(cr); creditAt.push(ln.bbox);
         out.regions.push({ text: cr, bbox: ln.bbox, chars: charsForText(cr, ln.chars) });
         continue;
@@ -1031,6 +1170,23 @@ export async function recognizeHeader(
       const order = creditAt.map((b, i) => ({ b, i })).sort((p, q) => col(p.b) - col(q.b) || p.b.y - q.b.y || p.i - q.i);
       const cs = out.credits.slice(base);
       order.forEach(({ i }, k) => { out.credits[base + k] = cs[i]!; });
+      const bs = [...creditAt];
+      order.forEach(({ i }, k) => { creditAt[k] = bs[i]!; });
+    }
+    // 整块印在标题**左边**的署名（942《万古磐石》左上角「作词：托普雷迪 / 作曲：黑斯廷斯」，标题与曲号在右）另记左上：
+    // 诗歌本文本谱的 `Z:` 排在标题下右对齐，左上角的字要写 `TL:`（123 `I:topleft`）才排得回原处
+    if (titleLine && creditAt.length) {
+      // 比标题第一个汉字的左缘：标题框常并着紧挨的拍号（946《大地音韵飘》「4大地音韵飘」），框左缘伸到署名右边
+      const tl = titleLine;
+      const first = tl.chars?.length === tl.text.length ? tl.chars.find((ch) => /[一-鿿]/.test(ch.text)) : undefined;
+      const tLeft = first ? Math.max(tl.bbox.x, first.cx - effH(tl) * 0.6) : tl.bbox.x;
+      const base = out.credits.length - creditAt.length;
+      const left = creditAt.map((b) => b.x + b.w <= tLeft);
+      if (left.some(Boolean)) {
+        probe("header.creditTopLeft");
+        out.creditsTopLeft = out.credits.slice(base).filter((_, i) => left[i]);
+        out.credits = [...out.credits.slice(0, base), ...out.credits.slice(base).filter((_, i) => !left[i])];
+      }
     }
     let numberBox: Rect | undefined;
     if (titleLine) {

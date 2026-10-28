@@ -8,8 +8,10 @@ import { punctClass } from "../common/cjkpunct";
 import { Matrix33, Point } from "../common/geom";
 // `Slur` 这个名字在 model.ts 里是**跨度对象**（哪两个音符之间有弧），
 // layout.ts 里的是**画出来的那条弧**，所以起个别名区分。
-import { GraphicPath, Group, Slur as SlurArc, TextFrame } from "../layout/pageitem";
+import { GraphicPath, Group, TextFrame } from "../pagetree/pageitem";
+import { Slur as SlurArc } from "../engrave/arc";
 import { GlyphCodes } from "../smufl/smufl";
+import { fillRect } from "../engrave/prims";
 import { BarStyle } from "../score/enums";
 import {
   LegerLayout,
@@ -20,6 +22,7 @@ import {
   GroupSymbol,
   LCR,
   LrcExtend,
+  MeasureLayout,
   PartMeasureLayout,
   MeasureText,
   MixedOptions,
@@ -35,6 +38,7 @@ import {
   TimeSig,
   Tuplet,
   Wedge,
+  ARPEGGIO_LEAD,
   mixedSlurStyle,
   fGe,
   fLt,
@@ -45,14 +49,15 @@ import {
   type HarmonyLayout,
   type StaffLayout,
 } from "./model";
-import { Font } from "../layout/font";
+import { Font } from "../pagetree/font";
 import { addEndingBracket } from "../engrave/ending";
 import { BarlineGlyph, type BarlineSpec } from "../engrave/barline";
 import { TupletGlyph } from "../engrave/tuplet";
 import { hairpinPath } from "../engrave/hairpin";
+import { arpeggioGroup } from "../engrave/arpeggio";
 import { chordTextSegs, harmonyWidth, layoutHarmonySegs } from "../engrave/chord";
 import { addLine, addSmufl, addSmuflScaled, chordGroup, STAFF_SYSTEM, translated, type StaffChordData, type StaffSystemData } from "./prims";
-import type { ItemIdentity } from "../layout/identity";
+import type { ItemIdentity } from "../pagetree/identity";
 import { drawJianpuOverlay } from "./jianpuoverlay";
 
 /** SMuFL breathMarkComma（U+E4CE）。 */
@@ -76,7 +81,66 @@ function addFilledQuad(
   g.add(p);
 }
 
+/** 断奏楔（staccatissimo）照 Sibelius 出的谱（八段锦二胡、中胡原 PDF）画实心三角：宽 0.54 格、高 0.77 格，尖朝符头。
+ *  Bravura 的 articStaccatissimo 是 0.4×1.17 格的瘦高楔，Wedge 变体也一样瘦，排出来像一道竖线。
+ *  (`cx`, `y`) 是字形原点口径：朝上（印在音上方）的从 y 往上画、尖在下；朝下的从 y 往下画、尖在上 */
+const WEDGE_W = 5.4, WEDGE_H = 7.7;
+function drawStaccatissimo(g: Group, cx: number, y: number, above: boolean): void {
+  const p = new GraphicPath();
+  p.fill = true;
+  p.stroke = false;
+  p.fillColor = 0xff000000;
+  const base = above ? y - WEDGE_H : y + WEDGE_H;
+  p.moveTo(cx - WEDGE_W / 2, base);
+  p.lineTo(cx + WEDGE_W / 2, base);
+  p.lineTo(cx, y);
+  p.close();
+  g.add(p);
+}
+
 // -----------------------------------------------------------------------
+/** 多小节休止：谱表中线上一道粗横杠（两头竖线从第二线到第四线），谱表上方印小节数。
+ *  数字照 Sibelius 出的谱（八段锦钢片琴原 PDF）用正文衬线体的普通字重、高约 1.8 格，基线在顶线上方 0.4 格；
+ *  原来用 SMuFL 拍号数字（粗、矮）。谱表坐标同别处：顶线 y=0、往下每格 10。横杠占满这一小节、两头各让 1.5 格 */
+const MULTIREST_NUM_SIZE = 27;
+function drawMultiRest(g: Group, mif: MeasureLayout, eng: MixedOptions): void {
+  const x0 = mif.dataPos + 15, x1 = mif.getEntPos(mif.dur) - 15;
+  if (x1 <= x0) return;
+  g.add(fillRect(0xff000000, x0, 15, x1 - x0, 10));
+  addLine(g, x0, 10, x0, 30, eng.lineWidths.stem * 1.5);
+  addLine(g, x1, 10, x1, 30, eng.lineWidths.stem * 1.5);
+  const t = new TextFrame();
+  t.text = String(mif.multiRest);
+  t.font = new Font(eng.wordFont, MULTIREST_NUM_SIZE);
+  t.color = 0xff000000;
+  t.x = (x0 + x1) / 2 - t.font.measureText(t.text) / 2;
+  t.y = -4;
+  g.add(t);
+}
+
+/**
+ * 全音符的震音斜线，照 Sibelius 出的谱（八段锦扬琴原 PDF 600 dpi 量的，单位 tenths、一个线距 = 10）：
+ * 每道是左右两边竖直的平行四边形，横宽 12.4、中心线左低右高升 5.3、竖向厚 3、相邻两道竖向间距 4.5——
+ * 比 Bravura 的 tremolo1–4 字形陡、窄（那个只升约 2，排出来几乎是平的）。`x0` 是左缘，(`cy`) 是整块的竖向中心。
+ */
+/** 全音符震音一道斜线的横宽（tenths） */
+const WHOLE_TREMOLO_W = 12.4;
+function drawWholeTremolo(g: Group, n: number, x0: number, cy: number): void {
+  const W = WHOLE_TREMOLO_W, R = 5.3, T = 3, S = 4.5;
+  for (let i = 0; i < n; i++) {
+    const y = cy + (i - (n - 1) / 2) * S;
+    addFilledQuad(g, x0, y + R / 2 - T / 2, x0 + W, y - R / 2 - T / 2, T);
+  }
+}
+
+/** 震音字形按墨迹中心摆到 (`cx`, `cy`) */
+function drawTremolo(g: Group, meta: { getBBox(glyph: string): { bBoxSW: number[]; bBoxNE: number[] } | null | undefined }, glyph: string, cx: number, cy: number, fs: number): void {
+  const bb = meta.getBBox(glyph);
+  const ox = bb ? ((bb.bBoxSW[0] + bb.bBoxNE[0]) / 2) * 10 : 0;
+  const oy = bb ? -((bb.bBoxSW[1] + bb.bBoxNE[1]) / 2) * 10 : 0;
+  addSmufl(g, glyph, cx - ox, cy - oy, fs);
+}
+
 // drawNotesNormal（render.cpp:953 drawNotesNormal + drawChord stem/flag）
 
 export function drawNotesNormal(
@@ -115,6 +179,11 @@ export function drawNotesNormal(
       const cue = n.size === 1 || ch.cue || ch.grace;
       const scale = ch.grace ? eng.graceSize : cue ? eng.cueSize : 1;
 
+      // 并过的多小节休止那一小节只剩一个休止（123 的 `Z` 带着 `whole` 时值，不算 measureRest，按小节认）
+      if (ch.rest && md.measureInfo.multiRest > 1) {
+        drawMultiRest(chordGrp(), md.measureInfo, eng);
+        continue;
+      }
       if (ch.measureRest) {
         const mif = md.measureInfo;
         const endPos = mif.getEntPos(mif.dur);
@@ -164,7 +233,25 @@ export function drawNotesNormal(
 
     // stem and flag (skip rests, whole notes, half notes with beams)
     if (ch.rest) continue;
-    if (ch.noteType.compareTo(new Fraction(4)) >= 0) continue; // whole: no stem
+    // 单音震音（`<tremolo type="single">`）：tremolo1–4 字形压在符干中段。全音符没有符干：照 Sibelius 出的谱（八段锦原 PDF，用户定照原谱）
+    // 画在假想符干那一侧：斜线组中心在符干起端的音头（符干朝下是最高的头，朝上是最低的头）往符干方向 1 格、音头中心右边约 1.7 格；
+    // 斜线照原谱自己画（`drawWholeTremolo`）。九份分谱量下来原谱逐处手调过（竖向 −0.5～2 格、横向 1.1～2.3 格），取多数：
+    // 二胡/高胡/琵琶在下方 1～1.5 格，和音（中阮 m92）落在两头之间；扬琴几处与音头齐平，对不上。
+    // GB/T 46846 7.8.3.3 b) 是居中画在假想符干上（音头正上 / 正下方），没照它
+    const strokes = ch.src.notations?.tremolo;
+    const tremolo = strokes ? [GlyphCodes.tremolo1, GlyphCodes.tremolo2, GlyphCodes.tremolo3, GlyphCodes.tremolo4][Math.min(4, strokes) - 1]! : "";
+    if (ch.noteType.compareTo(new Fraction(4)) >= 0) {
+      if (tremolo && headR > headL) {
+        // 全音符的 `stemUp` 没按音高算过：照符干方向的通则，离中线（谱表内 y = 20）最远的音在中线之上就朝下
+        const ys = ch.notes.map((n) => n.cy() - md.staffY(subStaff));
+        const up = 20 - Math.min(...ys) <= Math.max(...ys) - 20;
+        // 原文记了位置的（`tremoloPos`，斜线墨迹中心相对符头左缘 / 谱表顶线）照它画
+        const at = ch.src.notations?.tremoloPos;
+        if (at) drawWholeTremolo(chordGrp(), Math.min(4, strokes!), headL + at.x - WHOLE_TREMOLO_W / 2, -at.y);
+        else drawWholeTremolo(chordGrp(), Math.min(4, strokes!), headR + 2.5, up ? Math.max(...ys) - 10 : Math.min(...ys) + 10);
+      }
+      continue; // whole: no stem
+    }
 
     const sx = ch.stemX();
     // stemY local = stemY() - md.staffY(subStaff) but for sub=0 staffY=0
@@ -202,6 +289,8 @@ export function drawNotesNormal(
     }
 
     addLine(chordGrp(), sx, sy, sx, ty, eng.lineWidths.stem);
+    // 符干上离符头 3/5 处（偏符干末端，躲开符头与符杠）
+    if (tremolo) drawTremolo(chordGrp(), meta, tremolo, sx, sy + (ty - sy) * 0.6, fs);
   }
 
   // ---- notations (fermata 等) —— render.cpp:328 drawChord 非简谱分支 ----
@@ -219,6 +308,10 @@ export function drawNotesNormal(
       if (ch.stemUp && ch.noteType.compareTo(new Fraction(4)) < 0) {
         x -= ch.noteheadWidth(meta);
       }
+      if (nota.symbol === GlyphCodes.articStaccatissimoAbove || nota.symbol === GlyphCodes.articStaccatissimoBelow) {
+        drawStaccatissimo(container, x + ch.noteheadWidth(meta) / 2, nota.y, nota.symbol === GlyphCodes.articStaccatissimoAbove);
+        continue;
+      }
       // **墨迹中心对符头中心**：照原排版程序是字形原点对符头左缘，窄的顿音点就偏到左边、宽的延长号偏到右边
       const bb = meta.getBBox(nota.symbol);
       if (bb) x += ch.noteheadWidth(meta) / 2 - ((bb.bBoxSW[0] + bb.bBoxNE[0]) / 2) * 10;
@@ -232,17 +325,13 @@ export function drawNotesNormal(
       if (arp.notes.length === 0) continue;
       const n0 = arp.notes[0];
       const n1 = arp.notes[arp.notes.length - 1];
-      const y0 = md.staffY(n0.staff) + n0.cy() + 5;
-      const y1 = md.staffY(n1.staff) + n1.cy() - 5;
-      const cnt = Math.max(1, Math.ceil((y0 - y1) / 12.0));
-      const str = GlyphCodes.wiggleTrillSlow.repeat(cnt);
-      const x = md.measureInfo.getEntPos(n0.chord.offset) - 12;
-      const grp = new Group();
-      const m = new Matrix33();
-      m.setAffine([0, 1, -1, 0, x, y1]); // translate(x,y1) ∘ rotate(90°)
-      grp.matrix = m;
-      addSmufl(grp, str, 0, 0, fs);
-      container.add(grp);
+      // 照 Sibelius 出的谱（八段锦钢片琴原 PDF）：波浪线上下各伸出符头约 0.3 格，画在临时记号左边；
+      // 横向的位由 layoutpass `entryReach` 按 ARPEGGIO_RESERVE 让出
+      const y0 = md.staffY(n0.staff) + n0.cy() + 8;
+      const y1 = md.staffY(n1.staff) + n1.cy() - 8;
+      const left = arp.inkLeft(md.noteEntries);
+      const x = (Number.isFinite(left) ? left : md.measureInfo.getEntPos(n0.chord.offset)) - ARPEGGIO_LEAD;
+      container.add(arpeggioGroup(x, y1, y0, fs));
     }
   }
 
@@ -421,7 +510,7 @@ function drawSlurTied(
 ): void {
   const arc = new SlurArc();
   arc.init(new Point(plx, ply), new Point(prx, pry), mixedSlurStyle(above));
-  // 可视化编辑认弧：起止和弦的元素 id（身份标签，`layout/identity.ts`）
+  // 可视化编辑认弧：起止和弦的元素 id（身份标签，`pagetree/identity.ts`）
   const s = obj.startNote?.chord.src.id;
   const e = obj.endNote?.chord.src.id;
   if (s !== undefined && e !== undefined) arc.ident = { kind: "slur", id: s, end: e };
@@ -822,7 +911,10 @@ export function drawLrc(
       pref.font = lrc.font;
       pref.color = 0xff000000;
       const cnt = lrc.prefix.length;
-      pref.x = x - (40 + (cnt - 2) * 12);
+      // 段号按墨迹摆：右缘离首字左缘留 0.3 字号；成书照 musicpp 的固定偏移（逐位不变）
+      pref.x = eng.verseLabelByInk
+        ? x + lrc.xOffset - lrc.font.run(lrc.prefix, lrc.compress).width - lrc.font.size * 0.3
+        : x - (40 + (cnt - 2) * 12);
       pref.y = -lrc.y;
       container.add(pref);
     }
@@ -937,6 +1029,20 @@ function drawTextBlock(container: Group, t: MeasureText): void {
     container.add(tf);
     xpos += it.font.measureText(content);
   }
+  if (t.boxed && !t.frameless) {
+    // 排练号的方框：按首行字的墨迹上下沿、整块宽，四周留 0.25 个字号
+    const it0 = t.data.find((it) => it.text !== "\n");
+    if (!it0) return;
+    const b = it0.font.charBound(it0.text);
+    const pad = it0.font.size * 0.25;
+    const x0 = t.x - pad, x1 = t.x + totalW + pad;
+    const y0 = -t.y + b.top - pad, y1 = -t.y + b.bottom + pad;
+    const lw = 1.2;
+    addLine(container, x0, y0, x1, y0, lw);
+    addLine(container, x1, y0, x1, y1, lw);
+    addLine(container, x1, y1, x0, y1, lw);
+    addLine(container, x0, y1, x0, y0, lw);
+  }
 }
 
 function drawTextBlocks(container: Group, data: PartMeasureLayout, subStaff: number): void {
@@ -1046,7 +1152,21 @@ function drawStaff(eng: MixedOptions, container: Group, sysStf: SysStaff, ypos: 
 // -----------------------------------------------------------------------
 // drawClef
 
+/** 打击乐谱号照 Sibelius 出的谱（八段锦小钗、小锣原 PDF）画两道细竖线：各粗 0.2 格、相隔 0.3 格，从第二线到第四线。
+ *  Bravura 的 unpitchedPercussionClef1 是 1.5 格宽的两道粗条。占位仍按字形宽，竖线画在它中间 */
+function drawPercussionClef(container: Group, xpos: number, sc: number): void {
+  const w = 2 * sc, gap = 3 * sc, glyphW = 15.28 * sc;
+  const x0 = xpos + (glyphW - (2 * w + gap)) / 2;
+  const y0 = 20 - 10 * sc, h = 20 * sc;
+  container.add(fillRect(0xff000000, x0, y0, w, h));
+  container.add(fillRect(0xff000000, x0 + w + gap, y0, w, h));
+}
+
 function drawClef(clef: ClefSig, container: Group, xpos: number, fontSize: number, sc = 1): void {
+  if (clef.sign === GlyphCodes.unpitchedPercussionClef1) {
+    drawPercussionClef(container, xpos, sc);
+    return;
+  }
   const y = 50 - clef.line * 10;
   if (sc !== 1) {
     addSmuflScaled(container, clef.sign, xpos, y, fontSize, sc, sc);
@@ -1471,7 +1591,7 @@ export function drawSystem(container: Group, sys: Sys): Group {
     if (!st.staffVisible) continue;
     ypos += st.distance;
     // 谱表带上沿：混排第一子谱表连同上方的简谱层（与 `drawJianpuOverlay` 的 jpOffY 同式）
-    const mixedTop = st.partStaff.getNotation(new Fraction(0)) === Notation.Mixed && st.partStaff.subIndex === 0
+    const mixedTop = st.partStaff.getNotation(sys.measures[0].offset) === Notation.Mixed && st.partStaff.subIndex === 0
       ? ypos + st.minY - eng.mixStaffDist - eng.mixStaffHeight
       : ypos;
     top ??= mixedTop;

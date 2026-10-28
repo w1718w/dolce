@@ -29,6 +29,9 @@ export interface LyricRow {
   blocks: Component[];
   /** 不足 `MIN_CELLS` 块的**孤行**（一行只印一个音节：「人」「a」），由 `keepLone` 放行的才有 */
   lone?: boolean;
+  /** 谱行弯、斜时这一行在 x 处比中段高出（负）或低下（正）多少像素：随所挂谱行的谱线走（见 `LyricStaff.lift`），
+   *  裁条时逐列按它上下挪（`stripOf`）。平直的谱行没有。 */
+  lift?: (x: number) => number;
 }
 
 /** 谱行的纵向范围（切歌词带要用）。 */
@@ -37,6 +40,9 @@ export interface LyricStaff {
   bottom: number;
   left: number;
   right: number;
+  /** 弯、斜谱行在 x 处的谱线相对 `top` / `bottom`（谱表中段的线位）的偏移；平直的没有。
+   *  歌词随谱线一起歪（同一张纸一起斜、一起卷），切带、断行都在减掉这个偏移的坐标里做。 */
+  lift?: (x: number) => number;
 }
 
 /** 歌词字号相对线距的上下限。汉字歌词实测在一个到两个线距之间。 */
@@ -51,6 +57,8 @@ const ROW_GAP = 0.9;
 
 /** 一行歌词至少要有几个字格才算数（少于这个多半是力度记号、小节号一类）。 */
 const MIN_CELLS = 3;
+/** 读成「一 / 二 / 三」的字格宽过这么多个字高、又扁的，是杠残条不是字（`mapCharsToCells`）。 */
+const BAR_CELL_W = 2;
 
 /** 孤行字格高度的下限（线距的倍数） */
 const LONE_MIN = 0.5;
@@ -91,9 +99,43 @@ export function findLyricRows(blobs: Component[], staves: LyricStaff[], unit: Ra
     const st = staves[Math.max(0, i)];
     // 带的下界：下一行谱的上缘；最后一行取 `TAIL_BAND` 个线距
     // ——够罩住整页最多的那几段歌词，又不至于把页脚的版权行收进来。
-    const limit = head ? st.top - sp * 0.3 : i + 1 < staves.length ? staves[i + 1].top : st.bottom + sp * TAIL_BAND;
+    // 弯、斜的谱行：块先按所在 x 处的谱线偏移拉回谱表中段的高度再切（斜 1.7 格的页上相邻两段词只隔 1.5 格，
+    // 按原图的 y 断行会串行），出字格时再挪回原图（`unlift`）。页顶那条带随第一行谱走
+    // 两行谱之间的偏移按高度在上下两行的曲线间插值：页面上下弯得不一样（倚靠主永远膀臂第三行起伏 15px、下一行 5px），
+    // 全按上一行拉，夹在中间的三段词各多拉几像素，行间的谷填平了切不开（歌词 83 → 39）
+    const next = !head && i + 1 < staves.length ? staves[i + 1] : null;
+    const curved = !!(st.lift || next?.lift);
+    const liftAt = (x: number, y: number) => {
+      const t = next ? Math.min(1, Math.max(0, (y - st.bottom) / Math.max(1, next.top - st.bottom))) : 0;
+      return (1 - t) * (st.lift?.(x) ?? 0) + t * (next?.lift?.(x) ?? 0);
+    };
+    const level = (c: Component): Component => {
+      const d = curved ? Math.round(liftAt(c.cx, c.cy)) : 0;
+      return d ? { ...c, cy: c.cy - d, bbox: { ...c.bbox, y: c.bbox.y - d } } : c;
+    };
+    // 按谱线拉平之后**这条带里的字自己还斜多少**（`textSkew`，下面量）：纸面卷得不匀时歌词与谱线各歪各的
+    //（倚靠主永远膀臂第一行谱下的词往右下斜 11px、谱线却往右上翘，按谱线拉反倒斜到 15px，两段词交错切不开）
+    let skew = 0;
+    let skewX = 0;
+    const skewAt = (x: number) => skew * (x - skewX);
+    const unlift = (r: Rect): Rect => {
+      const d = curved ? Math.round(liftAt(r.x + r.w / 2, r.y + r.h / 2) + skewAt(r.x + r.w / 2)) : 0;
+      return d ? { ...r, y: r.y + d } : r;
+    };
+    /** 一行的偏移（裁条用）：按这一行（拉平后）的中线高度取插值，加上带里字的斜度 */
+    const rowLift = (cells: Rect[]) => {
+      const y = (Math.min(...cells.map((c) => c.y)) + Math.max(...cells.map((c) => c.y + c.h))) / 2;
+      return (x: number) => liftAt(x, y) + skewAt(x);
+    };
+    // 拉平后下一行谱的第一线就在它的名义线位上
+    const limit = head ? st.top - sp * 0.3 : next ? next.top : st.bottom + sp * TAIL_BAND;
     const from = head ? st.top - sp * HEAD_BAND : st.bottom + sp * 0.3;
-    const band = blobs.filter((c) => {
+    const origOf = new Map<number, Component>();
+    const band0 = blobs.map((c) => {
+      const l = level(c);
+      if (l !== c) origOf.set(c.id, c);
+      return l;
+    }).filter((c) => {
       const b = c.bbox;
       if (b.y < from || rbottom(b) > limit) return false;
       if (rright(b) < st.left - sp || b.x > st.right + sp) return false;
@@ -103,7 +145,22 @@ export function findLyricRows(blobs: Component[], staves: LyricStaff[], unit: Ra
     });
     // 扁块**不参与切行与量字号**：它们的中心会把上下两行连成一行（简谱行与歌词行之间的
     // 减时线、符杠碎段），块高又会把字号拉到偏旁以下。切完行再按 y 落进哪一行就并进哪一行。
+    const orig = (c: Component) => origOf.get(c.id) ?? c;
     const isFlat = (c: Component) => c.bbox.h / sp < CHAR_MIN * 0.4;
+    if (curved) {
+      // 只拿够字号的块量：带里零星几个噪点、符干碎渣也能「斜着排成一行」（新编 005 末行谱下五个小点斜 1%，成了第五段词）
+      const sol = band0.filter((c) => c.bbox.h / sp >= CHAR_MIN);
+      skewX = sol.length ? sol.reduce((a, c) => a + c.cx, 0) / sol.length : 0;
+      skew = textSkew(sol, sp, skewX);
+    }
+    const band = skew
+      ? band0.map((c) => {
+          const d = Math.round(skewAt(c.cx));
+          if (!d) return c;
+          origOf.set(c.id, orig(c));
+          return { ...c, cy: c.cy - d, bbox: { ...c.bbox, y: c.bbox.y - d } };
+        })
+      : band0;
     const flat = band.filter(isFlat);
     const solid = band.filter((c) => !isFlat(c));
     if (solid.length < (keepLone && !head ? 1 : MIN_CELLS)) continue;
@@ -127,7 +184,7 @@ export function findLyricRows(blobs: Component[], staves: LyricStaff[], unit: Ra
             const y = Math.round(Math.max(from, r.y - sp * 0.6));
             return { ...r, y, h: rbottom(r) - y };
           });
-        if (cells.length && cells.length < MIN_CELLS) loneRaw.push({ staffIndex: i, verse: 0, cells, charH, blocks: row, lone: true });
+        if (cells.length && cells.length < MIN_CELLS) loneRaw.push({ staffIndex: i, verse: 0, cells: cells.map(unlift), charH, blocks: row.map(orig), lone: true, ...(curved ? { lift: rowLift(cells) } : {}) });
       }
     let rowsHere = split.rows.sort((a, b) => Math.min(...a.map((c) => c.bbox.y)) - Math.min(...b.map((c) => c.bbox.y)));
     // **末行谱下面的带要一行接一行**：第一行离谱表不过 `TAIL_FIRST` 个线距，往下每行与上一行的间隔不过上一行高。
@@ -204,7 +261,10 @@ export function findLyricRows(blobs: Component[], staves: LyricStaff[], unit: Ra
       }
       const cells = merged.filter((r) => r.h >= sp * CHAR_MIN * 0.5 || r.w >= sp * CHAR_MIN * 1.5);
       if (cells.length < MIN_CELLS) continue;
-      raw.push({ staffIndex: i, verse: 0, cells, charH, blocks: row });
+      // 够字号的格也要有 `MIN_CELLS` 个：谱表下符干末梢、加线碎渣这些半格上下的小块也能凑成一行
+      //（新编 005 末行谱下五块 9~15px，线距 22，成了第五段词，整曲歌词错段）
+      if (cells.filter((r) => r.h >= sp * CHAR_MIN).length < MIN_CELLS) continue;
+      raw.push({ staffIndex: i, verse: 0, cells: cells.map(unlift), charH, blocks: row.map(orig), ...(curved ? { lift: rowLift(cells) } : {}) });
     }
   }
 
@@ -284,6 +344,44 @@ function squareCells(cells: Rect[], charW: number): Rect[] {
     } else out.push({ ...c });
   }
   return out;
+}
+
+/** 带里字的剩余斜度（每横一像素的落差）在 ±`SKEW_MAX` 里按 `SKEW_STEP` 试；剖面平方和要比不斜时高出 `SKEW_GAIN` 倍以上才认。 */
+const SKEW_MAX = 0.03;
+const SKEW_STEP = 0.001;
+const SKEW_GAIN = 1.1;
+
+/**
+ * 一条带里字块的**剩余斜度**：投影法量倾斜——试一组斜率，每块按斜率扣回后把自己的宽度加到它盖住的每一行上，
+ * 取这条纵向覆盖剖面平方和最大（行与行之间的空当最干净）的那个。只动坐标，不动图。字太少（不到两行的量）不量。
+ * 只拿块心分箱试过：偏旁、标点、段号的中心上下乱跳，倚靠主永远膀臂第一行谱下斜 1.1% 的三段词各斜率得分拉不开（520 / 542 / 524）。
+ */
+function textSkew(blocks: Component[], sp: number, x0: number): number {
+  if (blocks.length < MIN_CELLS * 2) return 0;
+  const top = Math.min(...blocks.map((c) => c.bbox.y)) - sp * 2;
+  const H = Math.ceil(Math.max(...blocks.map((c) => rbottom(c.bbox))) - top + sp * 4);
+  const prof = new Float64Array(H);
+  const score = (k: number) => {
+    prof.fill(0);
+    for (const c of blocks) {
+      const y0 = Math.round(c.bbox.y - k * (c.cx - x0) - top);
+      for (let y = Math.max(0, y0); y < Math.min(H, y0 + c.bbox.h); y++) prof[y] += c.bbox.w;
+    }
+    let v = 0;
+    for (const p of prof) v += p * p;
+    return v;
+  };
+  const base = score(0);
+  let best = 0;
+  let bs = base;
+  for (let i = -Math.round(SKEW_MAX / SKEW_STEP); i <= Math.round(SKEW_MAX / SKEW_STEP); i++) {
+    const v = score(i * SKEW_STEP);
+    if (v > bs) {
+      bs = v;
+      best = i * SKEW_STEP;
+    }
+  }
+  return bs >= base * SKEW_GAIN ? best : 0;
 }
 
 /**
@@ -434,29 +532,38 @@ export interface LyricStrip {
   gray?: Uint8Array;
 }
 
-/** 从二值图里裁出一条歌词条。 */
+/** 从二值图里裁出一条歌词条。
+ *  挂在弯、斜谱行下的行（`row.lift`）**逐列按谱线偏移上下挪**着取：整行裁成水平矩形，斜 1.7 格的页上
+ *  条子要高出一倍、罩进上下两段词。只是整像素挪列，不插值，条里的笔画与原图逐像素相同。 */
 export function stripOf(bin: { w: number; h: number; data: Uint8Array }, row: LyricRow, pad = 2, grayPage?: Uint8Array): LyricStrip | null {
   const x0 = Math.max(0, Math.min(...row.cells.map((c) => c.x)) - pad);
   const x1 = Math.min(bin.w, Math.max(...row.cells.map((c) => c.x + c.w)) + pad);
-  const y0 = Math.max(0, Math.min(...row.cells.map((c) => c.y)) - pad);
-  const y1 = Math.min(bin.h, Math.max(...row.cells.map((c) => c.y + c.h)) + pad);
+  const lift = row.lift;
+  const dy = (x: number) => (lift ? Math.round(lift(x)) : 0);
+  const y0 = Math.max(0, Math.min(...row.cells.map((c) => c.y - dy(c.x + c.w / 2))) - pad);
+  const y1 = Math.min(bin.h, Math.max(...row.cells.map((c) => c.y + c.h - dy(c.x + c.w / 2))) + pad);
   const w = x1 - x0;
   const h = y1 - y0;
   if (w < 8 || h < 8) return null;
-  const data = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++)
-    for (let x = 0; x < w; x++) data[y * w + x] = bin.data[(y0 + y) * bin.w + x0 + x];
-  let gray: Uint8Array | undefined;
-  if (grayPage) {
-    gray = new Uint8Array(w * h);
+  const shift = new Int32Array(w);
+  if (lift) for (let x = 0; x < w; x++) shift[x] = dy(x0 + x);
+  const take = (src: Uint8Array, blank: number) => {
+    const out = new Uint8Array(w * h);
     for (let y = 0; y < h; y++)
-      for (let x = 0; x < w; x++) gray[y * w + x] = grayPage[(y0 + y) * bin.w + x0 + x];
-  }
+      for (let x = 0; x < w; x++) {
+        const sy = y0 + y + shift[x];
+        out[y * w + x] = sy >= 0 && sy < bin.h ? src[sy * bin.w + x0 + x] : blank;
+      }
+    return out;
+  };
+  const data = take(bin.data, 0);
+  const gray = grayPage ? take(grayPage, 255) : undefined;
+  const mid = dy((x0 + x1) / 2);
   return {
     w,
     h,
     data,
-    box: { x: x0, y: y0, w, h },
+    box: { x: x0, y: y0 + mid, w, h },
     charH: row.charH,
     cells: row.cells.map((c) => ({ x0: (c.x - x0) / w, x1: (c.x + c.w - x0) / w, box: c })),
     ...(gray ? { gray } : {}),
@@ -622,6 +729,15 @@ function splitWideCells(strip: LyricStrip, extra: number): LyricStrip {
  * 实测那样会丢掉近一半的字（1221 个字里丢 566）。
  */
 export function mapCharsToCells(strip0: LyricStrip, chars: OcrChar[]): { box: Rect; ch: string }[] {
+  const out = mapCharsToCells0(strip0, chars);
+  // **扁长横条上读出的「一 / 二 / 三」不是字**：歌词条里剩下的杠残条（是爱 p5 第二系统钢琴两手之间，99×4、95×5 的几截），
+  // 一个字格宽过两个字高。真「一」的格不会比一个字宽出一倍
+  const h = strip0.charH;
+  if (h > 0) for (const o of out) if (/^[一二三]$/.test(o.ch) && o.box.w > h * BAR_CELL_W && o.box.h < o.box.w * 0.2) o.ch = "";
+  return out;
+}
+
+function mapCharsToCells0(strip0: LyricStrip, chars: OcrChar[]): { box: Rect; ch: string }[] {
   const keep = foldLyricChars(chars);
   const filled = keep.length > strip0.cells.length ? fillMissingCells(strip0, keep) : strip0;
   const strip = keep.length > filled.cells.length ? splitWideCells(filled, keep.length - filled.cells.length) : filled;
@@ -910,4 +1026,15 @@ export function latinCells(strip: LyricStrip, chars: OcrChar[], spaceGap = SPACE
     if (next && brk[i]) out.push(boxAt(end, next.xFrac, " "));
   });
   return out;
+}
+
+/** 汉字歌词行尾的跳转记号（`Fine`、`D.S. al Fine`）：最后一个汉字（或标点，「華美!Fine.」的感叹号是半角）之后的拉丁串整串是跳转记号才摘 */
+export function jumpTail(chars: OcrChar[]): { text: string; xFrac: number; rest: OcrChar[] } | null {
+  let k = chars.length;
+  while (k > 0 && !/\p{Script=Han}|[，。、；：！？,;:!?]/u.test(chars[k - 1]!.ch)) k--;
+  if (k === 0 || k === chars.length) return null;
+  const text = chars.slice(k).map((c) => c.ch).join("").trim();
+  // 「Fine.」带不带句点都有（OCR 读出的与谱面一致）
+  if (!/^(?:fine\.?|D\.?\s*[SC]\b.*)$/i.test(text)) return null;
+  return { text, xFrac: chars[k]!.xFrac, rest: chars.slice(0, k) };
 }

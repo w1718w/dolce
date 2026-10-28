@@ -1,7 +1,7 @@
 // 段落词（音符注释，「（副歌）」）的横向落点：判据是 `engrave/sectionword.ts::placeSectionWord`（与旧简谱引擎同一份），
 // 这里只把一行里的符号换算成它要的几何——横向撑开（spacing.ts，justify 前预演、行首那条 justify 后匀）
 // 与真正摆（band.ts）用同一个换算，两边不会错配。
-import type { MusicElement } from "../../../pu/ast";
+import type { MusicElement } from "../../../jianpu/ast";
 import { placeSectionWord, sectionWordHangLeft, type SectionWordSlot } from "../../../engrave/sectionword";
 import type { JianpuGrid } from "../metrics";
 import type { PlacedItem } from "./model";
@@ -9,6 +9,16 @@ import type { PlacedItem } from "./model";
 /** 挂得住段落词的符号（音符、增时线）上的那条注释 */
 export function sectionWordOf(el: MusicElement): string | undefined {
   return el.kind === "note" || el.kind === "sustain" ? el.annotation : undefined;
+}
+
+/** 一个音上的几条段落词（ABC §4.19：同方位连写几条注记就分几行、先写的在上；模型里按换行隔开） */
+export function sectionWordLines(text: string): string[] {
+  return text.split("\n").filter((l) => l !== "");
+}
+
+/** 几行里最宽那一行（横向让位、撑开按它算） */
+export function widestLine<T extends { ink: { left: number; right: number } }>(lines: readonly string[], measure: (s: string) => T): T {
+  return lines.map(measure).reduce((a, b) => (b.ink.right - b.ink.left > a.ink.right - a.ink.left ? b : a));
 }
 
 /** 一行里第一个音符/增时线：行首那一条段落词不往右让、不撑开，justify 之后从行内匀（`nudgeForSectionWords`） */

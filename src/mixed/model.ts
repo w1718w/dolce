@@ -8,7 +8,7 @@
 
 import { Fraction } from "../common/fraction";
 import { Point } from "../common/geom";
-import { Font } from "../layout/font";
+import { Font } from "../pagetree/font";
 import { arcClearShift, arcRise, calcSlurPoints, jpArcY, type ArcObstacle, type SlurStyle } from "../engrave/arc";
 import { accidentalRise } from "../engrave/accidental";
 import type { CompressMode } from "../common/cjkpunct";
@@ -296,6 +296,10 @@ export class NotationItem {
   dx = 0;
   y = 0;
   above = true;
+  /** 一律印在谱表上方、谱表之外（波音、颤音、弓法），不随符干翻到下面；`layoutNotations` 摞在符头/符干顶之上 */
+  outside = false;
+  /** 原文写明的上下（`placement`，true = 上方）：不按通则翻；落在符干一侧的贴着符干端（八段锦二胡 m49 顿音印在朝上符干的杠上方） */
+  placed?: boolean;
 
   /** model.cpp:1096 NotationItem::isFermata */
   isFermata(): boolean {
@@ -495,6 +499,11 @@ export class ChordLayout {
   get slash(): boolean {
     return this.src.notes.some((n) => n.notehead?.trim() === "slash");
   }
+  /** 叉形 / 圈叉符头（整个和弦同一形状才换，打击乐谱的单音） */
+  get crossHead(): "x" | "circle-x" | null {
+    const h = this.src.notes[0]?.notehead?.trim();
+    return (h === "x" || h === "circle-x" || h === "cross") && this.src.notes.every((n) => n.notehead?.trim() === h) ? (h === "circle-x" ? "circle-x" : "x") : null;
+  }
   /** 实际时值（四分音符为 1） */
   get dur(): Fraction {
     return new Fraction(this.src.duration.divisions, this.divisions);
@@ -557,6 +566,13 @@ export class ChordLayout {
     if (this.slash) {
       if (fLe(nt, new Fraction(1))) return GlyphCodes.noteheadSlashVerticalEnds;
       return GlyphCodes.noteheadSlashDiamondWhite; // half/whole slash
+    }
+    const cross = this.crossHead;
+    if (cross) {
+      const circle = cross === "circle-x";
+      if (fLe(nt, new Fraction(1))) return circle ? GlyphCodes.noteheadCircleX : GlyphCodes.noteheadXBlack;
+      if (nt.equals(2)) return circle ? GlyphCodes.noteheadCircleXHalf : GlyphCodes.noteheadXHalf;
+      return circle ? GlyphCodes.noteheadCircleXWhole : GlyphCodes.noteheadXWhole;
     }
     if (fLe(nt, new Fraction(1))) return GlyphCodes.noteheadBlack;
     if (nt.equals(2)) return GlyphCodes.noteheadHalf;
@@ -1030,6 +1046,8 @@ export class LyricLayout {
   get above(): boolean {
     return this.src.placement === "above";
   }
+  /** 源里没写、排版时补的段号（`layout.ts::autoVerseNumbers`）；画法同源里写的（`render.ts::drawLrc`） */
+  autoPrefix = "";
   /** 印在首字前的段落号（`1.圣` 的 `1.`）与去掉它的正文 */
   private get split(): { prefix: string; text: string } {
     const text = this.src.text.trim();
@@ -1042,8 +1060,9 @@ export class LyricLayout {
   get text(): string {
     return this.split.text;
   }
+  /** 首字前印的段号：源里的（`verseLabel`；没拆开的 `1.圣` 也认），没有才用补的 */
   get prefix(): string {
-    return this.split.prefix;
+    return this.src.verseLabel ?? (this.split.prefix || this.autoPrefix);
   }
   /** 词首 / 词尾（`<syllabic>`） */
   get begin(): boolean {
@@ -1415,8 +1434,14 @@ export class MeasureText extends TextBlock {
   sourceY = false;
   /** 力度记号原文写了字号：自动铺排不统一成歌词字号 */
   sourceSize = false;
+  /** segno / coda 原文写了 `default-x` / `default-y`：不挪到小节线上、不贴轮廓（`staffpages.ts::placePartAboveStaff`） */
+  signPlaced = false;
   /** `ScoreDoc` 里对应的 `<direction>`（导出时把排好的高度写回，`engrave.ts`） */
   src: DocDirection | null = null;
+  /** 排练号（`<rehearsal>`）：粗体字外面套方框（render.ts::drawTextBlock） */
+  boxed = false;
+  /** 排练号自带【】（`rehearsalBracketed`）：不画方框 */
+  frameless = false;
 
   constructor(measure: PartMeasureLayout) {
     super();
@@ -1886,7 +1911,24 @@ export class PartMeasureLayout {
       const hasStem = fLt(ch.noteType, new Fraction(4));
       if (!(hasStem && ch.stemUp === above)) noteSide = true;
 
+      // 谱表上方那一摞（波音、颤音、弓法）：从这个和弦最高的墨迹（符干朝上取符干顶）往上摞，至少在谱表顶线之上
+      const topNote = ch.notes[ch.notes.length - 1]!;
+      let outsideY = Math.min(hasStem && ch.stemUp ? ch.tailY(false) : topNote.cy() - 5, 0) - 10;
       for (const it of ch.notations) {
+        if (it.outside) {
+          it.above = true;
+          it.y = outsideY;
+          outsideY -= 14;
+          continue;
+        }
+        if (it.placed !== undefined) {
+          it.setAbove(it.placed);
+          const inc = it.above ? -1 : 1;
+          const stemSide = hasStem && ch.stemUp === it.above;
+          const head = it.above ? ch.notes[ch.notes.length - 1]! : ch.notes[0]!;
+          it.y = (stemSide ? ch.tailY(false) : head.cy() + 5 * inc) + 5 * inc;
+          continue;
+        }
         // musicpp 以「原始字形是否 fermataAbove」判定，setAbove 之前取值。
         const fermata = it.symbol === GlyphCodes.fermataAbove;
         if (fermata) {
@@ -1984,6 +2026,8 @@ export enum BarGlyph {
 export class MeasureLayout {
   system!: Sys;
   number = "";
+  /** 多小节休止：这一小节代表几个小节（`model/multirest.ts` 并过的；0 = 普通小节）。整小节休止画成 H 形横杠加小节数 */
+  multiRest = 0;
 
   endingNum = new Set<number>();
   leftEndingType = EndingType.None;
@@ -2172,9 +2216,26 @@ export class OctaveLine extends SpanObj {
   size = 8;
 }
 
+/** 琶音线（`arpeggioGroup` 的 x）在和弦墨迹左缘（符头、临时记号取最左）往左这么多（tenths）；
+ *  波浪线墨迹在 x 右边 3.9～8.4，离符头约 0.36 格（照八段锦钢片琴原 PDF 量的约 0.3 格） */
+export const ARPEGGIO_LEAD = 12;
+/** 排版给琶音在和弦左边让出的宽：线的墨迹左缘到和弦墨迹左缘 */
+export const ARPEGGIO_RESERVE = ARPEGGIO_LEAD - 3.9;
+
 /** 琶音（model.hpp:435 Arpeggiate）：同一 offset 上的一组音符。 */
 export class Arpeggiate {
   notes: NoteLayout[] = [];
+
+  /** 和弦墨迹左缘（与音符同一坐标）：这组音所在各 entry 的符头与临时记号取最左 */
+  inkLeft(entries: readonly NoteEntry[]): number {
+    let left = Infinity;
+    for (const ent of entries) {
+      if (!ent.notes.some((n) => n.arpeg === this)) continue;
+      for (const n of ent.notes) if (!n.chord.rest) left = Math.min(left, n.x);
+      for (const a of ent.acc.accidentals) if (a.xpos !== null) left = Math.min(left, a.xpos);
+    }
+    return left;
+  }
 }
 
 export class LrcExtend extends SpanOverNotes {
@@ -3269,6 +3330,14 @@ export class MixedOptions {
    *  谱里的版面坐标不再用（整份自动铺排）；没给就照谱里的 `<scaling>` / `<lyric-font>`。 */
   staffSizeMm: number | null = null;
   lyricPt: number | null = null;
+  /** 自动段号（样式键 `verse-numbers`，同简谱口径）：`always` 一个声部唱两段以上就在每段首字前印「1.」「2.」…，
+   *  `auto` 段数多于 `verseNumberAutoMin` 才印，`never` 不印（成书缺省，`pdflayout/songbook.ts`） */
+  verseNumbers: "always" | "never" | "auto" = "always";
+  verseNumberAutoMin = 3;
+  /** 段号按墨迹摆：右缘离首字左缘 0.3 字号（`render.ts::drawLrc`）；false = musicpp 的固定偏移（成书，逐位不变） */
+  verseLabelByInk = true;
+  /** 谱里的 `new-system` / `new-page` 是源文写明的换行换页（ABC 的代码换行与 `%%newpage`），自动铺排时当硬断点（`StaffLayout.hardBreaks`） */
+  sourceBreaks = false;
   // ── 简谱层附件相对数字的位置。八度点、减时线走公共那一份（engrave/stack.ts，墨迹到墨迹等距）：
   /** 叠层的空 ÷ 数字墨迹高。样式键 `stack-gap`。 */
   stackGap = STACK_GAP_DEFAULT;
@@ -3364,6 +3433,13 @@ export class StaffLayout {
    * 横向、纵向间距仍自动算，只是行与页不重排（`layoutpass.ts` 源谱版面档、`staffpages.ts::sourceFlow`）。
    */
   keepBreaks = false;
+  /**
+   * 自动铺排时 `new-system` / `new-page` 是硬断点：源谱版面档（`keepBreaks`），或源文写明的换行（`MixedOptions.sourceBreaks`）。
+   * 后者只管分行分页——过满的行同源谱版面档那样压（`justifySourceSystem`），压不下的才在行内再拆（`writtenBreaks`），
+   * 不满的照常拉、换页照写明的换，
+   * 纵向与装页仍按自动铺排。
+   */
+  hardBreaks = false;
   /** 没写朝向的圆滑线、没有多声部/和弦可依的延音线一律画在音符上方（让开下面的歌词）：自动铺排的谱，以及本应用导出的谱
    *  （读回来要与导出前一样）。别的谱照 musicpp：圆滑线缺省在下、延音线与符干反向。 */
   get arcsAbove(): boolean {

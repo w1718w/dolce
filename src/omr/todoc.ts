@@ -1,4 +1,4 @@
-// 识别结果 → `ScoreDoc`（**简谱形状**，与 `j123/parse.ts` 的产物同口径：度数、48 分时值、增时线、减时线）。
+// 识别结果 → `ScoreDoc`（**简谱形状**，与 `abcfamily/parse.ts` 的产物同口径：度数、48 分时值、增时线、减时线）。
 //
 // 识别出来的本来就是简谱：数字、八度点、减时线、增时线。以前先拼成 MusicXML 再读回来、由
 // `model/jianpuproject.ts` 猜回简谱形状——绝对音高、divisions、`<type>` 转一圈，附点加增时线（2.5 拍）这种
@@ -214,9 +214,22 @@ export function recognizedToDoc(score: RecognizedScore, numOf?: Map<ElementId, J
   // 多声部（`StaffRow.voice`，四声部诗歌本）：每个声部各取自己那几行建一个 part，行序即谱面系统序；
   // 弧、换行、跨行小节都在声部内部算。歌词挂在歌词带上方那一行（第 2 声部），与文本谱 `Q2` 后跟 `C1:` 一致。
   const voices = [...new Set(score.rows.map((r) => r.voice ?? 0))].sort((a, b) => a - b);
+  // 局部多声部（946《大地音韵飘》前两行单声部、副歌两个系统分两声部）：没归系统的行只进第 1 声部，各声部的小节数就对不上了。
+  // 按谱面自上而下给每行编组号（同一系统的几行一组，单声部行各成一组），挂在行首小节的 `print.system` 上，
+  // 共用时间轴按组对齐（`timeaxis.ts`，同文本谱一组只写 `Q:` 的口径）。整页都分了声部的不挂，照旧按小节序号一一对应。
+  let groupOf: Map<StaffRow, number> | undefined;
+  if (voices.length > 1 && score.rows.some((r) => r.voice === undefined)) {
+    groupOf = new Map();
+    let g = -1, sys: number | undefined;
+    for (const r of [...score.rows].sort((a, b) => a.topY - b.topY)) {
+      if (r.system === undefined || r.system !== sys) g++;
+      sys = r.system;
+      groupOf.set(r, g);
+    }
+  }
   const parts = voices.map((v, pi) => ({
     id: `P${pi + 1}`,
-    measures: measuresOfRows(score.rows.filter((r) => (r.voice ?? 0) === v), score, ids, marks, numOf),
+    measures: measuresOfRows(score.rows.filter((r) => (r.voice ?? 0) === v), score, ids, marks, numOf, groupOf),
   }));
   // 四声部简谱（女高、女低、男高、男低）：男声两部照惯例按高八度记，标上八度谱号（123 `V:3 clef=treble-8`），
   // 试听与五线谱据此落回实际八度（`jianpu.ts::writtenOctaveOf`）。二、三声部的谱看不出哪部是男声，不标。
@@ -240,6 +253,10 @@ export function recognizedToDoc(score: RecognizedScore, numOf?: Map<ElementId, J
   // 左侧的不用另记（写出端缺省就写 `XL:`）。
   if (score.number && score.numberSide === "right") {
     song.pageText = { indexRight: score.number, topLeft: [], topRight: [], bottomLeft: [], bottomCenter: [], bottomRight: [] };
+  }
+  // 印在标题左边的署名记左上（文本谱 `TL:`）：诗歌本的 `Z:` 排在标题下右对齐，记成署名就挪了位置
+  if (score.creditsTopLeft?.length) {
+    (song.pageText ??= { topLeft: [], topRight: [], bottomLeft: [], bottomCenter: [], bottomRight: [] }).topLeft.push(...score.creditsTopLeft);
   }
   // 谱后的注（「注：…」）记页脚左（文本谱 `BL:`）
   if (score.footnotes?.length) {
@@ -265,7 +282,8 @@ export function recognizedToDoc(score: RecognizedScore, numOf?: Map<ElementId, J
 }
 
 /** 一个声部的谱行 → 小节序列。`marks` 由各声部共用（元素 id 全局唯一）。 */
-function measuresOfRows(rows: readonly StaffRow[], score: RecognizedScore, ids: IdGen, marks: Mark[], numOf?: Map<ElementId, JpNum>): Measure[] {
+function measuresOfRows(rows: readonly StaffRow[], score: RecognizedScore, ids: IdGen, marks: Mark[], numOf?: Map<ElementId, JpNum>,
+  groupOf?: Map<StaffRow, number>): Measure[] {
   // 遵照图片小节线：行末无小节线时（开口收尾），本行末小节与下一行行首小节实为同一跨行小节，合并，
   // 不在换行处凭空补小节线。行末有小节线（如终止线）才各自成节。
   // 记录每个 row 在 allMeasures 中「干净起始」的小节下标（>0 才记），供换行（`Print.newSystem`）
@@ -273,10 +291,12 @@ function measuresOfRows(rows: readonly StaffRow[], score: RecognizedScore, ids: 
   // 无法在小节边界干净断行 → 不记（与「开口不补小节线」一致）。
   const allMeasures: JpNum[][] = [];
   const rowStartIdx = new Set<number>();
+  const groupAt = new Map<number, number>();   // 行首小节下标 → 组号（只在局部多声部时给，见 recognizedToDoc）
   const endStyleIdx = new Set<number>();   // 右边界是终止线（‖）的小节
   const thinEndIdx = new Set<number>();    // 其中只按位置认的（两根没分出粗细）
   const doubleIdx = new Set<number>();     // 右边界是复纵线（细细双线 ‖）的小节
   const silentIdx = new Set<number>();     // 声部整小节不唱（写整小节隐形休止）
+  const hiddenIdx = new Set<number>();     // 右边界是不可见小节线（行末开口、下一行行首却带 segno，见下）
   // 行首段号（`1.`）挂到该行每段第一个有词的音符上（`Lyric.verseLabel`）
   const labelOf = new Map<JpNum, string[]>();
   const breakAfterNum = new Set<JpNum>();
@@ -298,14 +318,22 @@ function measuresOfRows(rows: readonly StaffRow[], score: RecognizedScore, ids: 
     };
     // 行首就是 `‖:`（上一行末开口）：那道反复线就是本行首小节的左线，不并进上一行——
     // 青年诗歌 13《爱使我们相聚一起》`… 2|1 - - $ ‖:3̲ 4̲|5 …`，并了反复线就落到 `1 - -` 前面
-    if (openTail && allMeasures.length && !ms[0].notes[0]?.repeatForward) {
+    // segno 印在行首、上一行末开口（青年诗歌 60《经历基督作牧人》`… | 1 $ 𝄋 3·♯2̳ | …`）同理：segno 只能挂小节线，
+    // 并进跨行小节就落到上一行的 `1` 前面、D.S. 跳回来多唱一个音。上一行末收一道不可见线 `[|]`，segno 挂本行首小节左线
+    const segnoHead = openTail && allMeasures.length > 0 && !!ms[0].notes[0]?.segno;
+    if (segnoHead) hiddenIdx.add(allMeasures.length - 1);
+    if (openTail && allMeasures.length && !ms[0].notes[0]?.repeatForward && !segnoHead) {
       // 跨行小节：原图换行落在小节中间，记在上一行最后一个音上（`Chord.lineBreakAfter`），写出时原位断行
       const prev = allMeasures[allMeasures.length - 1];
       if (prev.length) breakAfterNum.add(prev[prev.length - 1]);
       const first = ms.shift()!;
       allMeasures[allMeasures.length - 1].push(...first.notes);
       markDouble(first, allMeasures.length - 1);
-    } else if (allMeasures.length) rowStartIdx.add(allMeasures.length);
+    } else {
+      if (allMeasures.length) rowStartIdx.add(allMeasures.length);
+      const g = groupOf?.get(row);
+      if (g !== undefined) groupAt.set(allMeasures.length, g);
+    }
     for (const m of ms) {
       allMeasures.push(m.notes); markDouble(m, allMeasures.length - 1);
       if (m.silent) silentIdx.add(allMeasures.length - 1);
@@ -325,6 +353,8 @@ function measuresOfRows(rows: readonly StaffRow[], score: RecognizedScore, ids: 
   return allMeasures.map((notes, idx) => {
     const m: Measure = { number: String(idx + 1), elements: [] };
     if (rowStartIdx.has(idx)) m.print = { newSystem: true };
+    // 声部在后面的组才露面（局部多声部的第 2 声部）：它的首小节在全曲是换行处
+    if (groupAt.has(idx)) m.print = { ...m.print, ...(groupAt.get(idx)! > 0 ? { newSystem: true } : {}), system: groupAt.get(idx)! };
     // 曲中转拍号：识别时锚在该小节头一个音符上（JpNum.timeChange），提升为本小节的 `attrs.time`。
     const change = notes.find((n) => n.timeChange)?.timeChange;
     if (change && idx > 0 && (change.beats !== curBeats || change.beatType !== curBeatType)) {
@@ -390,6 +420,7 @@ function measuresOfRows(rows: readonly StaffRow[], score: RecognizedScore, ids: 
       if (n.articulation) notations.articulations = [n.articulation];
       const dyn = (n.dynamics ?? []).filter((x) => !/^(cresc|dim)/.test(x)), dynWords = (n.dynamics ?? []).filter((x) => /^(cresc|dim)/.test(x));
       if (dyn.length) notations.articulations = [...(notations.articulations ?? []), ...dyn];
+      if (n.fall) notations.articulations = [...(notations.articulations ?? []), "xhy"];
       if (n.ornament === "upper-mordent") notations.ornaments = ["inverted-mordent"];
       else if (n.ornament === "lower-mordent") notations.ornaments = ["mordent"];
       if (Object.keys(notations).length) ch.notations = notations;
@@ -471,6 +502,7 @@ function measuresOfRows(rows: readonly StaffRow[], score: RecognizedScore, ids: 
       // 故不像终止线那样给 endingStop 让位。
       // 下一小节以反复起始 `‖:` 开头：那对粗细线就是反复线本身（青年诗歌 5《第一声呼求》`5 ‖: 3̇`），不另记复纵线
       else if (doubleIdx.has(idx) && !allMeasures[idx + 1]?.some((n) => n.repeatForward)) b.style = "light-light";
+      else if (hiddenIdx.has(idx)) b.style = "none";
       else if (closed) b.style = "regular";
       if (endingStop !== undefined) b.ending = endingOf(endingStop, "stop");
       // 跳转记号（D.C./D.S./Fine/To Coda）：识别时锚在本小节某音符上，记在小节末

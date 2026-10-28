@@ -68,6 +68,8 @@ export class LexerAbc extends AbcFamilyLexer {
     const ch = line[i];
     if (ch !== "z" && ch !== "Z") return null;
     const dur = this.scanDuration(line, i + 1);
+    // `Z4` 的数字是小节数，不是时值
+    if (ch === "Z") return { beams: 0, dots: 0, bars: Math.max(1, dur?.num ?? 1), next: dur?.next ?? i + 1 };
     return {
       beams: 0,
       dots: 0,
@@ -143,7 +145,7 @@ export class LexerAbc extends AbcFamilyLexer {
     return name ? { len: 1, name } : null;
   }
 
-  /** `[CEG]` 同时发声的和弦（ABC §4.17）。基类已先判掉 `[K:…]`、`[1`、`[|`，剩下的才轮到这里。 */
+  /** `[CEG]` 同时发声的和弦（ABC §4.17），音后可跟 `-` 单连这一个音（`[C-E]`）。基类已先判掉 `[K:…]`、`[1`、`[|`，剩下的才轮到这里。 */
   protected override scanChordGroup(
     line: string,
     i: number,
@@ -160,6 +162,8 @@ export class LexerAbc extends AbcFamilyLexer {
       if (!n) return null; // 里面有不是音符的东西，就不是和弦
       notes.push(n);
       k = n.next;
+      // 音后的 `-`：只这一个音连到下一个和弦里的同音（§4.11 `[C-E]`）
+      if (body[k] === "-") k++;
     }
     if (notes.length === 0) return null;
     return { text: line.slice(i, close + 1), notes, dur: this.scanDuration(line, close + 1) };

@@ -16,20 +16,22 @@
 // 已知不表达：承接前音的增时线（`Chord.continued`）按普通音符写、不补 tie；
 // 挂在增时线上的歌词（文本谱 `-@`）与记号不写——MusicXML 里增时线不是独立的音符。
 
+import { layersToVoices } from "./innervoice";
 import type {
   Barline, BeamVal, Chord, Direction, Element, ElementId, Lyric, Mark, Measure, Notations, Part,
-  NoteType, SourceOrnament, Song,
+  NoteType, ScoreDoc, SourceOrnament, Song,
 } from "./doc";
 import { SIMPLE_DIVISIONS } from "./doc";
 import { Fraction, lcm } from "../common/fraction";
-import { AccidentalCarry, quarterTempos } from "./jianpu";
+import { AccidentalCarry, StaffAccidentalCarry, quarterTempos } from "./jianpu";
 import { typeOfDuration } from "../score/xmlutil";
-import { DYNAMICS, TERMS } from "../pu/glyph";
+import { TERMS, isDynamicName } from "./marknames";
 import { applyPageMetaToDefaults } from "./pagemeta";
-import { decoKey } from "./deconames";
+import { decoKey, noteheadOf, rehearsalOf, tremoloStrokes } from "./deconames";
 import { applyBreaks } from "./breaks";
 import { keyFifths, songFifths } from "./keyshift";
 import { distinctNumbers } from "./phrasedoc";
+import { mergeStaffParts } from "./staves";
 
 
 /** 记号原名 → `<articulations>` 元素名（`&xx` 与 123 的 `!xx!` 同名）。 */
@@ -43,6 +45,8 @@ const ARTICULATION: Readonly<Record<string, string>> = {
   xhy: "falloff",
 };
 const FERMATA = /^(yc|ycy|fermata)$/i;
+/** 归一后的短名 → `<technical>` 元素（弓法） */
+const TECHNICAL: Readonly<Record<string, string>> = { sg: "up-bow", xg: "down-bow" };
 export const ORNAMENT_TAG: Readonly<Record<string, string>> = {
   sby: "inverted-mordent",
   xby: "mordent",
@@ -75,11 +79,14 @@ export interface ProjectOptions {
   /** `lineStarts` 落在小节中间的也原位断（拆小节、中间隐藏线）：它们是乐句断点（`App.staffPhraseLineStarts`），
    *  不是简谱版面宽度的产物。不给就只留源文写明的，其余顺延到下一小节。 */
   midLineStarts?: boolean;
+  /** 相邻两个同音的弧当延音线（简谱口径，`tieSlur`）。缺省是；源格式有自己延音线写法的（`hasTieSyntax`：ABC、Muse）传 false */
+  slurTies?: boolean;
 }
 
 export function projectForMusicXml(src: Song, options: ProjectOptions = {}): Song {
   if (isXmlShaped(src)) return src;
-  const song: Song = structuredClone(src);
+  // 文本谱的 `{dsb…}` 并排块写成同一谱表的第二个 `<voice>`（以前整块丢掉）
+  const song: Song = structuredClone(layersToVoices(src));
   // 123/ABC 里 `I:meta page …` 写的纸还原成 `<page-layout>`
   applyPageMetaToDefaults(song);
   // 多声部不对齐、不补小节：一组不一定含全部声部，写出端按共用时间轴逐格写（`toxml.ts::axisMeasuresXml`，issue 11）
@@ -91,7 +98,7 @@ export function projectForMusicXml(src: Song, options: ProjectOptions = {}): Son
   const divisions = SIMPLE_DIVISIONS * factor;
 
   tiesToMarks(song);
-  normalizeMarks(song, hosts);
+  normalizeMarks(song, hosts, options.slurTies ?? true);
   const tupletInner = tupletInnerChords(song, tuplets, hosts);
   /** 拆出来的后半小节的编号（`X1`、`X2`…）；各声部同步拆，各自从头数 */
   let xno: { n: number };
@@ -109,7 +116,8 @@ export function projectForMusicXml(src: Song, options: ProjectOptions = {}): Son
       ...(first.attrs ?? {}),
       divisions,
       key: { ...(song.key ?? {}), ...(first.attrs?.key ?? {}), fifths: first.attrs?.key?.fifths ?? fifths },
-      time: first.attrs?.time ?? (song.time ? { beats: song.time.beats, beatType: song.time.beatType } : { beats: 4, beatType: 4 }),
+      // 印成 `C` / `₵` 的（123 / ABC 的 `M:C`）带上 `symbol`
+      time: first.attrs?.time ?? (song.time ? { beats: song.time.beats, beatType: song.time.beatType, ...(song.time.symbol ? { symbol: song.time.symbol } : {}) } : { beats: 4, beatType: 4 }),
     };
     for (const [i, m] of part.measures.entries()) {
       if (!m.print) continue;
@@ -126,6 +134,8 @@ export function projectForMusicXml(src: Song, options: ProjectOptions = {}): Son
     wedgeDirections(song, part);
     if (pi === 0) tempoDirection(song, first);
   }
+  // 123 / ABC 的大谱表（`V:2 part=1`）并回一个声部的几条谱表
+  mergeStaffParts(song);
   // wedge 已经全部落成 direction，`<notations>` 那边不认它
   song.marks = song.marks.filter((m) => m.type !== "wedge");
   if (!song.credits?.length) song.credits = creditsOf(song);
@@ -142,12 +152,15 @@ function applyLineStarts(song: Song, starts: ReadonlySet<ElementId>, mid: boolea
   return applyBreaks(song, [...starts].map((id) => ({ id })), { mid: mid ? "inline" : "source", pages: "keep" });
 }
 
+/** 页眉的 credit：标题、副标题、署名；页面文字的左上、右上写成靠左、靠右的无类型 credit（转回简谱文本时照 `justify` 落回原处，
+ *  `jianpuproject.ts::headTextFromCredits`）。五线谱自动铺排按标题去重（`mixed/layoutpass.ts::autoLayoutHeader`），标题那条不会画两遍 */
 function creditsOf(song: Song): NonNullable<Song["credits"]> {
   const out: NonNullable<Song["credits"]> = [];
+  if (song.work.title) out.push({ type: "title", text: song.work.title, page: 1 });
   for (const t of song.work.subtitles) if (t) out.push({ type: "subtitle", text: t, page: 1 });
   for (const c of song.identification?.creators ?? []) if (c.text) out.push({ type: c.type, text: c.text, page: 1 });
-  for (const t of song.pageText?.topRight ?? []) if (t) out.push({ type: "composer", text: t, page: 1 });
-  for (const t of song.pageText?.topLeft ?? []) if (t) out.push({ type: "lyricist", text: t, page: 1 });
+  for (const t of song.pageText?.topRight ?? []) if (t) out.push({ text: t, page: 1, justify: "right" });
+  for (const t of song.pageText?.topLeft ?? []) if (t) out.push({ text: t, page: 1, justify: "left" });
   return out;
 }
 
@@ -576,15 +589,19 @@ function divisionFactor(song: Song, tuplets: Map<ElementId, { actual: number; no
 }
 
 /** 延音线：简谱来源只在音上标了起止（`Note.tie`），`<tied>` 要按 id 配成对。
- *  两端必须是同一个实音，配不上的两头都去掉——孤立的 start 会让下游软件把线一路拖下去。 */
+ *  两端必须是同一个实音，配不上的两头都去掉——孤立的 start 会让下游软件把线一路拖下去。
+ *  按谱表·声部各配各的：小节里的第二声部（`&`）排在第一声部后面，混着配会把两边的线都当孤立的删掉。 */
 export function tiesToMarks(song: Song): void {
   if (song.marks.some((m) => m.type === "tied")) return;
+  type Open = { chord: Chord; note: Chord["notes"][number] }[];
   for (const p of song.parts) {
-    let open: { chord: Chord; note: Chord["notes"][number] }[] = [];
+    const byVoice = new Map<string, Open>();
     for (const m of p.measures) {
       for (const el of m.elements) {
         if (el.kind !== "chord" || el.grace) continue;
-        const next: typeof open = [];
+        const key = `${el.staff ?? 1}:${el.voice ?? 1}`;
+        const open = byVoice.get(key) ?? [];
+        const next: Open = [];
         for (const note of el.notes) {
           if (note.tie?.stop) {
             const k = open.findIndex((o) => sameDegree(o.note, note));
@@ -598,30 +615,98 @@ export function tiesToMarks(song: Song): void {
           if (note.tie?.start) next.push({ chord: el, note });
         }
         for (const o of open) delete o.note.tie!.start;
-        open = next;
+        byVoice.set(key, next);
       }
     }
-    for (const o of open) delete o.note.tie!.start;
+    for (const open of byVoice.values()) for (const o of open) delete o.note.tie!.start;
   }
 }
 
 const sameDegree = (a: Chord["notes"][number], b: Chord["notes"][number]): boolean =>
   !!a.degree && !!b.degree && a.degree.number === b.degree.number && a.degree.octaveShift === b.degree.octaveShift;
 
+/** 延音线两端算不算同音：唱名音看度数与八度（后一个没写变音算沿用），带谱表位置的节奏音符（`X@E5`）看位置 */
+function sameTiedNote(x: Chord["notes"][number], y: Chord["notes"][number]): boolean {
+  if (x.unpitched || y.unpitched) {
+    return !!x.unpitched && !!y.unpitched && x.unpitched.step === y.unpitched.step && x.unpitched.octave === y.unpitched.octave;
+  }
+  return sameDegree(x, y) && !(y.degree!.accidental && y.degree!.accidental !== x.degree!.accidental);
+}
+
 /** 简谱括住相邻两个同音的弧就是延音线（两者同形，文本谱/123 都只写括号）：补上两端的 `Note.tie`，
- *  五线谱画成延音线、导出的 `<tie>` 让别的软件也连着发声。后一个没写记号算沿用（`(#4 4)`），写了不同的不算 */
-function tieSlur(a: Chord, b: Chord): boolean {
-  const x = a.notes[0];
-  const y = b.notes[0];
-  if (a.rest || b.rest || a.grace || b.grace || !x || !y || !sameDegree(x, y)) return false;
-  if (y.degree!.accidental && y.degree!.accidental !== x.degree!.accidental) return false;
-  (x.tie ??= {}).start = true;
-  (y.tie ??= {}).stop = true;
-  return true;
+ *  五线谱画成延音线、导出的 `<tie>` 让别的软件也连着发声。后一个没写记号算沿用（`(#4 4)`），写了不同的不算。
+ *  和音（123 `[13]~ [13]`）里每个音各找下一个和音里的同音、各连一条，有一个找不到就仍是圆滑线。返回连上的 `[起, 止]` 下标 */
+function tieSlur(a: Chord, b: Chord): [number, number][] {
+  if (a.rest || b.rest || a.grace || b.grace) return [];
+  // 不带位置的节奏音符（`X`，有声无音高）彼此算同音；带位置的（`[X@E5X@F5]`）同和音一样逐个配
+  if (a.rhythm && b.rhythm && (!a.notes.length || !b.notes.length)) return [[0, 0]];
+  if (!!a.rhythm !== !!b.rhythm) return [];
+  const out: [number, number][] = [];
+  const used = new Set<number>();
+  a.notes.forEach((x, i) => {
+    const j = b.notes.findIndex((y, k) => !used.has(k) && sameTiedNote(x, y));
+    if (j < 0) return;
+    used.add(j);
+    out.push([i, j]);
+  });
+  // 和音只有每个音都连得上才算延音线；只连其中几个的 123 写在括号里（`[1~3]`），整和音的弧仍是圆滑线
+  if (out.length < a.notes.length) return [];
+  for (const [i, j] of out) {
+    (a.notes[i]!.tie ??= {}).start = true;
+    (b.notes[j]!.tie ??= {}).stop = true;
+  }
+  return out;
+}
+
+/** 弧的两端（已归到宿主音）是不是同一路里相邻的两个同音：是就按 `tieSlur` 补上两端的 `Note.tie`、返回连上的音下标对，不是返回空。
+ *  同一路 = 声部 + 谱表 + voice，「相邻」按这一路里的先后算：`&` 第二声部夹在中间的第一声部前后两个音照样相邻 */
+function slurTieTester(song: Song): (start: ElementId, end: ElementId) => [number, number][] {
+  const at = new Map<ElementId, { el: Chord; lane: string; at: number }>();
+  const laneNext = new Map<string, number>();
+  for (const [pi, p] of song.parts.entries()) {
+    for (const m of p.measures) {
+      for (const el of m.elements) {
+        if (el.kind !== "chord") continue;
+        const lane = `${pi}/${el.staff}/${el.voice}`;
+        const k = laneNext.get(lane) ?? 0;
+        laneNext.set(lane, k + 1);
+        at.set(el.id, { el, lane, at: k });
+      }
+    }
+  }
+  return (start, end) => {
+    const [a, b] = [at.get(start), at.get(end)];
+    return a && b && a.lane === b.lane && b.at === a.at + 1 ? tieSlur(a.el, b.el) : [];
+  };
+}
+
+/** 有自己延音线写法的源格式（ABC、Muse 的 `-`）：括号就是圆滑线，相邻同音也不当延音线（`ProjectOptions.slurTies`） */
+export const hasTieSyntax = (doc: Pick<ScoreDoc, "sourceFormat">): boolean => doc.sourceFormat === "abc" || doc.sourceFormat === "jcx";
+
+/** 简谱口径的歌写进有 `-` 的格式（ABC、Muse）之前：相邻同音的弧换成延音线（两端补 `Note.tie`、记号改 `tied`），
+ *  否则 123 的 `(1 1)` 照写成 `(C C)`，读回是圆滑线。MusicXML 形状的原样返回（那边圆滑线与延音线本就分开） */
+export function slursAsTies(src: Song): Song {
+  if (isXmlShaped(src) || !src.marks.some((m) => m.type === "slur")) return src;
+  const song: Song = structuredClone(src);
+  const hosts = sustainHosts(song);
+  const slurTie = slurTieTester(song);
+  const marks: Mark[] = [];
+  for (const mk of song.marks) {
+    const start = hosts.get(mk.start) ?? mk.start;
+    const end = hosts.get(mk.end) ?? mk.end;
+    const pairs = mk.type === "slur" && !mk.collapsed ? slurTie(start, end) : [];
+    if (!pairs.length) {
+      marks.push(mk);
+      continue;
+    }
+    for (const [i, j] of pairs) marks.push({ type: "tied", start, end, ...(i ? { startNote: i } : {}), ...(j ? { endNote: j } : {}) });
+  }
+  song.marks = marks;
+  return song;
 }
 
 /** 记号端点归到写得出来的音符上；没收口、倒置、端点不在谱面元素上的丢掉；弧线补 number。 */
-function normalizeMarks(song: Song, hosts: Map<ElementId, ElementId>): void {
+function normalizeMarks(song: Song, hosts: Map<ElementId, ElementId>, slurTies: boolean): void {
   const written = new Set<ElementId>();
   const order = new Map<ElementId, number>();
   for (const p of song.parts) {
@@ -633,10 +718,7 @@ function normalizeMarks(song: Song, hosts: Map<ElementId, ElementId>): void {
       }
     }
   }
-  const chordAt = new Map<ElementId, { el: Chord; part: number }>();
-  for (const [pi, p] of song.parts.entries()) {
-    for (const m of p.measures) for (const el of m.elements) if (el.kind === "chord") chordAt.set(el.id, { el, part: pi });
-  }
+  const slurTie = slurTieTester(song);
   const marks: Mark[] = [];
   for (const mk of song.marks) {
     if (mk.type === "wedge") {
@@ -648,9 +730,9 @@ function normalizeMarks(song: Song, hosts: Map<ElementId, ElementId>): void {
     const end = hosts.get(mk.end) ?? mk.end;
     if (!written.has(start) || !written.has(end)) continue;
     if ((mk.type === "slur" || mk.type === "tuplet") && order.get(start)! >= order.get(end)!) continue;
-    const [a, b] = [chordAt.get(start)!, chordAt.get(end)!];
-    if (mk.type === "slur" && a.part === b.part && order.get(end)! === order.get(start)! + 1 && tieSlur(a.el, b.el)) {
-      marks.push({ type: "tied", start, end });
+    const pairs = mk.type === "slur" && slurTies ? slurTie(start, end) : [];
+    if (pairs.length) {
+      for (const [i, j] of pairs) marks.push({ type: "tied", start, end, ...(i ? { startNote: i } : {}), ...(j ? { endNote: j } : {}) });
       continue;
     }
     marks.push({ ...mk, start, end });
@@ -725,6 +807,7 @@ function projectPart(
   /** 各小节末在原小节里的拍位（拆开的后半从前半末尾接着数） */
   const ends = new Map<Measure, number>();
   const carries = new Map<Measure, AccidentalCarry>();
+  const staffCarries = new Map<Measure, StaffAccidentalCarry>();
   for (const [mi, m] of part.measures.entries()) {
     const cont = continuationOf.get(m);
     const onset = cont ? (ends.get(cont) ?? 0) : 0;
@@ -742,12 +825,17 @@ function projectPart(
     if (clef) octave = clef.octaveChange ?? 0;
     const carry = (cont && carries.get(cont)) || new AccidentalCarry();
     carries.set(m, carry);
+    const staffCarry = (cont && staffCarries.get(cont)) || new StaffAccidentalCarry(fifths);
+    staffCarries.set(m, staffCarry);
     const dirs: Direction[] = [];
     // 小节内各声部的时间游标。一个小节里出现两个以上 voice 只有一种来源：ABC `&` 的临时多声部
-    // （§7.4，`j123/parse.ts`），各分支都从小节起点重新计时；其余来源整条 part 就是一个声部。
+    // （§7.4，`abcfamily/parse.ts`），各分支都从小节起点重新计时；其余来源整条 part 就是一个声部。
     const cursors = new Map<number, number>();
     const overlay = new Set(m.elements.map((el) => el.voice || 1)).size > 1;
     let pos = 0;
+    /** 要定印不印记号的音与它的起点：`&` 的各支一支接一支排，第二支第 1 拍的 C 排在第一支第 3 拍的 C♯ 后面，
+     *  按元素先后定就多印一个还原号。同时刻的照原次序（倚音在主音前） */
+    const staffMarks: { t: number; n: Chord["notes"][number] }[] = [];
     for (const el of m.elements) {
       // 简谱来源一个 part 就是一个声部：`<voice>` 一律写 1（文本谱 `Q2:` 的声部号是 part 的事）。
       // **临时多声部例外**：解析已经定好的分支号照原样留着，覆盖掉就把两条并行旋律串成一条了。
@@ -770,6 +858,9 @@ function projectPart(
         if (!n.pitch && n.degree && n.degree.number > 0) {
           n.pitch = carry.pitch(n.degree, { fifths });
           n.pitch.octave += octave;
+          // 谱表上印的记号（`<accidental>`）按五线谱口径另算：源文的记号是简谱的（相对调号、按唱名延续），
+          // 照抄在非 C 调、跨八度处都不对；`.jpwabc`/文本谱则根本没写，谱表上一个记号都不印。小节走完按时刻排了再定（`marks`）
+          staffMarks.push({ t: pos, n });
         }
       }
       if (ch.grace) {
@@ -793,20 +884,31 @@ function projectPart(
       };
       if (!realBeams) delete ch.beams;
 
-      // 增时线上的和弦：拍位从本音符起算（本体时值 + 前面的增时线条数）
+      // 增时线上的和弦：拍位从本音符起算（本体时值 + 前面的增时线条数），搬成 MusicXML 形状的 `laterHarmonies`（带 offset，
+      // 同 `fromxml`）——留在增时线上的话，再投回简谱（`projectForJianpu` 按 `laterHarmonies` 重排增时线）就丢了
       const bodyQuarters = (nominal - (ch.sustains?.length ?? 0) * SIMPLE_DIVISIONS) / SIMPLE_DIVISIONS;
       (ch.sustains ?? []).forEach((su, k) => {
         if (!su.harmony) return;
         const off = (bodyQuarters + k) * SIMPLE_DIVISIONS * factor * (r ? r.normal / r.actual : 1);
-        su.harmony = { ...su.harmony, offset: Math.round(off) };
+        (ch.laterHarmonies ??= []).push({ ...su.harmony, offset: Math.round(off) });
+        delete su.harmony;
       });
 
       projectOrnaments(ch, dirs, pos);
-      if (ch.sectionWord) push(dirs, pos, { type: "words", placement: "above", text: ch.sectionWord });
+      // 分行的几条（123 连写的 `"^…""^…"`）各成一条 `<words>`，先写的在上
+      for (const line of (ch.sectionWord ?? "").split("\n")) if (line) push(dirs, pos, { type: "words", placement: "above", text: line });
       ch.lyrics = lyricsOf(ch.lyrics);
       if (!ch.lyrics.length) delete ch.lyrics;
       pos += ch.duration.divisions;
       cursors.set(voice, pos);
+    }
+    for (const { n } of staffMarks.sort((a, b) => a.t - b.t)) {
+      const acc = staffCarry.mark(n.pitch!, !!n.tie?.stop);
+      if (acc) n.accidental = acc;
+      else {
+        delete n.accidental;
+        delete n.accidentalParentheses;
+      }
     }
     // 小节长度取各分支最远的终点，**不是各分支时值之和**
     pos = Math.max(0, ...cursors.values());
@@ -970,31 +1072,44 @@ function projectOrnaments(ch: Chord, dirs: Direction[], pos: number): void {
     : (ch.notations?.articulations ?? []).map((name) => ({ name, level: 0 }));
   const n: Notations = {};
   if (ch.notations?.fermata) n.fermata = true;
+  if (ch.notations?.arpeggiate) n.arpeggiate = true;
   const artic: string[] = [];
   const orn: string[] = [...(ch.notations?.ornaments ?? [])];
+  const tech: string[] = [...(ch.notations?.technical ?? [])];
+  if (ch.notations?.tremolo) n.tremolo = ch.notations.tremolo;
   for (const { name } of names) {
+    const strokes = tremoloStrokes(name);
+    if (strokes) { n.tremolo = strokes; continue; }
+    const head = noteheadOf(name);
+    if (head) { for (const nt of ch.notes) nt.notehead = head; continue; }
+    const mark = rehearsalOf(name);
+    if (mark) { push(dirs, pos, { type: "rehearsal", placement: "above", text: mark }); continue; }
     // 本来就是 MusicXML 元素名的原样留（`staccatissimo` 不能归成普通顿音）；其余按别名表归一成短名再查
     // （123 的 `!uppermordent!` `!顿音!` 这类，`deconames.ts`）
     const key = XML_ARTICULATIONS.has(name) || XML_ORNAMENTS.has(name) ? name : decoKey(name) ?? name;
     if (FERMATA.test(key)) { n.fermata = true; continue; }
+    if (key === "arp") { n.arpeggiate = true; continue; }
     const a = ARTICULATION[key] ?? (XML_ARTICULATIONS.has(key) ? key : undefined);
     if (a) { if (!artic.includes(a)) artic.push(a); continue; }
     const o = ORNAMENT_TAG[key] ?? (XML_ORNAMENTS.has(key) ? key : undefined);
     if (o) { if (!orn.includes(o)) orn.push(o); continue; }
-    const d = directionOf({ name, level: 0 });
+    const tk = TECHNICAL[key];
+    if (tk) { if (!tech.includes(tk)) tech.push(tk); continue; }
+    // 归一后再查：123 的 `!coda!` `!segno!` 挂在音符上（小节中间的跳转目标）时是 ABC 名，按原名查不到、整个丢了
+    const d = directionOf({ name: key, level: 0 });
     if (d) push(dirs, pos, d);
   }
   if (artic.length) n.articulations = artic;
   if (orn.length) n.ornaments = orn;
-  if (ch.notations?.technical?.length) n.technical = ch.notations.technical;
-  if (n.fermata || n.articulations || n.ornaments || n.technical) ch.notations = n;
+  if (tech.length) n.technical = tech;
+  if (n.fermata || n.arpeggiate || n.articulations || n.ornaments || n.technical || n.tremolo) ch.notations = n;
   else delete ch.notations;
 }
 
 /** 力度、术语、伴奏括弧、跳转记号 → `<direction>`。 */
 function directionOf(o: SourceOrnament): Direction | null {
   const name = o.name;
-  if (DYNAMICS[name]) return { type: "dynamics", placement: "below", text: name };
+  if (isDynamicName(name)) return { type: "dynamics", placement: "below", text: name };
   if (TERMS[name]) return { type: "words", placement: "above", text: TERMS[name] };
   if (name === "zkh" || name === "ykh") return { type: "bracket", placement: "above", spanType: name === "zkh" ? "start" : "stop" };
   if (name === "fine") return { type: "words", placement: "above", text: "Fine", sound: { fine: true } };

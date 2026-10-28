@@ -647,7 +647,7 @@ export function splitArcUnderGlyph(bin: Binary, comps: Component[], numH: number
   let nextId = 7_100_000;
   for (const k of comps) {
     const b = k.bbox;
-    if (b.w < numH * 1.5 || b.h <= numH * 1.05 || b.h > numH * 2) { out.push(k); continue; }
+    if (b.w < numH * 1.5 || b.h <= numH * 0.8 || b.h > numH * 2) { out.push(k); continue; }
     const sub: Binary = { w: b.w, h: b.h, data: new Uint8Array(b.w * b.h) };
     for (let yy = 0; yy < b.h; yy++) for (let xx = 0; xx < b.w; xx++) sub.data[yy * b.w + xx] = bin.data[(b.y + yy) * bin.w + b.x + xx];
     const labels = new Int32Array(b.w * b.h);
@@ -684,8 +684,10 @@ export function splitArcUnderGlyph(bin: Binary, comps: Component[], numH: number
     const endY = Math.min(low[best.x0]!, low[best.x1]!);
     if (runW < numH * 1.2 || t0 > numH * 0.15 || endY - topY < numH * 0.15) { out.push(k); continue; }
     // 弧的像素：段内每列最低墨点往上一个中位厚（加一像素余量）；立在弧上的字脚高出这一截，归字
-    const cap = Math.ceil(t0) + 1;
-    const arcPx = (xx: number, yy: number) => inRun(xx) && yy <= low[xx]! && yy > low[xx]! - cap;
+    // 弧两端陡，竖着量比中位厚得多（48《祂是耶稣》`Am` 下那条短弧 84×21）：底段整段不过 0.2 字号的列整段归弧，
+    // 再厚的才是字脚连着弧，只取一个中位厚
+    const cap = Math.ceil(t0) + 1, capMax = Math.max(cap, numH * 0.2);
+    const arcPx = (xx: number, yy: number) => inRun(xx) && yy <= low[xx]! && yy > low[xx]! - (thick[xx]! <= capMax ? thick[xx]! : cap);
     const box = (pick: (xx: number, yy: number) => boolean): Component | null => {
       let x0 = Infinity, yy0 = Infinity, x1 = -1, yy1 = -1, area = 0;
       for (let yy = 0; yy < b.h; yy++) for (let xx = 0; xx < b.w; xx++) {
@@ -700,7 +702,26 @@ export function splitArcUnderGlyph(bin: Binary, comps: Component[], numH: number
     // 字得从弧顶以上起笔（字脚压在弧上，字身在上面）
     if (!arc || !glyph || glyph.bbox.y > arc.bbox.y - numH * 0.3) { out.push(k); continue; }
     probe("splitArcUnderGlyph");
-    out.push(arc, glyph);
+    // 弧两头各立着一个字（青年诗歌 60《经历基督作牧人》`A⌒⌒A7` 罩着 `7-6|5`）：字那份合成一个横跨整条弧的框，又被当成第二条弧。
+    // 按连通取字墨，横向挨着（间隙不过半个字号）的并成一组——同一个字的几笔（「利」的禾与刂）、`F#m` 的上标 ♯ 都留在一组；
+    // 隔得开的几组各成一块。碎屑（弧边上的一两个像素）不算
+    const rest: Binary = { w: b.w, h: b.h, data: new Uint8Array(b.w * b.h) };
+    for (let yy = 0; yy < b.h; yy++) for (let xx = 0; xx < b.w; xx++) if (own(xx, yy) && !arcPx(xx, yy)) rest.data[yy * b.w + xx] = 1;
+    const groups: Rect[] = [], areas: number[] = [];
+    for (const p of connectedComponents(rest, 4).filter((p) => Math.max(p.bbox.w, p.bbox.h) >= numH * 0.12).sort((p, q) => p.bbox.x - q.bbox.x)) {
+      const g = groups.length - 1;
+      if (g >= 0 && p.bbox.x - rright(groups[g]!) <= numH * 0.5) {
+        const u = groups[g]!, x0 = Math.min(u.x, p.bbox.x), y0 = Math.min(u.y, p.bbox.y);
+        groups[g] = { x: x0, y: y0, w: Math.max(rright(u), rright(p.bbox)) - x0, h: Math.max(rbottom(u), rbottom(p.bbox)) - y0 };
+        areas[g]! += p.area;
+      } else { groups.push({ ...p.bbox }); areas.push(p.area); }
+    }
+    out.push(arc);
+    if (groups.length <= 1) out.push(glyph);
+    else groups.forEach((g, i) => {
+      const r = { x: b.x + g.x, y: b.y + g.y, w: g.w, h: g.h };
+      out.push({ id: nextId++, bbox: r, area: areas[i]!, cx: rcx(r), cy: rcy(r) });
+    });
   }
   return out;
 }

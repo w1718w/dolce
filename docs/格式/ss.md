@@ -6,7 +6,7 @@
 >
 > 状态：解析/写出（`src/style/ss.ts`）、模板排版（`src/style/template.ts`）、`hymn500` 与 `kl2020` 两份歌本已落地；
 > 原样文档布局的内置表 `original` / `original-shige` 已落地；编辑器按 `I:style` / 手动选 / 自动查找装诗集样式表，
-> 只取字体、页眉字号、纸与配色（见 [../模块/样式与设置.md](../模块/样式与设置.md)），其余见 待办（本地私有仓库 `dev/docs/待办.md`） §2.3。
+> 只取字体、页眉字号、纸与配色（见 [../模块/样式与设置.md](../模块/样式与设置.md)），其余见 待办（本地私有仓库 `dev/docs/待办/格式与语料迁移.md`）「歌本」。
 > **认不出的名字一律解析期报 `行:列`**：规则、区域名、区域/行/格属性、各块的键、角色、过滤器、组件，不静默丢弃。
 
 ## 0. 为什么模板和样式放一个文件
@@ -83,6 +83,7 @@
 - **成书**也读 `@jianpu`（`keys.ts` 的 `book` 一列，落到 `BookStyle.metrics` / `layout`）：间距类写 `em`
   （基准是音符字号；`lyric-gap` `slur-thickness` `barline` `final-barline` 按歌词字号），线宽类（`bracket-width`、
   `repeat-dot-diameter`）写裸数 pt。例：`@jianpu { system-spread: 0.8575em; slur-gap: 0.154em; verse-numbers: auto; }`。
+  `verse-numbers` 五线谱/混排也读（每段首字前印一次段号，见[排版-五线谱混排](../模块/排版-五线谱混排.md)「自动段号」）。
   数值原样存进字段、不在读样式表时乘字号，所以重排结果逐位不变。
 - 简谱只有一个引擎，读 `@jianpu`（尺子 `JianpuStyle`）。多声部才有的 `voice-gap`、`double-barline-gap` 只在多声部谱上起作用。`barline-height`（小节线高，缺省 4/3 em）
   口径同一：上缘在数字基线上 3/4、下缘在下 1/4（缺省即 −1 em / +1/3 em），行内拍号竖向居中于它。
@@ -111,7 +112,7 @@
 
 键：`enable` `lines-per-page` `target-measures` `length-weight` `break-weight` `mid-break` `merge-short` `even-weight`
 `tail-weight` `content-only` `parallel-weight` `tail-long-weight` `more-rows-slack` `fit-slack`，
-各自的含义见 `pdflayout/bookstyle.ts::BookLayoutOpts`。
+各自的含义见 `style/bookstyle.ts::BookLayoutOpts`。
 
 ### 2.4 `@page`：纸
 

@@ -15,6 +15,7 @@
 import type {
   Barline,
   Chord,
+  Clef,
   Element,
   ElementId,
   Key,
@@ -24,22 +25,28 @@ import type {
   Part,
   ScoreDoc,
   Song,
+  Time,
 } from "../model/doc";
 import { SIMPLE_DIVISIONS } from "../model/doc";
 import { breakAfter, lyricOfVerse, type BreakKind } from "../model/helpers";
 import { beatGroupIndex, beatGroupSize } from "../engrave/beatgroup";
 import { lyricSlots, type LyricSlotRule } from "./lyricslot";
-import { arcsToNextNote, isLatinEnd, isLatinStart, isOneCjkWithPunct, nestArcsInTuplets, ownIds, ownMarks, partRanges, systemRanges, type SystemRange } from "../model/emitutil";
-import { harmonyText } from "../model/jianpu";
+import { arcsToNextNote, beamLevel1, isLatinEnd, isLatinStart, isOneCjkWithPunct, nestArcsInTuplets, ownIds, ownMarks, partRanges, systemRanges, type SystemRange } from "../model/emitutil";
+import { clefName, harmonyText } from "../model/jianpu";
 import { ORNAMENT_TAG } from "../model/xmlproject";
 import { BARLINE_ORNAMENT_NAME } from "./jumpmarks";
+import { chordNotehead, rehearsalOf } from "../model/deconames";
 import { tupletNormal123 } from "./parsedialect";
+import { isLyricApostrophe, isLyricTrailingPunct } from "../common/cjkpunct";
 import { chordSuffixForm } from "../score/harmonyparse";
 
 /** MusicXML 的 `<ornaments>` 元素名 → 123 记号名：`xmlproject.ts::ORNAMENT_TAG` 反过来（同名的取第一个）。 */
 const ORNAMENT_NAME: Readonly<Record<string, string>> = Object.fromEntries(
   Object.entries(ORNAMENT_TAG).reverse().map(([name, tag]) => [tag, name]),
 );
+
+/** MusicXML 的 `<technical>` 元素名 → 123 记号名（ABC 标准名）。别的 technical（指法、拨弦…）认不出，原名写出、读回不画 */
+const TECHNICAL_NAME: Readonly<Record<string, string>> = { "up-bow": "upbow", "down-bow": "downbow" };
 
 export interface MarkIndex {
   slurStart: Map<number, number>;
@@ -92,8 +99,9 @@ export interface LyricStyle {
   /** 一格里的字读回会被拆成几格时怎么写；缺省是多个 CJK 字包 `{}`。给了它就**每格都过一遍**（不只含 CJK 的）：
    *  Muse 没有花括号，用 `~` 连（`你~们`、`1.~圣`、`the~Lord`），读回会拆开的地方都要连上 */
   joinMulti?(text: string): string;
-  /** 印刷段号写不写（Muse 没有这种写法，写了会当成歌词印出来） */
-  labels?: boolean;
+  /** 印刷段号写不写（Muse 没有这种写法，写了会当成歌词印出来）；`tilde` = ABC 惯例，数字段号写在首字前 `1.~道`
+   *  （别的段号仍写 `<副歌>`） */
+  labels?: boolean | "tilde";
   /** 一字多音的延长位怎么写；缺省 `_`。Muse 只有 `*` */
   extend?: string;
 }
@@ -120,6 +128,8 @@ export function lyricLines(
   for (let verse = 1; verse <= maxVerse; verse++) {
     let body = "";
     let label: string | undefined;
+    /** 段号已写在首字前（`1.~道`），行首不再写 `<1.>` */
+    let labelInline = false;
     /** 末尾连续的空位不必写出来（ABC：音节少于音符是合法的） */
     let pendingSkips = "";
     /** 上一个字带了 `_`（延长到下一音符）——那个空位已由 `_` 表达，**不要再补 `*`**，
@@ -162,17 +172,24 @@ export function lyricLines(
       // 「一个字 + 标点」（`哦，` `“主` `主。”`）读回本来就是一个音节，不包——手写的样子就是这样。
       // 但后面要接词内 `-` 的仍然包：CJK 分支不认字后的 `-`（211《等主来》的 `{来”}-`）。
       const inWordNext = hit.syllabic === "begin" || hit.syllabic === "middle";
-      const needBrace = [...hit.text].length > 1 && /[\u3400-\u9fff]/u.test(hit.text)
-        && (inWordNext || !isOneCjkWithPunct(hit.text));
+      const needBrace = ([...hit.text].length > 1 && /[\u3400-\u9fff]/u.test(hit.text)
+        && (inWordNext || !isOneCjkWithPunct(hit.text))) || splitsOnRead(hit.text);
       // 不包 `{}` 的拉丁词里的字面 `-` 与跳音符要转义，否则读回被拆开（`and/or`）
       const bare = skip === "/" ? hit.text.replace(/[/-]/g, (c) => `\\${c}`) : hit.text;
       const joined = style.joinMulti ? style.joinMulti(hit.text) : needBrace ? `{${hit.text}}` : bare;
+      if (style.labels === "tilde" && hit.verseLabel !== undefined && hit.verseLabel === label && /^\d+[.．、]?$/.test(label) && !labelInline) {
+        body += `${label}~`;
+        labelInline = true;
+      }
       body += (hit.leadingPunctuation ?? "") + joined + (hit.trailingPunctuation ?? "");
       prevSyllabic = hit.syllabic;
       // 以转义字符收尾（`How\-`）同样会被下一个拉丁词粘上，也要空格；
       // 拉丁词后跟半角标点（`grace,`）读回不会粘，但照英文排版也空一格（`grace, how`），全角标点（`grace，`）照中文不空
-      prevLatin = hit.trailingPunctuation
-        ? isLatinEnd(hit.text) && /^[!-~]+$/.test(hit.trailingPunctuation)
+      // MusicXML 来的字标点还连在 `text` 里（`ly,`），读回 123 才拆成 `trailingPunctuation`：两种一样算，转一圈写法不变
+      const tail = hit.trailingPunctuation ?? /[!"'),.:;?\]}]+$/.exec(hit.text)?.[0];
+      const core = hit.trailingPunctuation || !tail ? hit.text : hit.text.slice(0, -tail.length);
+      prevLatin = tail
+        ? isLatinEnd(core) && /^[!-~]+$/.test(tail)
         : isLatinEnd(hit.text) || (!needBrace && /[/-]$/.test(bare) && bare !== hit.text);
       if (hit.extend) {
         body += sep + ext;
@@ -183,11 +200,23 @@ export function lyricLines(
     }
     // 词内分音节跨行（`mid-` 在行末）：`-` 照写，不然读回丢了 syllabic
     if (body !== "" && (prevSyllabic === "begin" || prevSyllabic === "middle")) body += "-";
-    bodies.push(body === "" ? "" : `${label !== undefined && style.labels !== false ? `<${label}>` : ""}${body}`);
+    bodies.push(body === "" ? "" : `${label !== undefined && style.labels !== false && !labelInline ? `<${label}>` : ""}${body}`);
   }
   // 尾部没词的段不必写（ABC：段数少于最大段号是合法的）
   while (bodies.length > 0 && bodies[bodies.length - 1] === "") bodies.pop();
   return bodies.map((b) => `w:${b}`);
+}
+
+/**
+ * 拉丁音节读回会被拆开：中间夹着空白，或收尾标点后面还接着字（识别把 `dumb,` `Your` 两格读成了一格 `dumb,Your`）——
+ * 读入端（`abcfamily/parse.ts::parseLyricLine`）在收尾标点处收一个音节，后面的字另起一格，整段往后错一格。这种包 `{}`。
+ */
+function splitsOnRead(text: string): boolean {
+  if (/\s/.test(text.trim())) return true;
+  for (let k = 0; k + 1 < text.length; k++) {
+    if (isLyricTrailingPunct(text[k]!) && !isLyricApostrophe(text, k) && !isLyricTrailingPunct(text[k + 1]!)) return true;
+  }
+  return false;
 }
 
 /** 字段值里的行界。裸 `\r` 也算（文本谱原文行内夹着的）：带着它写出去，读回按行切开，后半截就成了另一行。 */
@@ -231,6 +260,63 @@ function playOrderText(song: Song): string {
 }
 
 
+/** `I:score` 的值（ABC §11.1）：大谱表的几条谱表用花括号括起（`{1 2}`），`<part-group>` 的括号 / 花括号包住各自的声部。
+ *  只写最外层一层（读入端只认最外层）：组里有大谱表的，大谱表那层让给组。没有可写的返回 null。 */
+export function scoreDirective(song: Song): string | null {
+  const vno = new Map(song.parts.map((p, i) => [p.id, String(i + 1)]));
+  // 一个声部连同它的从属谱表算一个单位
+  const units: { ids: string[]; text: string }[] = [];
+  for (const p of song.parts) {
+    if (p.staffOf && vno.has(p.staffOf)) continue;
+    const ids = [p.id, ...song.parts.filter((q) => q.staffOf === p.id).map((q) => q.id)];
+    units.push({ ids, text: ids.map((id) => vno.get(id)!).join(" ") });
+  }
+  const groups = (song.partGroups ?? []).filter((g) => g.symbol === "bracket" || g.symbol === "brace");
+  if (!groups.length && units.every((u) => u.ids.length === 1)) return null;
+  const out: string[] = [];
+  for (let i = 0; i < units.length; ) {
+    const g = groups.find((x) => x.parts[0] !== undefined && units[i]!.ids.includes(x.parts[0]));
+    if (g) {
+      const inG = (u: { ids: string[] }): boolean => u.ids.some((id) => g.parts.includes(id));
+      let j = i;
+      while (j < units.length && inG(units[j]!)) j++;
+      const [l, r] = g.symbol === "bracket" ? ["[", "]"] : ["{", "}"];
+      out.push(l + units.slice(i, j).map((u) => u.text).join(" ") + r);
+      i = Math.max(j, i + 1);
+      continue;
+    }
+    const u = units[i]!;
+    out.push(u.ids.length > 1 ? `{${u.text}}` : u.text);
+    i++;
+  }
+  return out.join(" ");
+}
+
+/** MusicXML 写明的符杠分组（第一层 `begin` … `end`，各声部分开）；一个 `begin` 都没有（简谱来源的减时线占位）为 null。 */
+export function xmlBeamGroups(mea: Measure): Map<ElementId, number> | null {
+  if (!mea.elements.some((e) => e.kind === "chord" && beamLevel1(e.beams) === "begin")) return null;
+  const out = new Map<ElementId, number>();
+  const open = new Map<number, number>();
+  let next = 0;
+  for (const el of mea.elements) {
+    if (el.kind !== "chord" || el.grace) continue;
+    const voice = el.voice > 1 ? el.voice : 1;
+    const b = beamLevel1(el.beams);
+    if (b === "begin") open.set(voice, ++next);
+    const g = open.get(voice);
+    if (g !== undefined && (b === "begin" || b === "continue" || b === "end")) out.set(el.id, g);
+    if (b === "end" || b === undefined) open.delete(voice);
+  }
+  return out;
+}
+
+/** 拍号的写法：印成 `C` / `₵` 的（MusicXML `<time symbol>`）写 `C` / `C|`（ABC §3.1.6，123 同），其余写分数 */
+export function timeText(t: Time): string {
+  if (t.symbol === "common" && t.beats === 4 && t.beatType === 4) return "C";
+  if (t.symbol === "cut" && t.beats === 2 && t.beatType === 2) return "C|";
+  return `${t.beats}/${t.beatType}`;
+}
+
 export abstract class AbcFamilyEmitter {
   /** 文件头的版本声明行（`%123-1.0` / `%abc-2.1`）。 */
   protected abstract readonly versionLine: string;
@@ -255,7 +341,7 @@ export abstract class AbcFamilyEmitter {
 
   /** `M:` 的值。默认只写头一个拍号——并排的混合拍是 123 的扩展，标准 ABC 读不了（见 emit123）。 */
   protected timeValue(song: Song): string | null {
-    return song.time ? `${song.time.beats}/${song.time.beatType}` : null;
+    return song.time ? timeText(song.time) : null;
   }
 
   /** `V:n` 首次出现时跟在声部号后面的属性：多声部时的声部名 `name="女高"` / `subname="S"`（ABC §3.1.20；
@@ -292,6 +378,127 @@ export abstract class AbcFamilyEmitter {
    *  123 没有单独的 tie 写法；ABC 不是，它有 `-`（见 `tieText`）。 */
   protected readonly tiesAsSlurs: boolean = false;
 
+  /** 和音里单连一个音的延音线写在括号里那个音后面（123 `[1~3]`，同 ABC `[C-E]`）：`chordText` 照它补 `~` */
+  protected readonly noteTieAfter = new Set<Note>();
+
+  /**
+   * 同一对相邻和弦之间的延音线（MusicXML 一个音一条 `<tied>`）先归并再当弧写：连上了写出的每个音的并成一条整和音的弧
+   * （三音和弦以前写成三层括号 `((([135]-`）；只连其中几个的从弧里拿掉、记进 `noteTieAfter`，写成括号里的 `~`。
+   */
+  private chordTies(part: Part, marks: Mark[]): Mark[] {
+    this.noteTieAfter.clear();
+    const chordOf = new Map<number, Chord>();
+    for (const m of part.measures) for (const el of m.elements) if (el.kind === "chord") chordOf.set(el.id, el);
+    const groups = new Map<string, Mark[]>();
+    for (const m of marks) {
+      if (m.type !== "tied") continue;
+      const k = `${m.start}>${m.end}`;
+      groups.set(k, [...(groups.get(k) ?? []), m]);
+    }
+    const drop = new Set<Mark>();
+    for (const g of groups.values()) {
+      const ch = chordOf.get(g[0]!.start);
+      if (!ch) continue;
+      const written = this.chordNotes(ch);
+      const tied = new Set(g.map((m) => ch.notes[m.startNote ?? 0]).filter((n): n is Note => !!n && written.includes(n)));
+      if (written.length > 1 && tied.size > 0 && tied.size < written.length) {
+        for (const n of tied) this.noteTieAfter.add(n);
+        for (const m of g) drop.add(m);
+      } else for (const m of g.slice(1)) drop.add(m);
+    }
+    return drop.size ? marks.filter((m) => !drop.has(m)) : marks;
+  }
+
+  /** 第 `i` 小节头上换成的谱号名（第一行谱表）；不换返回 null。小节中间的换谱号过了半小节的算下一小节的
+   *  （写得出小节中间换谱号的方言另在原位写，`midClefs`，这里只看小节头）。 */
+  private clefAt(part: Part, i: number): string | null {
+    const staff1 = (a: { clefs?: Clef[] } | undefined): Clef | undefined => a?.clefs?.find((x) => (x.staff ?? 1) === 1);
+    if (this.midClefs) {
+      const c = staff1(part.measures[i]?.attrs);
+      return c ? clefName(c) : null;
+    }
+    const mid = (m: Measure | undefined, late: boolean): Clef | undefined => {
+      const hits = (m?.laterAttrs ?? []).filter((la) => (la.afterElements * 2 >= m!.elements.length) === late && staff1(la.attrs));
+      return hits.length ? staff1(hits[hits.length - 1]!.attrs) : undefined;
+    };
+    const c = mid(part.measures[i], false) ?? staff1(part.measures[i]?.attrs) ?? (i > 0 ? mid(part.measures[i - 1], true) : undefined);
+    return c ? clefName(c) : null;
+  }
+
+  /** 第 `i` 小节起的多小节休止能写成 `Zn` 就返回 n，否则 0。整串都得是干净的整小节休止：
+   *  没有记号、文字、和弦、歌词，中间的小节不换调号拍号谱号、不带左线与特殊右线、不在中间换行，且不跨出本行（`to`）。
+   *  单独一个整小节休止（`rest.measure`，投影把它拆成了一拍一个 `0`）返回 1，写 `Z`。 */
+  private multiRestRun(part: Part, i: number, to: number): number {
+    if (!this.multiRests) return 0;
+    const head = part.measures[i];
+    const lone = !!head?.elements.some((el) => el.kind === "chord" && !!el.rest?.measure)
+      && head.elements.every((el) => el.kind === "chord" && !!el.rest && el.printObject !== false && el.voice === head.elements[0]!.voice);
+    const multi = head?.attrs?.multiRest ?? 0;
+    const n = multi >= 2 ? multi : lone ? 1 : 0;
+    if (!n || i + n - 1 > to || i + n - 1 >= part.measures.length) return 0;
+    for (let j = i; j < i + n; j++) {
+      const m = part.measures[j]!;
+      // 头一个小节可以带记号与文字（排练号、力度、pizz），写在 `Z` 前面（`multiRestText`）
+      const plainNotations = (el: Chord): boolean => !el.notations
+        || (j === i && Object.keys(el.notations).every((k) => k === "articulations"));
+      const clean = m.elements.length > 0 && m.elements.every((el) => el.kind === "chord" && !!el.rest && !el.grace
+        && plainNotations(el) && !el.ornaments?.length && (j === i || !el.sectionWord) && !el.harmony && !el.lyrics?.length);
+      if (!clean || m.directions?.length || m.laterAttrs?.length) return 0;
+      if (j > i && (m.attrs || m.barlines?.some((b) => b.location === "left"))) return 0;
+      if (j < i + n - 1 && (breakAfter(part, j) || m.barlines?.some((b) => b.location === "right" && (b.style !== "regular" || b.repeat || b.ending || b.ornaments?.length)))) return 0;
+    }
+    return n;
+  }
+
+  /** `Zn` 连同头一个小节休止上挂的记号与文字（`"^pizz"!rehearsal=B!Z3`）。 */
+  private multiRestText(mea: Measure, n: number): string {
+    let s = "";
+    for (const el of mea.elements) {
+      if (el.kind !== "chord") continue;
+      if (el.sectionWord) s += this.annotationText(el.sectionWord);
+      for (const a of el.notations?.articulations ?? []) if (this.rehearsalMarks || rehearsalOf(a) === undefined) s += `!${a}!`;
+    }
+    return `${s}Z${n > 1 ? n : ""}`;
+  }
+
+  /** 排练号 `!rehearsal=A!` 写不写（123 的扩展，ABC 与 Muse 读不懂）。 */
+  protected readonly rehearsalMarks: boolean = false;
+  /** 弓法 `!upbow!` `!downbow!` 与单音震音 `!///!` 写不写（ABC 的写法；Muse 没有这些装饰名）。 */
+  protected readonly bowAndTremolo: boolean = true;
+
+  /** 多小节休止写不写成 `Zn`。123 写；ABC 的 `Z` 同义但各家软件的读法不一，先只给 123。 */
+  protected readonly multiRests: boolean = false;
+
+  /** 曲中换谱号写不写（`[K:clef=…]`）。123 写；ABC、Muse 那两档读入端没接，先不写。 */
+  protected readonly inlineClefs: boolean = false;
+  /** 小节中间的换谱号（`laterAttrs`）在原位写 `[K:clef=…]`（ABC 的行内字段哪儿都能写）；否则落到较近的那个小节头（`clefAt`） */
+  protected readonly midClefs: boolean = false;
+  /** `measureBody` 写出的最后一个小节中间的谱号（`partSystems` 据此接着比下一小节头的谱号） */
+  private lastMidClef: string | null = null;
+
+  /** 这一小节中间第一行谱表换谱号的时刻（实际时值，四分 = `SIMPLE_DIVISIONS`）与谱号名，按时刻排 */
+  private midClefChanges(mea: Measure): { t: number; name: string }[] {
+    const later = (mea.laterAttrs ?? []).filter((la) => la.attrs.clefs?.some((c) => (c.staff ?? 1) === 1));
+    if (!later.length) return [];
+    const ends: number[] = [];
+    let end = 0;
+    for (const el of mea.elements) {
+      const tm = el.kind === "chord" || el.kind === "space" ? el.duration?.timeMod : undefined;
+      const len = el.kind === "chord" && el.grace ? 0 : (el.duration?.divisions ?? 0) * (tm ? tm.normal / tm.actual : 1);
+      end = (el.onset ?? end) + len;
+      ends.push(end);
+    }
+    return later.flatMap((la) => {
+      const name = clefName(la.attrs.clefs!.find((c) => (c.staff ?? 1) === 1)!);
+      return name ? [{ t: la.onset ?? (la.afterElements > 0 ? ends[Math.min(la.afterElements, ends.length) - 1]! : 0), name }] : [];
+    }).sort((a, b) => a.t - b.t);
+  }
+
+  /** 和弦里只连其中几个音时写在那个音后面的记号（123 的 `[1~3]`，见 `chordTies`）。整和弦都连的写在和弦后（`tieText`） */
+  protected noteTieText(n: Note, notes: readonly Note[]): string {
+    return notes.length > 1 && this.noteTieAfter.has(n) ? "~" : "";
+  }
+
   /** 延音线（ABC 专有：tie 的 start 端写 `-`）。 */
   protected tieText(ch: Chord): string {
     void ch;
@@ -299,7 +506,8 @@ export abstract class AbcFamilyEmitter {
   }
 
   /** 节奏音符 `X`（123 扩展）。 */
-  protected rhythmText(): string {
+  protected rhythmText(ch: Chord): string {
+    void ch;
     return "X";
   }
 
@@ -378,7 +586,7 @@ export abstract class AbcFamilyEmitter {
     return out;
   }
 
-  /** 小节内临时多声部的分隔符（ABC 的 `&`，§7.4）。123 没有这个记号，恒为 null。 */
+  /** 小节内临时多声部的分隔符（ABC 的 `&`，§7.4；123 同）。null = 这个格式写不出（Muse）。 */
   protected readonly overlayText: string | null = null;
 
   /** 临时声部起点晚于小节起点时，用来占住前面那段时间的不可见休止（ABC 的 `x`）。
@@ -405,6 +613,9 @@ export abstract class AbcFamilyEmitter {
    *  后面的 `w:` 歌词行就成了孤儿。 */
   protected readonly trailingBreak: boolean = true;
 
+  /** 换页单独占一行写在两个系统之间（ABC 的 `%%newpage`）；null = 换页由 `breakText` 写在行内（123 的 `$$`） */
+  protected readonly pageBreakLine: string | null = null;
+
   /** 渐强渐弱的起止怎么写：缺省是 ABC 的装饰 `!crescendo(!` … `!crescendo)!`（123 同）；Muse 写 `(<` … `<)`。
    *  null = 这种方言写不出。 */
   protected wedgeText(type: "crescendo" | "diminuendo", edge: "start" | "stop"): string | null {
@@ -416,10 +627,11 @@ export abstract class AbcFamilyEmitter {
 
   /** 段落词/注记（`Chord.sectionWord`）怎么写：ABC §4.19 的注记，`^` = 标在上方。 */
   protected annotationText(word: string): string {
-    return `"^${word}"`;
+    // 分行的几条各写一条注记（ABC §4.19：同方位连写的分行印、先写的在上）
+    return word.split("\n").filter((l) => l !== "").map((l) => `"^${l}"`).join("");
   }
 
-  /** 段落词写在和弦名之前（Muse：两者都是引号，读入端靠先后分，见 `j123/parse.ts` 的 `chord` 分支）。 */
+  /** 段落词写在和弦名之前（Muse：两者都是引号，读入端靠先后分，见 `abcfamily/parse.ts` 的 `chord` 分支）。 */
   protected readonly annotationBeforeChord: boolean = false;
 
   /** 歌词行的方言写法（`LyricStyle`）。 */
@@ -452,12 +664,12 @@ export abstract class AbcFamilyEmitter {
     const ch = el;
     let s = "";
     if (ch.rhythm) {
-      s = this.rhythmText();
+      s = this.rhythmText(ch);
     } else if (ch.rest) {
       s = this.restText(ch);
     } else {
       const notes = this.chordNotes(ch);
-      s = this.chordGroupText(notes.map((n) => this.noteText(n)).join(""), notes.length);
+      s = this.chordGroupText(notes.map((n) => this.noteText(n) + this.noteTieText(n, notes)).join(""), notes.length);
     }
     s += this.durationText(ch);
     s += this.tieText(ch);
@@ -500,6 +712,7 @@ export abstract class AbcFamilyEmitter {
     const tupletEnd = new Map<number, { count: number; outerArcs: number }>();
     const isArc = (m: Mark): boolean => m.type === "slur" || (m.type === "tied" && this.tiesAsSlurs);
     let marks = ownMarks(song, own);
+    if (this.tiesAsSlurs) marks = this.chordTies(part, marks);
     // 123 的多连音与弧共用括号、只许嵌套：连到下一个音的写成 `~`，其余跨出组的弧截进组内（`planSave` 另报 `slurCrossTuplet`）
     const arcNext = new Set<number>();
     if (this.tupletCloses) {
@@ -536,11 +749,13 @@ export abstract class AbcFamilyEmitter {
       tupletStart.set(m.start, ts);
     }
 
-    // 曲中转调/转拍号写成行内 `[K:]` `[M:]`（解析端 `j123/parse.ts` 的 inlineField 认得）。
+    // 曲中转调/转拍号写成行内 `[K:]` `[M:]`（解析端 `abcfamily/parse.ts` 的 inlineField 认得）。
     // 以前不写：MusicXML 里 A♭ 转 A 的谱（019《拥戴祂为王》）转成 123 后后半首整体差半音
     let key = song.key ? this.keyValue(song.key) : "";
-    const timeOf = (t: { beats: number; beatType: number } | undefined): string => (t ? `${t.beats}/${t.beatType}` : "");
+    const timeOf = (t: Time | undefined): string => (t ? timeText(t) : "");
     let time = timeOf(song.time);
+    /** 当前谱号名（曲中换谱号才写 `[K:clef=…]`） */
+    let clef = "treble";
     this.curTime = song.time ?? { beats: 4, beatType: 4 };
     /** 收一行：换行标记若是（或带着）真换行，join 出来的两侧空格要收掉；末尾的换行也收掉，否则歌词行前多一个空行。
      *  代码行以「字母（+ 数字）+ 冒号」起头（小节中间换行后 `C :|`、`C4 :|`、123 的 `x :|`）会被读成字段行
@@ -566,8 +781,13 @@ export abstract class AbcFamilyEmitter {
       // 123 一处只能起一个房号；文本谱解析器会留下与新房号重叠的不收口房号，只写最后一个（读回也只认它）
       const lastEnding = lefts.filter((b) => b.ending?.type === "start").pop();
       for (const left of lefts) {
-        // 只有房号、没有实际线时不写线（`[1` 自己就是起点标记）
-        if (left.style !== undefined) out.push(barlineText(left));
+        // 只有房号、没有实际线时不写线（`[1` 自己就是起点标记）。
+        // MusicXML 的起反复常只写 `<repeat direction="forward"/>`、不带 `<bar-style>`，也是一条线（以前丢了，`:|` 跳回曲首）
+        if (left.style !== undefined || left.repeat) {
+          // 前一小节收的是普通线：并成一根 `|:`（写成 `| |:` 谱面上是两根线）
+          if (left.repeat === "forward" && left.style === undefined && out[out.length - 1] === "|") out.pop();
+          out.push(barlineText(left));
+        }
         // 跳转记号紧跟这条线（segno 是跳转目标，落点就是这条线）
         out.push(...barlineOrnaments(left));
         if (left === lastEnding) out.push(`[${left.ending!.numbers.join(",")}`);
@@ -577,6 +797,12 @@ export abstract class AbcFamilyEmitter {
       key = k;
       const t = mea.attrs?.time ? timeOf(mea.attrs.time) : time;
       if (t !== time) out.push(`[M:${t}]`);
+      // 曲中换谱号（大提琴转中音谱号）：`[K:clef=alto]`（ABC §3.1.14 的 clef= 写在 K: 里）。首小节的走 `V:` 声明。
+      // 123 只有小节级的谱号：MusicXML 写在小节中间的（`laterAttrs`，Sibelius 常放在前一小节末尾）落到较近的那个小节头
+      const cn = this.clefAt(part, i);
+      if (this.inlineClefs && cn && i > 0 && cn !== clef) out.push(`[K:clef=${cn}]`);
+      if (cn) clef = cn;
+      this.lastMidClef = null;
       time = t;
       if (mea.attrs?.time) this.curTime = mea.attrs.time;
       let el0 = 0;
@@ -587,9 +813,13 @@ export abstract class AbcFamilyEmitter {
         ri++;
         el0 = cut.at;
       }
-      const body = this.measureBody(mea, { slurStart, slurEnd, tupletStart, tupletEnd, arcNext, wedgeStart, wedgeEnd }, el0);
+      // 多小节休止（MusicXML `<multiple-rest>`、123 `Zn`）：整串写成一个 `Zn`，跳过后面那几个小节
+      const run = cuts.length ? 0 : this.multiRestRun(part, i, ranges[ri]!.to);
+      const body = run ? this.multiRestText(mea, run) : this.measureBody(mea, { slurStart, slurEnd, tupletStart, tupletEnd, arcNext, wedgeStart, wedgeEnd }, el0);
       out.push(body);
-      const right = (mea.barlines ?? []).find((b) => b.location === "right");
+      if (run) i += run - 1;
+      if (this.lastMidClef) clef = this.lastMidClef;
+      const right = (part.measures[i]!.barlines ?? []).find((b) => b.location === "right");
       const last = i === part.measures.length - 1;
       // 右线的记号写在线**之前**（`… 6 !fine! |]`）：唱到这儿才跳，读回来也按这个位置认。
       if (right) out.push(...barlineOrnaments(right));
@@ -622,29 +852,85 @@ export abstract class AbcFamilyEmitter {
     // 一个声部连着一个声部，所以这里只在**声部号变了**的地方断开；MusicXML 读进来的交错
     // 多声部先按声部归并（只在整小节写出时才归并——小节中间换行那条路按下标切片，不能重排）。
     const order = this.voiceOrder(mea, from, to);
+    // MusicXML 来源照它写明的 `<beam>` 分组（识别稿、制谱软件的跨拍连杠），没写才按拍自动分
     const auto = this.spaceBeams && !mea.elements.some((e) => e.kind === "chord" && e.beamGroup !== undefined)
-      ? this.autoBeamGroups(mea, mi) : null;
+      ? xmlBeamGroups(mea) ?? this.autoBeamGroups(mea, mi) : null;
     let prevVoice: number | undefined;
+    // 各分支写到哪儿了（实际时值，四分 = SIMPLE_DIVISIONS）：后面的分支比第一支短的（MusicXML 的副声部提前收尾、
+    // 末尾的 `<forward>` 不留元素）用不可见休止补齐——ABC §7.4 的各分支等长，读回才不报拍数不对
+    const branchLen = new Map<number, number>();
+    let mainVoice: number | undefined;
+    const whole = from === 0 && to >= mea.elements.length;
+    // 小节中间换谱号（`midClefs`）：按时刻插在第一支那个时刻起的音前；到第一支末尾还没轮到的写在第一支末尾
+    const clefs = this.midClefs ? this.midClefChanges(mea) : [];
+    let clefIdx = 0;
+    const mainAt = new Map<number, number>();
+    if (clefs.length) {
+      let end = 0;
+      mea.elements.forEach((el, j) => {
+        const tm = el.kind === "chord" || el.kind === "space" ? el.duration?.timeMod : undefined;
+        const s = el.onset ?? end;
+        mainAt.set(j, s);
+        end = s + (el.kind === "chord" && el.grace ? 0 : (el.duration?.divisions ?? 0) * (tm ? tm.normal / tm.actual : 1));
+      });
+    }
+    const pushClefs = (until: number): void => {
+      while (clefIdx < clefs.length && clefs[clefIdx]!.t <= until + 1e-6) {
+        pieces.push(`[K:clef=${clefs[clefIdx]!.name}]`);
+        this.lastMidClef = clefs[clefIdx]!.name;
+        prevGroup = undefined;
+        clefIdx++;
+      }
+    };
+    /** 分支写完：补到第一支的长度；第一支自己补到记下的小节长（`Measure.duration`：拆开的大谱表里跨谱表的声部后半在另一条谱表上） */
+    const padBranch = (v: number | undefined): void => {
+      if (v === undefined || from > 0 || to < mea.elements.length) return;
+      const target = Math.max(v === mainVoice ? 0 : branchLen.get(mainVoice!) ?? 0, mea.duration ?? 0);
+      const lack = target - (branchLen.get(v) ?? 0);
+      const pad = lack > 1e-6 ? this.overlayPad(lack) : "";
+      if (pad) {
+        pieces.push(pad);
+        branchLen.set(v, target);
+      }
+    };
     for (const j of order) {
       const el = mea.elements[j]!;
       if (!this.emits(el, mea)) continue;
       const ch = el.kind === "chord" ? el : null;
       if (ch?.continued) continue; // 同 `lyricLines`
       const voice = el.voice > 1 ? el.voice : 1;
+      mainVoice ??= voice;
       if (this.overlayText && prevVoice !== undefined && voice !== prevVoice) {
+        padBranch(prevVoice);
+        if (prevVoice === mainVoice && to >= mea.elements.length) pushClefs(Infinity);
         pieces.push(this.overlayText);
         prevGroup = undefined;
-        // 这一支不是从小节起点开的（MusicXML 的交错多声部会这样）：用不可见休止占住前面那段
-        const pad = el.onset ? this.overlayPad(el.onset) : "";
-        if (pad) pieces.push(pad);
+      }
+      if (clefs.length && voice === mainVoice) pushClefs(mainAt.get(j)!);
+      // 这一支在这里空着一段（MusicXML 的交错多声部不从小节起点开；拆开的大谱表里跨谱表的声部前半在另一条谱表上）：
+      // 用不可见休止占住。`onset` 只有 MusicXML 来源写，原生的 `&` 分支按分支游标接着排
+      const at = branchLen.get(voice) ?? 0;
+      if (el.onset !== undefined && el.onset > at + 1e-6 && whole) {
+        const pad = this.overlayPad(el.onset - at);
+        if (pad) {
+          pieces.push(pad);
+          prevGroup = undefined;
+          branchLen.set(voice, el.onset);
+        }
+      }
+      if (!ch?.grace && el.duration) {
+        const tm = el.duration.timeMod;
+        branchLen.set(voice, (branchLen.get(voice) ?? 0) + el.duration.divisions * (tm ? tm.normal / tm.actual : 1));
       }
       prevVoice = voice;
       // 倚音单独成块、紧贴后一个音符
       if (ch?.grace) {
         // 相邻的一串倚音（同为前/后倚音、同带不带斜线）并回一对花括号：`{2_3_}`
         const prev = mea.elements[j - 1];
-        const g = this.graceText(ch);
-        if (prevGrace && prev?.kind === "chord" && prev.grace && pieces[pieces.length - 1] === prevGrace.text
+        // 从倚音起、在倚音收的弧照样写括号（`({5} 1---)`）：以前只写了主音上的 `)`，弧读回就没了（八段锦二胡 m48）
+        const opens = mi.slurStart.get(el.id) ?? 0, closes = mi.slurEnd.get(el.id) ?? 0;
+        const g = "(".repeat(opens) + this.graceText(ch) + ")".repeat(closes);
+        if (!opens && prevGrace && prev?.kind === "chord" && prev.grace && pieces[pieces.length - 1] === prevGrace.text && !prevGrace.text.endsWith(")")
             && !!prev.grace.slash === !!ch.grace.slash && !!prev.grace.after === !!ch.grace.after) {
           const merged = prevGrace.text.slice(0, -1) + g.slice(1 + this.graceSlashText(ch).length);
           pieces[pieces.length - 1] = merged;
@@ -668,10 +954,20 @@ export abstract class AbcFamilyEmitter {
       // 增时线上的注记（文本谱 `- "…"`）123 挂不到 `-` 上，并到宿主音符写出（宿主自己没有时）
       if (word && !this.annotationBeforeChord) s += this.annotationText(word);
       if (el.notations?.fermata) s += "!fermata!";
-      for (const a of el.notations?.articulations ?? []) s += `!${a}!`;
+      for (const a of el.notations?.articulations ?? []) if (this.rehearsalMarks || rehearsalOf(a) === undefined) s += `!${a}!`;
       // 从 MusicXML 读进来的波音/颤音挂在 ornaments 上（`inverted-mordent`），写回简谱来源的同名记号（`!sby!`）——
       // 不写就整个丢了：以前识别核对那条路（识别 → MusicXML → 123）里 1677《祷告》的两个波音就是这么没的。
       for (const o of el.notations?.ornaments ?? []) s += `!${ORNAMENT_NAME[o] ?? o}!`;
+      // MusicXML 来的弓法、单音震音（123 用 ABC 的写法 `!upbow!` `!///!`）
+      if (this.bowAndTremolo) {
+        for (const tk of el.notations?.technical ?? []) s += `!${TECHNICAL_NAME[tk] ?? tk}!`;
+        if (el.notations?.tremolo) s += `!${"/".repeat(el.notations.tremolo)}!`;
+        // 琶音：ABC 标准装饰（MusicXML 的 `<arpeggiate>` 是和弦级的布尔，不在 articulations 里）
+        if (el.notations?.arpeggiate) s += "!arpeggio!";
+        // 叉形、圈叉符头（打击乐）：abc2svg 的 `!head-…!`
+        const head = el.kind === "chord" ? chordNotehead(el.notes) : undefined;
+        if (head) s += `!head-${head}!`;
+      }
       // 同一个音上的开、收按嵌套排：包住多连音组的弧在外层（`((3: 1_ 2_ 3_) 4)`），其余在里层
       const tp = mi.tupletStart.get(el.id);
       const opens = mi.slurStart.get(el.id) ?? 0;
@@ -703,6 +999,8 @@ export abstract class AbcFamilyEmitter {
       else pieces.push(s);
       prevGroup = group;
     }
+    if (this.overlayText) padBranch(prevVoice);
+    if (clefs.length && prevVoice === mainVoice && to >= mea.elements.length) pushClefs(Infinity);
     // 余下的中间线归末段（小节中间换行时前一段不带它们）
     if (to >= mea.elements.length) while (midIdx < mid.length) { pieces.push(barlineText(mid[midIdx]!)); midIdx++; }
     return pieces.join(" ");
@@ -767,6 +1065,11 @@ export abstract class AbcFamilyEmitter {
     // 指令名**一律小写输出**：`parseInstruction` 读入时会归一成小写（ABC 的 `I:` 不区分大小写），
     // 这里若保留原样大小写，往返一轮就会从 `I:FontSize` 变成 `I:fontsize`
     for (const r of song.style?.raw ?? []) L.push(`I:${r.key.toLowerCase()} ${r.value.split(LINE_END).join(" ")}`);
+    // 原文没写分组的（MusicXML 转来的）：按 `<part-group>` 与大谱表（`staffOf`）配一行 `I:score`，括号、花括号读回不丢
+    if (!song.style?.raw?.some((r) => r.key.toLowerCase() === "score")) {
+      const sc = scoreDirective(song);
+      if (sc) L.push(`I:score ${sc}`);
+    }
     if (song.playOrder?.length) L.push(`I:playorder ${playOrderText(song)}`);
     for (const r of song.remarks ?? []) {
       // `P:` 原文在解析期被塞进 remarks，原样还回去
@@ -789,7 +1092,10 @@ export abstract class AbcFamilyEmitter {
   /** 声部切换行：声部 `i` 的一行音乐前面写什么（`first`：这个声部第一次出现）。null = 不写。
    *  缺省是 ABC 的 `V:n`：属性只在首次出现时写（带属性的 `V:` 是声明，之后的只切声部）；单声部有属性也得写 `V:1`。 */
   protected voiceLine(song: Song, i: number, first: boolean): string | null {
-    const attrs = first ? this.voiceAttrs(song.parts[i]!, song.parts.length > 1) : "";
+    const part = song.parts[i]!;
+    // 大谱表的第二条起：`part=<首条的 V 号>`（`model/staves.ts`）
+    const host = first && part.staffOf ? song.parts.findIndex((p) => p.id === part.staffOf) : -1;
+    const attrs = first ? [this.voiceAttrs(part, song.parts.length > 1), host >= 0 ? `part=${host + 1}` : ""].filter(Boolean).join(" ") : "";
     return song.parts.length > 1 || attrs ? `V:${i + 1}${attrs ? " " + attrs : ""}` : null;
   }
 
@@ -803,6 +1109,8 @@ export abstract class AbcFamilyEmitter {
     const bodies = song.parts.map((part, pi) => this.partSystems(part, song, pranges[pi]!, true));
     const declared = new Set<number>();
     for (let r = 0; r < ranges.length; r++) {
+      const prev = ranges[r - 1];
+      if (prev && this.pageBreakLine && (prev.inline ?? breakAfter(song.parts[0]!, prev.to)) === "page") L.push(this.pageBreakLine);
       for (let i = 0; i < song.parts.length; i++) {
         const text = bodies[i]![r]!;
         if (text === "") continue;

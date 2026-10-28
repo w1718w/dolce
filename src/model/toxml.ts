@@ -1,4 +1,4 @@
-// `ScoreDoc` → MusicXML（**直通**，不经 `PuDoc`）。与 `fromxml.ts` 互逆。
+// `ScoreDoc` → MusicXML（**直通**，不经 `FanqieDoc`）。与 `fromxml.ts` 互逆。
 //
 // ## 为什么敢全量重写
 //
@@ -13,7 +13,7 @@
 //
 // 所以 **`fromxml.ts` 每读一个语义字段，这里的 `OWNS` 就要认领它**，否则原节点上那份会被回填、与模型打架
 // （例如 `note@print-object`：改成可见后不能从原节点带回 `no`）。
-// 导出时五线谱引擎排出来的版面（`ToXmlOptions.layout`，`mixed/engrave.ts`）由写出端显式写，回填跳过同名的。
+// 导出时五线谱引擎排出来的版面（`ToXmlOptions.layout`，`editor/xmllayout.ts`）由写出端显式写，回填跳过同名的。
 //
 // ## 元素顺序是硬要求
 //
@@ -45,11 +45,12 @@ import type {
 } from "./doc";
 import { harmonyXml as chordTextXml } from "../score/harmonyxml";
 import { escapeAttr, escapeXml } from "../score/xmlutil";
-import { projectForMusicXml, type ProjectOptions } from "./xmlproject";
+import { hasTieSyntax, projectForMusicXml, type ProjectOptions } from "./xmlproject";
 import { axisOfSong, type TimeAxis } from "./timeaxis";
+import { rehearsalBracketed } from "./deconames";
 import { SOURCE_ID_PREFIX } from "./helpers";
 import { surfaceOf, type EngravedLayout, type Position, type PrintLayout } from "./xmlsurface";
-import { t as tr } from "../i18n";
+import { ModelError, msg } from "./msg";
 
 
 /** 一层缩进两格，与 MuseScore 的输出习惯一致。 */
@@ -103,7 +104,8 @@ const OWNS: Readonly<Record<string, { attrs?: readonly string[]; kids?: readonly
     kids: ["print", "barline", "attributes", "direction", "harmony", "note", "backup", "forward", "sound"],
   },
   print: { attrs: ["new-system", "new-page"] },
-  attributes: { kids: ["divisions", "key", "time", "staves", "clef", "transpose"] },
+  attributes: { kids: ["divisions", "key", "time", "staves", "clef", "transpose", "measure-style"] },
+  "measure-style": { kids: ["multiple-rest"] },
   key: { kids: ["cancel", "fifths", "mode", "key-step", "key-alter"] },
   time: { attrs: ["symbol"], kids: ["beats", "beat-type"] },
   clef: { attrs: ["number"], kids: ["sign", "line", "clef-octave-change"] },
@@ -451,7 +453,10 @@ function lyricXml(o: Out, l: Lyric, cx: Ctx): void {
   const pl = l.placement ? ` placement="${l.placement}"` : "";
   o.open("lyric", ` number="${escapeAttr(number)}"${name}${pl}${posAttrs(cx.layout?.pos.get(l))}`, surfaceOf(l));
   if (l.syllabic) o.text("syllabic", l.syllabic);
-  o.text("text", (l.leadingPunctuation ?? "") + l.text + (l.trailingPunctuation ?? ""));
+  // 印刷段号并进首字（`1.道`，诗歌本 MusicXML 的惯例写法；读回由 `fromxml.ts::readLyrics` 拆开）。
+  // 只写数字段号（不带点的隔一个空格 `1 Be`）：`副歌` 这类并进去读不回来，照旧不写
+  const label = l.verseLabel === undefined ? "" : /^\d+[.．、]$/.test(l.verseLabel) ? l.verseLabel : /^\d+$/.test(l.verseLabel) ? `${l.verseLabel} ` : "";
+  o.text("text", label + (l.leadingPunctuation ?? "") + l.text + (l.trailingPunctuation ?? ""));
   if (l.extend) o.leaf("extend", l.extendType ? ` type="${l.extendType}"` : "");
   o.close();
 }
@@ -461,6 +466,7 @@ function notationsXml(o: Out, n: Chord["notations"], starts: Mark[], stops: Mark
   const has =
     n?.articulations?.length ||
     n?.ornaments?.length ||
+    n?.tremolo ||
     n?.technical?.length ||
     n?.fermata ||
     n?.arpeggiate ||
@@ -502,9 +508,14 @@ function notationsXml(o: Out, n: Chord["notations"], starts: Mark[], stops: Mark
   if (n?.fermata) o.leaf("fermata", n.fermataInverted ? ' type="inverted"' : "");
   if (n?.arpeggiate) o.leaf("arpeggiate");
   for (const [tag, list] of [["articulations", n?.articulations], ["ornaments", n?.ornaments], ["technical", n?.technical]] as const) {
-    if (!list?.length) continue;
+    const trem = tag === "ornaments" ? n?.tremolo : undefined;
+    if (!list?.length && !trem) continue;
     o.open(tag);
-    for (const a of list) o.leaf(a);
+    for (const a of list ?? []) {
+      const pl = tag === "articulations" ? n?.articPlacement?.[a] : undefined;
+      o.leaf(a, pl ? ` placement="${pl}"` : "");
+    }
+    if (trem) o.text("tremolo", trem, ` type="single"${n?.tremoloPos ? ` default-x="${n.tremoloPos.x}" default-y="${n.tremoloPos.y}"` : ""}`);
     o.close();
   }
   o.close();
@@ -530,10 +541,10 @@ function chordXml(o: Out, ch: Chord, starts: Mark[], stops: Mark[], cx: Ctx): vo
       o.text("octave", note.pitch.octave);
       o.close();
     } else if (ch.rhythm) {
-      // 节奏音符（有声无音高）：斜线符头
+      // 节奏音符（有声无音高）：照读进来的显示位置（打击乐谱），简谱来源的没有、放第三线（斜线符头）
       o.open("unpitched");
-      o.text("display-step", "B");
-      o.text("display-octave", 4);
+      o.text("display-step", note?.unpitched?.step ?? "B");
+      o.text("display-octave", note?.unpitched?.octave ?? 4);
       o.close();
     } else {
       o.leaf("rest");
@@ -558,7 +569,8 @@ function chordXml(o: Out, ch: Chord, starts: Mark[], stops: Mark[], cx: Ctx): vo
     }
     const stem = note ? cx.layout?.stems.get(note) : undefined;
     if (stem) o.text("stem", stem);
-    if (ch.rhythm && !isChordNote) o.text("notehead", "slash");
+    // 简谱来源的节奏音符画斜线符头；打击乐谱读进来的（有显示位置）照它原来的符头
+    if (ch.rhythm && !isChordNote && !note?.unpitched?.step) o.text("notehead", "slash");
     else if (note?.notehead) o.text("notehead", note.notehead);
     if (ch.staff > 1) o.text("staff", ch.staff);
     // number 是层号：按下标算，不能 indexOf（两层同为 begin 时会都写成 1）
@@ -613,7 +625,8 @@ function directionXml(o: Out, dir: Direction, cx: Ctx): void {
     const a = soundAttrs(dir.sound);
     if (a) o.leaf("sound", a);
   }
-  if (dir.staff !== undefined && dir.staff > 1) o.text("staff", dir.staff);
+  // 模型里写明了就写（并成大谱表的首条谱表记成 1，`staves.ts::mergeStaffParts`）：多谱表的声部里缺 `<staff>` 的记号别的软件当整个声部的
+  if (dir.staff !== undefined) o.text("staff", dir.staff);
   o.close();
 }
 
@@ -630,7 +643,7 @@ function directionPartXml(o: Out, dir: DirectionPart, sur: Element | undefined, 
       break;
     case "words":
     case "rehearsal":
-      o.text(dir.type, dir.text ?? "", lay, sur);
+      o.text(dir.type, dir.text ?? "", dir.type === "rehearsal" && rehearsalBracketed(dir.text ?? "") ? `${lay} enclosure="none"` : lay, sur);
       break;
     case "wedge":
       o.leaf("wedge", ` type="${dir.spanType === "stop" ? "stop" : dir.wedgeType ?? "crescendo"}"${pos}`, sur);
@@ -723,6 +736,11 @@ function attributesXml(o: Out, attrs: MeasureAttrs, shown?: boolean): void {
     if (attrs.transpose.diatonic !== undefined) o.text("diatonic", attrs.transpose.diatonic);
     o.text("chromatic", attrs.transpose.chromatic);
     if (attrs.transpose.octaveChange !== undefined) o.text("octave-change", attrs.transpose.octaveChange);
+    o.close();
+  }
+  if (attrs.multiRest) {
+    o.open("measure-style");
+    o.text("multiple-rest", attrs.multiRest);
     o.close();
   }
   o.close();
@@ -940,7 +958,7 @@ export interface ToXmlOptions extends ProjectOptions {
   /** 每个 `<note>` 带 `id="jp<源元素 id>"`：文本格式派生五线谱（`export.ts::sourceMusicXmlBare`）读回后，
    *  `fromxml` 把它记成 `Chord.srcId`，五线谱上点的音才对得回代码区。**只给这条内部路径用**，导出文件不带。 */
   sourceIds?: boolean;
-  /** 导出版面（`mixed/engrave.ts::engraveScoreDoc` 排出来的坐标、小节宽、系统间距、符干），键是本文档的模型对象 */
+  /** 导出版面（`editor/xmllayout.ts::engraveScoreDoc` 排出来的坐标、小节宽、系统间距、符干），键是本文档的模型对象 */
   layout?: EngravedLayout;
 }
 
@@ -948,8 +966,8 @@ export interface ToXmlOptions extends ProjectOptions {
  *  简谱来源先经 `xmlproject.ts` 投成 MusicXML 形状，MusicXML 读进来的原样序列化（表层从原节点回填）。 */
 export function scoreDocToMusicXml(doc: ScoreDoc, options: ToXmlOptions = {}): string {
   const src = doc.songs[options.song ?? 0];
-  if (!src) throw new Error(tr("err.noSong"));
-  const song = projectForMusicXml(src, options);
+  if (!src) throw new ModelError(msg("err.noSong"));
+  const song = projectForMusicXml(src, { ...options, slurTies: options.slurTies ?? !hasTieSyntax(doc) });
   const cx: Ctx = { sourceIds: options.sourceIds === true, ...(options.layout ? { layout: options.layout } : {}) };
   // 文本格式投影出来的一律署上本应用（<encoding><software>）：混排引擎据此认 `<harmony><offset>` 等本写出端的写法
   const projected = song !== src;

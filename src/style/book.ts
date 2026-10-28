@@ -1,12 +1,12 @@
 // 成书那一份尺子：`BookStyle`（原书实测，字号已由生成脚本从墨迹高换成 font-size）→ `JianpuStyle`。
 //
 // 由 `style/jianpu.ts::jianpuStyleOf` 的 `book` 预设调用。
-import { Font } from "../layout/font";
+import { Font } from "../pagetree/font";
 import { STACK_GAP_DEFAULT } from "../engrave/stack";
 import type { JianpuStyle } from "../engrave/jianpustyle";
-import type { BookStyle } from "../pdflayout/bookstyle";
+import type { BookStyle } from "./bookstyle";
 import type { StyleRole } from "./sheet";
-import { defaultJianpuStyle } from "./jianpu";
+import { defaultJianpuStyle } from "./jianpudefault";
 
 /** 减时线宽 ÷ 小节线宽。取自混排简谱层的 `MixedOptions.lineWidths`（jpBeam 1 : lightBarline 1.5）。 */
 const JP_BEAM_TO_BARLINE = 2 / 3;

@@ -1,13 +1,13 @@
 // 一首（及一份文档）的定位：逐组排声部、组间让位、分页，长图把各页接成一张。
-import type { Meter, MusicElement, NoteElement, PuSong } from "../../../pu/ast";
+import type { Meter, MusicElement, NoteElement, FanqieSong } from "../../../jianpu/ast";
 import { contentWidth, type JianpuGrid } from "../metrics";
 import { paginate, type SystemBlock } from "../../../jianpu/vertical";
 import type { InkMeasurer, PlacedGroup, PlacedPage, PlacedScore, PlacedVoice } from "./model";
 import { placeColumns } from "./spacing";
 import { type BeatCtx, assignLyrics, computeUnderlines, layoutVoiceLine, lineEndMeter, lineEndsWithForwardRepeat } from "./voice";
 import { GROUP_CLEAR, braceReach, splitRise, wordsLead, groupHeadroom, lineInkBottom, voiceHeadroom } from "./vertical";
-import { placeMarks } from "./marks";
-import { placeLayers } from "./layers";
+import { belowArcsBottom, placeMarks } from "./marks";
+import { belowLayerLines, placeLayers } from "./layers";
 import { placeBand } from "./band";
 
 /**
@@ -61,7 +61,7 @@ function hideEmptyBarlines(voices: readonly PlacedVoice[], braceFromX: number): 
  * 把一首曲子排成若干页。文本谱自己管分页（`[fenye]`），我们只在一页塞不下时再补断。
  */
 export function layoutSong(
-  song: PuSong,
+  song: FanqieSong,
   m: JianpuGrid,
   songIndex = 0,
   headerBottom = 0,
@@ -76,6 +76,8 @@ export function layoutSong(
   autoVerseNumbers(song, m);
 
   const bottomLimit = m.page.height - m.page.margin.bottom;
+  // 整首没有一句歌词的按器乐谱排：力度记号、渐强渐弱记在谱行下方（GB/T 46845 7.3.8 a、7.3.6.3；`band.ts::placeBelow`）
+  const instrumental = !song.pages.some((pg) => pg.groups.some((g) => g.voices.some((v) => v.lyrics.length > 0)));
   // 拍号一路带过来：头部 `1=D4/4 3/4 5/4` 这类混合拍只有首个是起头拍号，其余由曲中
   // 的 `"p:3/4"` 逐小节改写（`BarlineElement.temporaryMeter`），故要跨行延续。
   // 只有减时线分组用得着（见 beatGroups）。
@@ -121,40 +123,44 @@ export function layoutSong(
         for (const it of l.items) it.syllables = new Array(voice.lyrics.length).fill(null);
         assignLyrics(l.items, voice.lyrics);
       });
+      // 同一谱表第二声部的并排下行也参加归列（它的拍位可能比主行细）
+      const below = laidOut.map((l, vi) => belowLayerLines(group.voices[vi]!, l.items, m, beatCtx));
       // 横向：各声部同一拍位归一列、列宽按内容、歌词避让、两端对齐（spacing.ts）
-      placeColumns(laidOut, m, ink, width);
+      placeColumns([...laidOut, ...below.flatMap((b) => [...b.values()])], m, ink, width);
 
       // 纵向先按各声部**自己的基线**排（上方带、记号、内联层都相对基线），头顶多高排完才知道，再定各声部的 y
       const pre = laidOut.map((l, vi) => {
         const voice = group.voices[vi]!;
         const underlines = computeUnderlines(voice, l.items, m, l.groups);
-        // 第一行歌词的位置：样式给了 `lyric-baseline` 就不低于它；自动值与旧简谱引擎同一口径
-        //（`layout.ts::Line.updateLyricY`）：数字墨迹底往下一个音符字号，再让开 max(0.4 字号, 数字底之下的叠层深度)
-        //——一行里有「减时线 + 低音点」叠下来的音，歌词整行跟着下移，免得字顶贴到低音点上。
-        const inkBottom = lineInkBottom(l.items, m);
-        const digitBottom = m.ink.noteHeight / 2;
-        const lyricY0 = Math.max(
-          m.style.vertical.lyricBaseline,
-          digitBottom + m.style.size.note + Math.max(m.style.size.note * 0.4, inkBottom - digitBottom),
-        );
         // 内联层要先排：`{dsb}` 会给主旋律那一段打上 dy，减时线与记号都得跟着走
-        const layers = placeLayers(voice, l.items, m, ink, beatCtx);
-        // 并排块里主旋律下移了半个行距，歌词要跟着让开，否则会和下行音符叠在一起
+        const layers = placeLayers(voice, l.items, m, ink, beatCtx, below[vi]);
+        // 并排块的下行（主旋律下移，或第二声部排在下行）比基线低一个 splitRise，歌词要跟着让开，否则会和下行音符叠在一起
         let splitDrop = 0;
         for (const lay of layers) {
-          if (lay.split) splitDrop = Math.max(splitDrop, -lay.split.dy);
+          if (lay.split) splitDrop = Math.max(splitDrop, Math.abs(lay.split.dy));
         }
         for (const u of underlines) {
           const at = l.items.find((it) => it.x >= u.x0 - 0.01 && it.x <= u.x1 + 0.01);
           if (at?.dy !== undefined) u.dy = at.dy;
         }
         const marks = placeMarks(voice, l.items, m, ink);
+        // 第一行歌词的位置：样式给了 `lyric-baseline` 就不低于它；自动值与旧简谱引擎同一口径
+        //（`layout.ts::Line.updateLyricY`）：数字墨迹底往下一个音符字号，再让开 max(0.4 字号, 数字底之下的叠层深度)
+        //——一行里有「减时线 + 低音点」叠下来的音，歌词整行跟着下移，免得字顶贴到低音点上。
+        // 叠印下方的延音线（和音最下面那个音单连的）也算进墨迹底
+        const inkBottom = Math.max(lineInkBottom(l.items, m), belowArcsBottom(marks, m));
+        const digitBottom = m.ink.noteHeight / 2;
+        const lyricY0 = Math.max(
+          m.style.vertical.lyricBaseline,
+          digitBottom + m.style.size.note + Math.max(m.style.size.note * 0.4, inkBottom - digitBottom),
+        );
         // 上方带：弧、连音、奏法记号、和弦、松叶、转调标签、力度/跳转字、临时伴奏行、房号按墨迹一次堆清（band.ts）
-        const band = placeBand(l.items, marks, layers, m, ink, width);
+        const band = placeBand(l.items, marks, layers, m, ink, width, instrumental);
         const pv: PlacedVoice = {
           voice, y: 0, items: l.items, underlines, layers, marks, lyricY: [], band: band.texts, top: band.top, textTop: band.textTop,
+          ...(band.bottom !== null ? { bottom: band.bottom } : {}),
         };
-        return { pv, inkBottom, digitBottom, lyricY0, splitDrop };
+        return { pv, inkBottom: Math.max(inkBottom, band.bottom ?? -Infinity), digitBottom, lyricY0, splitDrop };
       });
       const voices = pre.map((p) => p.pv);
 
@@ -303,7 +309,7 @@ function slideBlock(voices: ReadonlyArray<{ pv: PlacedVoice; inkBottom: number }
 
 /** 排一整份文档（可含多首「一首多唱」）。 */
 export function layoutDocument(
-  songs: readonly PuSong[],
+  songs: readonly FanqieSong[],
   m: JianpuGrid,
   headerBottoms: readonly number[] = [],
   ink: InkMeasurer,
@@ -374,7 +380,9 @@ function lowestOf(page: PlacedPage): number {
   let bottom = 0;
   for (const g of page.groups) {
     for (const v of g.voices) {
-      bottom = Math.max(bottom, v.y, ...v.lyricY);
+      bottom = Math.max(bottom, v.y, ...v.lyricY, v.bottom !== undefined ? v.y + v.bottom : 0);
+      // 并排块的下行（`{dsb}` 压下去的主旋律、同谱表第二声部）比基线低一个 splitRise
+      for (const l of v.layers) if (l.split) bottom = Math.max(bottom, v.y + Math.abs(l.split.dy));
     }
   }
   return bottom;
@@ -402,7 +410,7 @@ function shiftGroup(g: PlacedGroup, dy: number): void {
  * 补出来的就是一条普通的说明（`LyricLine.annotation`），画法、版心左缘让出（`compose/index.ts` 量伸出量）都同源里写的。
  * 只改行视图，不改 ScoreDoc。
  */
-function autoVerseNumbers(song: PuSong, m: JianpuGrid): void {
+function autoVerseNumbers(song: FanqieSong, m: JianpuGrid): void {
   const mode = m.style.look.verseNumbers;
   if (mode === "never") return;
   const voices = song.pages.flatMap((p) => p.groups).flatMap((g) => g.voices);
@@ -421,7 +429,7 @@ function autoVerseNumbers(song: PuSong, m: JianpuGrid): void {
   }
 }
 
-function moveTrailingSectionWords(song: PuSong): void {
+function moveTrailingSectionWords(song: FanqieSong): void {
   const groups = song.pages.flatMap((p) => p.groups);
   const notes = (els: readonly MusicElement[]) => els.filter((e): e is NoteElement => e.kind === "note" && !e.placeholder);
   for (let gi = 0; gi + 1 < groups.length; gi++) {

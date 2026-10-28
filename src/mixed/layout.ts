@@ -24,10 +24,11 @@
 
 import { getMeta } from "../model/metakeys";
 import { Fraction } from "../common/fraction";
-import { Font } from "../layout/font";
+import { Font } from "../pagetree/font";
+import { compressMultiRests } from "../model/multirest";
 import { dynamicGlyphs } from "../engrave/dynamics";
 import { articGlyph } from "../engrave/articulation";
-import { decoKey } from "../model/deconames";
+import { decoKey, rehearsalBracketed } from "../model/deconames";
 import { EQ_PAD_EM } from "../engrave/spacing";
 import { GlyphCodes } from "../smufl/smufl";
 import type {
@@ -86,6 +87,18 @@ import {
 import { melodyChords, topNote } from "../model/jianpu";
 import { defaultsFonts, measureWidth, noteStem, partSymbolOf, printLayout, staffDetailsOf, wedgeSpread, xmlAlign, xmlFont, xmlPos } from "../model/xmlsurface";
 
+/** 谱表上方的记号：MusicXML 元素名 → SMuFL 字形 */
+const OUTSIDE_GLYPH: Readonly<Record<string, string>> = {
+  "inverted-mordent": GlyphCodes.ornamentShortTrill,
+  mordent: GlyphCodes.ornamentMordent,
+  "trill-mark": GlyphCodes.ornamentTrill,
+  turn: GlyphCodes.ornamentTurn,
+  "up-bow": GlyphCodes.stringsUpBow,
+  "down-bow": GlyphCodes.stringsDownBow,
+};
+
+/** 文字与同一条 direction 里随后的速度记号之间的空（字号的倍数） */
+const WORDS_TEMPO_GAP_EM = 0.4;
 /** Bravura Text 里 segno/coda 相对 Bravura 同一字形的大小（见 processSegno） */
 const BRAVURA_TEXT_SCALE = 0.8;
 const STEP_DIATONIC: Record<string, number> = { C: 0, D: 1, E: 2, F: 3, G: 4, A: 5, B: 6 };
@@ -359,6 +372,7 @@ class DocPartLoader {
     const dur = new Fraction(end, div);
     if (dur.compareTo(mif.dur) > 0) mif.dur = dur;
     mif.number = m.number;
+    if (m.attrs?.multiRest) mif.multiRest = m.attrs.multiRest;
     if (m.implicit) mif.implicit = true;
     const width = measureWidth(m);
     if (width !== undefined) mif.width = width;
@@ -490,6 +504,8 @@ class DocPartLoader {
 
     const pitch = note?.pitch;
     if (!ch.rest && pitch) nt.writtenPitch = pitch.octave * 7 + (STEP_DIATONIC[pitch.step] ?? 0) + this.transposeSteps + this.octaveSteps;
+    // 节奏音符照 `<unpitched>` 的显示位置画（打击乐谱一个声部叠两个位置），不跟移调
+    else if (!ch.rest && note?.unpitched?.step) nt.writtenPitch = (note.unpitched.octave ?? 4) * 7 + (STEP_DIATONIC[note.unpitched.step] ?? 0);
     nt.x = xmlPos(note ?? src)?.defaultX ?? -1;
 
     const stem = noteStem(note);
@@ -625,6 +641,17 @@ class DocPartLoader {
       const item = new NotationItem();
       if (a === "strong-accent") item.above = true;
       item.symbol = symbol;
+      const pl = n?.articPlacement?.[a];
+      if (pl) item.placed = pl === "above";
+      ch.notations.push(item);
+    }
+    // 波音、颤音（`<ornaments>`）与弓法（`<technical>`）：印在谱表上方（`NotationItem.outside`）。单音震音在符干上，见 render.ts
+    for (const name of [...(n?.ornaments ?? []), ...(n?.technical ?? [])]) {
+      const symbol = OUTSIDE_GLYPH[name];
+      if (!symbol) continue;
+      const item = new NotationItem();
+      item.symbol = symbol;
+      item.outside = true;
       ch.notations.push(item);
     }
     for (const mk of this.marksByEnd.get(src.id) ?? []) {
@@ -792,6 +819,15 @@ class DocPartLoader {
         case "metronome":
           if (this.processMetronome(blk, item)) hasText = true;
           break;
+        case "rehearsal":
+          // 排练号：照文字排，字加粗放大一号、外面套方框（自带【】的不套）
+          if (this.processWords(blk, { ...item, type: "words" })) {
+            blk.boxed = true;
+            blk.frameless = rehearsalBracketed(item.text ?? "");
+            for (const it of blk.data) if (it.text !== "\n") it.font = new Font(it.font.family, it.font.size * 1.15, true, it.font.italic);
+            hasText = true;
+          }
+          break;
         case "segno":
           this.processSegno(blk, false, xmlPos(item));
           hasText = true;
@@ -934,8 +970,9 @@ class DocPartLoader {
    *  MusicXML 的意思相加（歌本改谱脚本把原程序的 `x += n` 写成 relative-x）；只有 relative-x 或都没有才相对拍位。
    *  再 y=45、右移 15。字形照原程序用 Bravura Text（webview 只注册了 Bravura，同一套字形，
    *  Bravura Text 的 segno/coda 是 Bravura 的 0.8 倍：墨高 629/786、844/1056）。 */
-  private processSegno(blk: MeasureText, coda: boolean, pos?: { defaultX?: number; relativeX?: number }): void {
+  private processSegno(blk: MeasureText, coda: boolean, pos?: { defaultX?: number; defaultY?: number; relativeX?: number }): void {
     blk.y = 45; // todo: parser.cpp 同样硬编码
+    if (pos?.defaultX !== undefined || pos?.defaultY !== undefined) blk.signPlaced = true;
     const dx = pos?.defaultX;
     if (dx !== undefined && !blk.data.length) {
       blk.x = dx + (pos?.relativeX ?? 0);
@@ -1010,9 +1047,20 @@ class DocPartLoader {
     let any = false;
     // `parentheses="yes"`：整个节拍器套一对圆括号「(♩ = 82)」
     const paren = !!met.tempo?.parentheses;
-    if (paren) blk.add("(", wordFont, false);
+    // 同一条 direction 里前面已有文字（「欢快 热烈地 ♩=144」）：隔开一个字宽的四成。原文末尾的空格不靠它——
+    // SVG 吞掉文本末尾的普通空格，排版量宽却算进去了，画出来就粘成「热烈地♩」
+    const last = blk.data[blk.data.length - 1];
+    let lead = 0;
+    if (last && last.text !== "\n" && !last.music) {
+      last.text = last.text.trimEnd();
+      lead = wordFont.size * WORDS_TEMPO_GAP_EM;
+    }
+    if (paren) {
+      blk.add("(", wordFont, false, undefined, lead);
+      lead = 0;
+    }
     if (met.tempo?.beatUnit !== undefined) {
-      blk.add(metNoteGlyph(met.tempo.beatUnit) + (met.tempo.beatUnitDot ? GlyphCodes.metAugmentationDot : ""), noteFont, true);
+      blk.add(metNoteGlyph(met.tempo.beatUnit) + (met.tempo.beatUnitDot ? GlyphCodes.metAugmentationDot : ""), noteFont, true, undefined, lead);
       any = true;
     }
     const pm = met.tempo?.perMinuteText?.trim() ?? (met.tempo?.perMinute !== undefined ? String(met.tempo.perMinute) : undefined);
@@ -1020,7 +1068,7 @@ class DocPartLoader {
       // 「=」两侧的空与调号「1 = F」同一个（engrave/spacing.ts::EQ_PAD_EM），按字号算、不靠空格字形
       // （空格宽随字体走，且 SVG 吞掉文本开头的普通空格）
       const pad = wordFont.size * EQ_PAD_EM;
-      blk.add("=", wordFont, false, undefined, any ? pad : 0);
+      blk.add("=", wordFont, false, undefined, any ? pad : lead);
       blk.add(pm, wordFont, false, undefined, pad);
       any = true;
     }
@@ -1315,7 +1363,7 @@ function printInput(p: NonNullable<Measure["print"]>): PrintInput {
 }
 
 /** 谱里有源谱真实排出的行：第一声部有带 `<system-layout>` 的 `new-system` / `new-page`（识别结果照原谱写的，`staffomr/toxml.ts::sourceLayout`）。
- *  简谱视图、123/ABC 写出的换行不带它，那些仍是优选断点。 */
+ *  简谱视图、123/ABC 写出的换行不带它：那些是优选断点，ABC 源文写明的另由 `MixedOptions.sourceBreaks` 当硬断点（`hardBreaks`）。 */
 function hasSourceBreaks(song: Song): boolean {
   return (song.parts[0]?.measures ?? []).some((m) => m.print && (m.print.newSystem || m.print.newPage) && !!printLayout(m.print)?.systemLayout);
 }
@@ -1385,8 +1433,10 @@ function partGroupsOf(score: StaffLayout, song: Song): PartGroup[] {
  * 调用方给好 `MixedOptions`（含已加载的 MetaData）。
  */
 export function layoutStaff(doc: ScoreDoc, options: MixedOptions): StaffLayout {
-  const song = doc.songs[0];
-  if (!song) throw new Error("这份文档里没有曲子");
+  const first = doc.songs[0];
+  if (!first) throw new Error("这份文档里没有曲子");
+  // 多小节休止在谱面上并成一小节（模型不动，见 `model/multirest.ts`）
+  const song = compressMultiRests(first);
   const score = new StaffLayout(options, song);
 
   const def = song.defaults;
@@ -1487,6 +1537,7 @@ export function layoutStaff(doc: ScoreDoc, options: MixedOptions): StaffLayout {
   // 换了纸，谱里按原纸算好的版面坐标就对不上了：整份按新纸自动铺排
   score.autoLayout = overridePage || resized || !hasEmbeddedLayout(song);
   score.keepBreaks = score.autoLayout && !overridePage && !resized && hasSourceBreaks(song);
+  score.hardBreaks = score.keepBreaks || (score.autoLayout && options.sourceBreaks);
 
   const numMeasures = song.parts[0]?.measures.length ?? 0;
   for (let i = 0; i < numMeasures; i++) {
@@ -1510,7 +1561,33 @@ export function layoutStaff(doc: ScoreDoc, options: MixedOptions): StaffLayout {
     pl.load();
     pl.linkLyrics();
   });
+  autoVerseNumbers(score);
 
   finishMixedScore(score, layoutInputOf(song), partGroupsOf(score, song));
   return score;
+}
+
+/**
+ * **自动段号**（同简谱 `place/song.ts::autoVerseNumbers` 的口径，样式键 `verse-numbers`）：一个声部唱两段以上
+ *（`auto` 多于 `verseNumberAutoMin` 段）时，每段第一个字前印「1.」「2.」…（`LyricLayout.autoPrefix`）。
+ * 五线谱照诗歌本惯例只印在每段开头一次，不像简谱逐行补；源里任一段首字带了段号（`1.圣`）的声部整个不补；
+ * 副歌与非数字段号（`chorus`）不标。识别结果、123/ABC 转来的谱都不带印刷段号，从前五线谱一个也不印（issue 24）。
+ */
+function autoVerseNumbers(score: StaffLayout): void {
+  const mode = score.options.verseNumbers;
+  if (mode === "never") return;
+  const min = mode === "auto" ? score.options.verseNumberAutoMin + 1 : 2;
+  for (const part of score.parts) {
+    const firsts = new Map<number, LyricLayout>();
+    let printed = false;
+    for (const md of part.measures) {
+      for (const l of [...md.lyrics].sort((a, b) => a.offset.compareTo(b.offset))) {
+        if (l.prefix) printed = true;
+        if (l.empty || l.src.numberText !== undefined || l.src.refrain) continue;
+        if (!firsts.has(l.src.number)) firsts.set(l.src.number, l);
+      }
+    }
+    if (printed || firsts.size < min) continue;
+    [...firsts.keys()].sort((a, b) => a - b).forEach((n, k) => (firsts.get(n)!.autoPrefix = `${k + 1}.`));
+  }
 }

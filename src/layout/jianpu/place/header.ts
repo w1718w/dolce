@@ -3,7 +3,7 @@
 // 排法照 500 首的成书页眉：标题居中，副标题、经文跟在标题下面居中；
 // 词曲署名逐行右对齐、紧接在标题块下面；**调号拍号在左、与最后一行署名同基线**（成书观感）。
 // 窄纸装不下最宽那一行时标题、署名整块等比缩（同 `bookHead` 的 k）。
-import type { Metadata, Meter } from "../../../pu/ast";
+import type { Metadata, Meter } from "../../../jianpu/ast";
 import type { JianpuGrid } from "../metrics";
 import type { Rect } from "../../../common/geom";
 
@@ -137,8 +137,9 @@ export function placeHeader(meta: Metadata, m: JianpuGrid, ink: HeaderMeasurer):
   }
   let keyBottom = keyY + key.bottom;
 
-  // `J:` 里的文字部分（「深情地」「高亢、自由地」）排在调号拍号**下一行**，左对齐；数字部分是速度值，不印在这里
-  const tempoWords = meta.tempos.filter((t): t is string => typeof t === "string" && t !== "");
+  // `J:` 里的文字部分（「深情地」「高亢、自由地」）排在调号拍号**下一行**，左对齐；文本谱的数字部分是播放速度，不印
+  // 别的来源的速度数字（`♩=144`，`Metadata.tempoMark`）排在这一行最前面
+  const tempoWords = [...(meta.tempoMark ? [meta.tempoMark] : []), ...meta.tempos.filter((t): t is string => typeof t === "string" && t !== "")];
   if (tempoWords.length > 0) {
     const text = tempoWords.join(" ");
     const baseline = keyY + m.style.size.keyMeter * 1.55;

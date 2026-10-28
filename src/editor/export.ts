@@ -4,15 +4,15 @@ import { toMidi } from "../score/midi";
 import { buildPptx } from "./pptx";
 import { ScorePainter } from "../layout/painter";
 import { isTauriRuntime, saveBytes } from "./fileio";
-import { CONVERT_TARGETS, targetSpec, type ConvertTarget } from "../model/convert";
+import { CONVERT_TARGETS, targetSpec, type ConvertTarget } from "../convert/targets";
 import { asset } from "../common/asset";
 import { scoreDocToMusicXml } from "../model/toxml";
 import { loadScoreDoc } from "../model/fromxml";
 import { jpwToScoreDoc } from "../model/fromjpw";
-import { emitJly } from "../model/tojly";
+import { emitJly } from "../jly/tojly";
 import type { ScoreDoc } from "../model/doc";
 import { JpwFile } from "../jpword/jpwfile";
-import { engraveScoreDoc } from "../mixed/engrave";
+import { engraveScoreDoc } from "./xmllayout";
 import { colorToCss } from "../common/geom";
 import { t } from "../i18n";
 import { openModal } from "./dialogs";
@@ -123,7 +123,7 @@ export async function exportMidi(app: App): Promise<void> {
 export async function exportPptx(app: App): Promise<void> {
   // 一律按**展开档**出片（两种格式同一条展开档排版）：屏幕在原样档也导得出 PPT 观感，
   // 切到展开档预览则是所见即所得。字号/纸张取展开档那一套设置。
-  const bytes = await buildPptx(pptxPainter(app).pptxSource, app.colorsOf("expanded").bg);
+  const bytes = await buildPptx(pptxPainter(app).pptxSource, app.style.colorsOf("expanded").bg);
   await saveBytes(
     bytes,
     `${baseName(app)}.pptx`,
@@ -132,14 +132,14 @@ export async function exportPptx(app: App): Promise<void> {
 }
 
 /** 按展开档另排一份。屏幕已在展开档时直接用屏幕那个，省一次排版。
- *  **设置取展开档那一套**（`App.styleOf("expanded")`），不是屏幕上原样档的那套——
+ *  **设置取展开档那一套**（`app.style.styleOf("expanded")`），不是屏幕上原样档的那套——
  *  否则导出的投影片会带着原样档的字号与颜色。 */
 export function pptxPainter(app: App): ScorePainter {
   const cur = app.painter;
   // 识别模式里屏幕上那个排版器不随改动重排（谱面区是核对视图），只有简谱档的才能直接用
   if (app.mode === "jp" && cur.renderer === "jianpu" && cur.jianpuView === "expanded") return cur;
   const req = app.expandedRequest();
-  if (!req) throw new Error(t("export.noPuLines"));
+  if (!req) throw new Error(t("export.noFanqieLines"));
   const p = new ScorePainter(cur.resources);
   p.loadSync(req);
   return p;
@@ -183,11 +183,11 @@ export async function buildMusicXml(app: App): Promise<string> {
 }
 
 /** 当前**源文**经唯一写出端投成 MusicXML（不看混排底本），带上给第三方软件看的版面坐标：
- *  由五线谱引擎按设置里的纸排一遍（`mixed/engrave.ts`），与屏幕上的五线谱同一套分行，坐标交给写出端。
+ *  由五线谱引擎按设置里的纸排一遍（`editor/xmllayout.ts`），与屏幕上的五线谱同一套分行，坐标交给写出端。
  *  谱里自带版面的原样不动。 */
 export async function sourceMusicXml(app: App): Promise<string> {
   const doc = loadScoreDoc(sourceMusicXmlBare(app));
-  const layout = await engraveScoreDoc(doc, app.staffPage);
+  const layout = await engraveScoreDoc(doc, app.staffPage, app.docFormat === "abc" && !app.phraseOn);
   return scoreDocToMusicXml(doc, layout ? { layout } : {});
 }
 
@@ -204,21 +204,23 @@ export function sourceMusicXmlBare(app: App, opts: { sourceIds?: boolean } = {})
     doc = app.currentScoreDoc();
     if (!doc) throw new Error(t("export.noLines"));
   }
-  // 换行：乐句档按五线谱自己量宽断句（小节中间的也原位断）；否则照简谱视图实际排出的行。都是自动铺排的优选断点
+  // 换行：乐句档按五线谱自己量宽断句（小节中间的也原位断）；ABC 照源文的换行（`App.staffRequest` 当硬断点）；
+  // 否则照简谱视图实际排出的行。后两种以外都是自动铺排的优选断点
   const phrase = app.phraseOn ? app.staffPhraseLineStarts(doc) : null;
-  const lineStarts = phrase ?? app.jianpuLineStarts();
+  const lineStarts = phrase ?? (app.docFormat === "abc" ? null : app.jianpuLineStarts());
   // `sourceIds`：`<note>` 带源元素 id，读回的五线谱模型靠它对回代码区（只给 `App._ensureMixedDoc`，导出不带）
   return scoreDocToMusicXml(doc, { lineStarts, midLineStarts: phrase !== null, sourceIds: opts.sourceIds });
 }
 
 /** 文本谱/123/ABC → MusicXML。`.musicxml` 那一档文档里就是 XML（原文或 `editScoreDoc` 整份重写过的），原样给出。 */
-export async function exportPuMusicXml(app: App): Promise<void> {
+export async function exportFanqieMusicXml(app: App): Promise<void> {
   const text = app.docFormat === "musicxml" ? app.getText() : await buildMusicXml(app);
   await saveBytes(new TextEncoder().encode(text), `${baseName(app)}.musicxml`, MUSICXML_MIME);
 }
 
 /** 五线谱这一路的会话：五线谱 / 混排档，或五线谱识别（`.musicxml`）的核对视图。导出图按五线谱排版出。 */
-const isStaffSession = (app: App): boolean => app.mode === "mixed" || (app.mode === "recognize" && app.docFormat === "musicxml");
+// 五线谱识别的对照视图，原文换成了 ABC / 123 也是五线谱会话
+const isStaffSession = (app: App): boolean => app.mode === "mixed" || (app.mode === "recognize" && app.omr.staffSession);
 /** 简谱展开档（含简谱识别的核对视图停在展开档）：出 PPTX，不出 PNG/PDF。 */
 const isExpanded = (app: App): boolean => !isStaffSession(app) && app.layoutMode === "expanded";
 /** 当前那一档排出来是不是长图（不分页）：长图出一张 PNG，分页纸出 PDF。 */
@@ -256,7 +258,7 @@ async function layoutPainter(app: App): Promise<{ painter: ScorePainter; name: s
 export async function exportLayoutPng(app: App): Promise<void> {
   const { painter, name } = await layoutPainter(app);
   for (let i = 0; i < painter.pageCount; i++) {
-    const bytes = await svgToBytes(painter.renderPage(i), 2, colorToCss(app.bgColor));
+    const bytes = await svgToBytes(painter.renderPage(i), 2, colorToCss(app.style.bgColor));
     const file = painter.pageCount === 1 ? `${name}.png` : t("export.pngName", { name, n: i + 1 });
     await saveBytes(bytes, file, "image/png");
   }
@@ -281,7 +283,7 @@ export async function exportLayoutPdf(app: App): Promise<void> {
       // 带 `pt` 整页放大 4/3（A5 出来成了近 A4）。无单位的用户单位在这条链上正好 1:1 落成 pt
       svg.setAttribute("width", String(w));
       svg.setAttribute("height", String(h));
-      paintBg(svg, app.bgColor);
+      paintBg(svg, app.style.bgColor);
       pages.push(new XMLSerializer().serializeToString(svg));
     }
     await invoke("export_pdf_cmd", { pagesSvg: pages, widthPt: wPt, heightPt: hPt, outPath });
@@ -291,7 +293,7 @@ export async function exportLayoutPdf(app: App): Promise<void> {
     const pdf = new jsPDF({ unit: "pt", format: [wPt, hPt], orientation: orient(wPt, hPt), compress: true });
     for (let i = 0; i < painter.pageCount; i++) {
       const { w, h } = painter.pageSize(i);
-      const png = await svgToBytes(painter.renderPage(i), 2, colorToCss(app.bgColor));
+      const png = await svgToBytes(painter.renderPage(i), 2, colorToCss(app.style.bgColor));
       if (i > 0) pdf.addPage([w, h], orient(w, h));
       pdf.addImage(png, "PNG", 0, 0, w, h, undefined, "FAST");
     }
@@ -310,10 +312,10 @@ interface ExportItem {
 
 const isMixed = (app: App): boolean => app.mode === "mixed";
 /** 走 `ScoreDoc` 排版的格式（文本谱、123、ABC、MusicXML 的简谱档）：导出项与 `.jpwabc` 那档不同。 */
-const isPu = (app: App): boolean => app.adapter.caps.layout === "scoredoc" && !isMixed(app);
-const isJp = (app: App): boolean => !isPu(app) && !isMixed(app);
+const isFanqie = (app: App): boolean => app.adapter.caps.layout === "scoredoc" && !isMixed(app);
+const isJp = (app: App): boolean => !isFanqie(app) && !isMixed(app);
 /** jianpu-ly 文本**哪一种非混排档都能写**（`tojly.ts` 同时收 `jianpuInputOfDoc` 与
- *  `jianpuInputOfJpw`），所以不能挂在 `isPu` 或 `isJp` 单独一边：`isJp` 只在 `.jpwabc` 下为真，
+ *  `jianpuInputOfJpw`），所以不能挂在 `isFanqie` 或 `isJp` 单独一边：`isJp` 只在 `.jpwabc` 下为真，
  *  挂它会让 123 / 文本谱 / ABC 文档都看不到这一项（第一版就是这么错的，用户当场撞上）。 */
 const canJly = (app: App): boolean => !isMixed(app);
 
@@ -327,15 +329,15 @@ const EXPORT_ITEMS: readonly ExportItem[] = [
   { label: "PNG", available: (a) => !isExpanded(a) && isLongImage(a), run: exportLayoutPng },
   { label: "PDF", available: (a) => !isExpanded(a) && !isLongImage(a), run: exportLayoutPdf },
   // 文本谱（非混排预览）
-  { label: "MIDI", available: isPu, run: exportMidi },
-  { label: "MusicXML", available: isPu, run: exportPuMusicXml },
+  { label: "MIDI", available: isFanqie, run: exportMidi },
+  { label: "MusicXML", available: isFanqie, run: exportFanqieMusicXml },
   // 混排（五线谱预览）
   { label: "MIDI", available: isMixed, run: exportMidi },
   { label: "MusicXML", available: isMixed, run: exportMusicXml },
   // 简谱
   { label: "MIDI", available: isJp, run: exportMidi },
   { label: "MusicXML", available: isJp, run: exportMusicXml },
-  // jianpu-ly：上面三档之外，`isPu` 那一档（文本谱 / 123 / ABC / MusicXML）也要能导出，
+  // jianpu-ly：上面三档之外，`isFanqie` 那一档（文本谱 / 123 / ABC / MusicXML）也要能导出，
   // 所以单独一条、用 `canJly`（非混排即可）——见那条注释。
   { label: "jianpu-ly", available: canJly, run: exportJly },
 ];
@@ -343,11 +345,11 @@ const EXPORT_ITEMS: readonly ExportItem[] = [
 /** 当前文档就是这种格式（文本谱按方言分）。 */
 const isCurrentFormat = (app: App, id: ConvertTarget): boolean => {
   const spec = targetSpec(id);
-  return app.docFormat === spec.docFormat && (spec.docFormat !== "pu" || app.puDialect === id);
+  return app.docFormat === spec.docFormat && (spec.docFormat !== "fanqie" || app.fanqieDialect === id);
 };
 
 /** 另存为的选项：当前格式另存一份，外加换成其它源格式。
- *  **换格式前会列出目标格式装不下的东西**（`model/capability.ts`），确认了才写。
+ *  **换格式前会列出目标格式装不下的东西**（`convert/capability.ts`），确认了才写。
  *  - 文本格式：写一份新文件，编辑器里仍是原文档（`App.saveAsFormat`）。
  *  - `.musicxml`：没有代码区，另存成文本格式就是「转成它再编辑」——转过去（`convertToTextDoc`）再落盘，
  *    之后编辑的就是新存的那份。 */

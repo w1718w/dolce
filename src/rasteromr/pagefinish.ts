@@ -7,9 +7,9 @@ import { findNotations, attachNotations, attachDynamicTexts, applyTuplet, attach
 import { groupDynamics, findGluedDynamics } from "./dynamics";
 import { findStaffLabels, labelKey, normalizeLabel } from "./stafflabel";
 import { makeTextObj, makeSymObj } from "./adapt";
-import { attachHarmonies, type LyricLine, buildLyricLines, attachLyrics } from "../staffomr/textanalyze";
+import { attachHarmonies, type LyricLine, buildLyricLines, attachLyrics, lyricObjLabel } from "../staffomr/textanalyze";
 import { liftHarmonies, lyricsBelongBelow, keepGapRowOrder, foldBilingualLyrics, splitSmallEchoes, moveEchoLines, splitVoiceLyrics, numberVersesByScript, liftLyrics } from "./lyricpost";
-import { type LyricStrip, type LyricRow, findLyricRows, stripOf, stripKey, lyricLayoutVerdict, isLatinRow, LATIN_MIN_CHAINED, type OcrChar, foldLyricChars, splitMixedChars, latinCells, mapCharsToCells, stripWithout } from "./lyric";
+import { type LyricStrip, type LyricRow, findLyricRows, stripOf, stripKey, lyricLayoutVerdict, isLatinRow, LATIN_MIN_CHAINED, type OcrChar, foldLyricChars, splitMixedChars, latinCells, mapCharsToCells, stripWithout, jumpTail } from "./lyric";
 import type { Staff, PObj, SPage, Sym } from "../staffomr/model";
 import type { Component, Rect, Binary } from "../omrkit/types";
 import { type StaffNote, keyFifths, checkBars, lastTimeSignature, type BeamShape, type StaffContext } from "../staffomr/notedata";
@@ -21,7 +21,7 @@ import { findRasterTuplets } from "./tuplet";
 import { findWordStrips, findFrameStrips, findNameStrips, partNameLines, type HeaderStrip, findHeaderStrip, wordKey, headerZoneLines, attachWordLines } from "./words";
 import { type WordLine, headerCredits } from "../omrkit/headertext";
 import { smallCapsCase, inkTextSize } from "./textsize";
-import { type Contour, candidateMap, traceContours, type ContourMap, type RepairedLayer } from "./contour";
+import { type Contour, candidateMap, traceContours, type ContourMap, type ContourStaff, type RepairedLayer } from "./contour";
 import { findRasterArticulations } from "./artic";
 import { findRasterWedges, findFusedWedges, findStrippedWedges } from "./wedge";
 import { findRasterSlurs, findStubSlurs, findRasterDashedSlurs, findFusedSlurs, judgeArcUnion, extendArcEnds, traceSteepArcEnds, traceLongArcTails } from "./slur";
@@ -32,9 +32,9 @@ import { touchesText } from "./pagetext";
 import { unknownObjs } from "../staffomr/page";
 import { lastKey } from "./keysig";
 import type { ContourLedger } from "./ledger";
-import type { HarmonyStrip, HarmonyToken } from "./harmony";
+import { attachJumpMarks, type HarmonyStrip, type HarmonyToken } from "./harmony";
 import type { RasterPage } from "./rasterpage";
-import type { RasterUnit, StaffGroup, StaffLineRun } from "./staffline";
+import { liftOf, type LineGrid, type RasterUnit, type StaffGroup, type StaffLineRun } from "./staffline";
 import type { TimeStrip } from "./timesig";
 import type { ClefTally, PageCarry, PageSource, RasterLiveOcr, RasterPageOpts, RasterPageResult } from "./recognize";
 
@@ -52,7 +52,7 @@ export interface PageFinishInput {
   groups: StaffGroup[];
   nl: Binary;
   staffLines: StaffLineRun[];
-  gridYs: number[];
+  grid: LineGrid;
   prims: RasterPrims;
   jianpuStrips: JianpuStrip[];
   blobs: Component[];
@@ -62,11 +62,11 @@ export interface PageFinishInput {
   harmonies: HarmonyToken[];
   harmonyTexts: HarmonyToken[];
   harmonyIds: Set<number>;
-  contourStaves: { top: number; bottom: number; left: number; right: number }[];
+  contourStaves: ContourStaff[];
   cmap: ContourMap;
   ledger: ContourLedger;
   rlayer: RepairedLayer;
-  onGrid: (y: number) => boolean;
+  onGrid: (y: number, x?: number) => boolean;
   restIds: Set<number>;
   claimed: Set<number>;
   dictClaimed: Set<number>;
@@ -81,6 +81,8 @@ export interface PageFinishInput {
   notes: StaffNote[];
 }
 
+/** 版权行的字样（歌词里不会出现）：`©`、copyright、「版权所有」「获准使用」 */
+const COPYRIGHT_RE = /©|copyright|版[权權]所有|[获獲]准使用/i;
 /** 歌词条字高不到本页中位数的这个比例就不是歌词（页脚版权小字）。 */
 const LYRIC_MIN_H = 0.4;
 /** 不带连字符的拉丁行离带连字符的那行多近（字高的倍数）算同一块歌词。
@@ -210,7 +212,7 @@ const ARP_REACH = 2.5;
 
 /** 一页的后半程（见文件头）。 */
 export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageResult> {
-  const { index, opts, source, raster, unit, live, textKey, textBoxes, textBin, groups, nl, staffLines, gridYs, prims, jianpuStrips, blobs, repaired, titleIds, harmonyStrips, harmonies, harmonyTexts, harmonyIds, contourStaves, cmap, ledger, rlayer, onGrid, restIds, claimed, dictClaimed, arpeggios, timeStrips, stemSegs, pg, ctx, carry, clefTally, beams, notes } = s;
+  const { index, opts, source, raster, unit, live, textKey, textBoxes, textBin, groups, nl, staffLines, grid, prims, jianpuStrips, blobs, repaired, titleIds, harmonyStrips, harmonies, harmonyTexts, harmonyIds, contourStaves, cmap, ledger, rlayer, onGrid, restIds, claimed, dictClaimed, arpeggios, timeStrips, stemSegs, pg, ctx, carry, clefTally, beams, notes } = s;
   // ── 演奏法与力度 ─────────────────────────────────────────────────────────
   //
   // 这三步矢量路一直在跑（`staffomr/pagerun.ts`），位图路**从来没调过**——所以力度
@@ -246,7 +248,16 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
   //
   // 条子**不论有没有缓存都要切**（与歌词字格同一条道理：切出来这件事本身
   // 就是「这块墨是标签」的判断）；认字靠 `labelOcr` 缓存，没缓存就只出条子。
-  const labelStrips = findStaffLabels(raster.bin, pg.staves, unit);
+  // 弯、斜的谱行带上逐列偏移（五线共用一条），文字条随它取带
+  const liftFor = (st: Staff) => {
+    const g = groups.find((q) => Math.abs(q.lines[0].y - st.box.top) < unit.space);
+    return g && liftOf(g.lines[0]);
+  };
+  const lifted = pg.staves.map((st) => {
+    const lift = liftFor(st);
+    return { box: st.box, index: st.index, ...(lift ? { lift } : {}) };
+  });
+  const labelStrips = findStaffLabels(raster.bin, lifted, unit);
   const labelOcr = opts.labelOcr ?? (live ? await live.label(labelStrips) : undefined);
   const staffLabels = new Map<number, string>();
   for (const st of labelStrips) {
@@ -268,6 +279,9 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
     attachHarmonies(pg, notes, objs, false);
     liftHarmonies(notes, pg.normalStaffSpace || pg.space);
   }
+
+  // ── 和弦带里的跳转记号（D.S. al Fine、Fine、𝄋）：见 `harmony.ts::attachJumpMarks`
+  attachJumpMarks(pg, notes, harmonyTexts, unit.space);
 
   // ── 歌词 ────────────────────────────────────────────────────────────────
   //
@@ -313,7 +327,9 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
       const sp = unit.space;
       const top = Math.min(...row.cells.map((c) => c.y));
       const bot = Math.max(...row.cells.map((c) => c.y + c.h));
-      if (top - st.box.bottom < sp * 0.5 || top - st.box.bottom > sp * LONE_FIRST) return false;
+      // 弯、斜的谱行按这一行所在 x 处的末线
+      const stBot = st.bottomAt((Math.min(...row.cells.map((c) => c.x)) + Math.max(...row.cells.map((c) => c.x + c.w))) / 2);
+      if (top - stBot < sp * 0.5 || top - stBot > sp * LONE_FIRST) return false;
       // 不比本页歌词首行贴谱表近太多（首行离谱表距离中位数的六成）：谱表下的倒延长号（弧加一点）读成「心」，离谱表不到一格，歌词首行在两格开外（新编 209）
       const firstOff = new Map<number, number>();
       for (const r of normal) {
@@ -323,7 +339,7 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
         firstOff.set(r.staffIndex, Math.min(firstOff.get(r.staffIndex) ?? Infinity, off));
       }
       const offs = [...firstOff.values()].filter((v) => v > 0).sort((a, b) => a - b);
-      if (offs.length && top - st.box.bottom < offs[offs.length >> 1] * 0.6) return false;
+      if (offs.length && top - stBot < offs[offs.length >> 1] * 0.6) return false;
       const next = pg.staves[row.staffIndex + 1];
       if (next && next.box.top - bot < sp) return false;
       const xs = notes.filter((n) => n.staff === st && !n.rest).map((n) => (n.sym.box.left + n.sym.box.right) / 2);
@@ -338,7 +354,7 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
     };
     const rows = findLyricRows(
       [...blobs.filter((c) => (!claimed.has(c.id) || orphanHead(c)) && !dictClaimed.has(c.id)), ...segBlobs],
-      pg.staves.map((st) => ({ top: st.box.top, bottom: st.box.bottom, left: st.box.left, right: st.box.right })),
+      lifted.map(({ box, lift }) => ({ top: box.top, bottom: box.bottom, left: box.left, right: box.right, ...(lift ? { lift } : {}) })),
       unit,
       keepLone,
     );
@@ -358,7 +374,7 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
         const bx = n.sym.box;
         const cx = (bx.left + bx.right) / 2;
         const cy = (bx.top + bx.bottom) / 2;
-        if (cy > n.staff.box.top - unit.space * 1.25) return false;
+        if (cy > n.staff.topAt(cx) - unit.space * 1.25) return false;
         return spans.some((q) => cx >= q.x0 - pad && cx <= q.x1 + pad && cy >= q.y0 - pad && cy <= q.y1 + pad);
       };
       for (let i = notes.length - 1; i >= 0; i--) if (inText(notes[i])) notes.splice(i, 1);
@@ -499,13 +515,29 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
     /** 行首印着段号的歌词对象。 */
     const verseObjs = new Set<PObj>();
     for (const strip of ocr ? lyricStrips : []) {
-      const chars = charsFix.get(strip) ?? ocr!.get(stripKey(strip));
+      let chars = charsFix.get(strip) ?? ocr!.get(stripKey(strip));
       if (!chars) continue; // 缓存没命中：这一条没跑过 OCR，宁可留空不编造
       lyricStats.hit++;
+      // 汉字歌词行尾印着的跳转记号（祢話如甘霖二房末「…華美！Fine.」）：摘出来挂成谱表下方的文字指示，不当英文歌词
+      const tail = jumpTail(chars);
+      if (tail) {
+        chars = tail.rest;
+        const x = strip.box.x + tail.xFrac * strip.box.w;
+        const st = pg.staves.filter((q) => q.box.bottom < strip.box.y && x > q.box.left && x < q.box.right + unit.space).sort((a, b) => b.box.bottom - a.box.bottom)[0];
+        const row = st ? notes.filter((n) => n.staff === st && !n.chordExtra && !n.grace && n.x <= x).sort((a, b) => a.x - b.x) : [];
+        const n = row[row.length - 1];
+        if (n) {
+          const box = { left: x, right: strip.box.x + strip.box.w, top: strip.box.y, bottom: strip.box.y + strip.box.h };
+          (n.words ??= []).push({ text: tail.text, above: false, size: strip.charH, baseY: box.bottom, box });
+        }
+      }
       // **页脚小字不是歌词**：赞美三一真神末行下面的版权行（字高 12，歌词 34~41）离低音谱表
       // 不到两个谱表高，被收成男声的第 1 段
       // 短拉丁音节（`charsFix`，已按音位验过）放宽到一半：「Glo」字高按块高中位数量，小写字母只有汉字的三成多
       if (strip.charH < medH * LYRIC_MIN_H * (charsFix.has(strip) ? 0.5 : 1)) continue;
+      // **版权行按字样剔**：字号只比歌词小一半上下的（你的信实广大末行下「词曲 © 1923 … Hope publishing Company」「版权所有 获准使用」字高 16、23，
+      // 歌词 39）过得了上面的字高闸，被收成低音谱表下的第 1、2、4 段
+      if (COPYRIGHT_RE.test(chars.map((c) => c.ch).join(""))) continue;
       // **三格以内、认不出一半字的条不收**：谱表紧下方带加线的低音被切成一条（赞美三一真神
       // 末系统 3 格只认出一个「户」），占掉第 1 段，后面四段整体下移一段
       if (strip.cells.length <= 3 && !latinStrips.has(strip) && foldLyricChars(chars).length < strip.cells.length * 0.5) continue;
@@ -538,14 +570,23 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
       if (!latin && !mix && foldLyricChars(chars).length === strip.cells.length) lyricStats.parity++;
       // 行首印着段号（「1.」「2、」）：OCR 读出来、折叠时剔掉了，这里记一笔——段号是歌词的强判据（`lyricsBelongBelow`）
       // 只认一位数：页顶标题前的诗歌编号（有一位神「23.有一位神」）也是「数字 + 点」
-      const verseNo = /^[1-9][.．、]/.test([...chars].sort((a, b) => a.xFrac - b.xFrac).map((c) => c.ch).join(""));
+      // 段号照印的记下来（「1.」「2、」），挂到这一行最左那个对象的首字上（`textanalyze.ts::lyricObjLabel`）
+      const lead = [...chars].sort((a, b) => a.xFrac - b.xFrac).map((c) => c.ch).join("");
+      const verseNo = /^[1-9][.．、]/.exec(lead)?.[0];
+      // 英文段常印不带点的「1 Be」：拉丁行数字后面跟着大写字母的也是段号（只记下来，不当歌词归属的判据）。
+      // 跟小写的不算：那多半是首字「I」读成了「1」（求主同住「1need」、更亲近恩主「1am」）
+      const label = verseNo ?? (latin && !mix ? /^[1-9](?=\s*[A-Z‘’'"“])/.exec(lead)?.[0] : undefined);
+      const made: PObj[] = [];
       for (const cells of parts) {
         if (!cells.some((c) => c.ch)) continue;
         const o = makeTextObj(pg.objs.length + objs.length, { cells, sizeDev: strip.charH });
         o.addTag("Lyric");
         objs.push(o);
+        made.push(o);
         if (verseNo) verseObjs.add(o);
       }
+      const first = made.reduce<PObj | null>((a, o) => (!a || o.box.left < a.box.left ? o : a), null);
+      if (label && first) lyricObjLabel.set(first, label);
     }
     pg.objs.push(...objs);
     // 认得出字的行，字格留着给弧的候选按归属剔笔画用（没读出字的「行」可能就是谱表上方一排小弧本身，破碎 p5 钢琴右手）
@@ -562,12 +603,17 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
         const cy = (n.sym.box.top + n.sym.box.bottom) / 2;
         // 谱表**上方**也一样：两行谱之间的词归上一行谱，可字的笔画被收成头时落到了下一行谱的上加线区
         //（倚靠主永远膀臂 m3「穌」、大地风光 m3「愛」，低音谱表上方 2.4 格的空心头）
-        const below = cy >= n.staff.box.bottom + unit.space;
+        // 首末线按头所在 x 取（弯、斜的谱线）
+        const stTop = n.staff.topAt(cx);
+        const stBot = n.staff.bottomAt(cx);
+        const below = cy >= stBot + unit.space;
         // 上方只看两格开外：一两格上的是上加线的真音，上一行谱的歌词紧贴着它（当我们回到天家末行八个高音、−2.7）
         // 只剔空心头（字里的口字框才围得出内腔）：实心的多半是高声部的真音（合唱谱扫描档 −0.15）
-        if (!below && (cy > n.staff.box.top - unit.space * 2 || n.sym.code === "noteheadBlack")) return false;
+        // 离顶线三格（谱表带）以内的休止也不剔：钢琴两手之间让位的八分休止正压在上一行谱的歌词字格上（是爱 p5 m68 低音谱表上方，心离顶线 2.3 格）；
+        // 歌词整行离谱表远，字收成的假休止心在三格半开外（望十架 p5 m41、p8 m64，3.6、4.0 格）
+        if (!below && (cy > stTop - unit.space * 2 || n.sym.code === "noteheadBlack" || (n.rest && cy > stTop - unit.space * 3))) return false;
         // 谱表下的头挂着一根往上伸进谱表的干：字的笔画没有这种干（破碎 p10 m91 男低 B♮3，还原号的尾巴伸进「體」的字格，字格撑到了头心）
-        if (below && n.stemUp === true && stemSegsLyr.some((sg) => sg.top <= n.staff.box.bottom && sg.bottom >= n.sym.box.top && Math.abs(sg.cx - n.sym.box.right) <= unit.space * 0.3)) return false;
+        if (below && n.stemUp === true && stemSegsLyr.some((sg) => sg.top <= stBot && sg.bottom >= n.sym.box.top && Math.abs(sg.cx - n.sym.box.right) <= unit.space * 0.3)) return false;
         // 中心要落在（贴着）某个字格上：字被拆散时，剩下的笔画就在旁边成了字格；
         // 真的低音符头旁边没有字格压着（合唱谱谱表间距窄，歌词行离低音符头常只有一格，
         // 只看「落在行里」实测会误删真音）
@@ -582,7 +628,7 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
           // 残格高 15、字高 40，头中心在残格上方 7px、谱表下 2.4 格，按残格判就漏了）。
           // 只放宽不到字高六成的格、且头在谱表下两格开外：一律按整行高判，齐来称颂、齐来谢主歌各误删一个
           // 真的低音；合唱谱破碎两处谱表下一格的加一线音也被删
-          const far = below ? cy >= n.staff.box.bottom + unit.space * 2 : cy <= n.staff.box.top - unit.space * 2;
+          const far = below ? cy >= stBot + unit.space * 2 : cy <= stTop - unit.space * 2;
           return r.cells.some((c) => {
             const [y0, y1] = far && c.h < r.charH * 0.6 ? [top, bot] : [c.y, c.y + c.h];
             return cx > c.x - pad(r) && cx < c.x + c.w + pad(r) && cy > y0 - pad(r) && cy < y1 + pad(r);
@@ -678,15 +724,15 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
   // ── 文字指示与节拍器记号 ────────────────────────────────────────────────
   //
   // 带照固定几何切（两行谱之间的空当），认字靠 `wordOcr` 缓存；歌词行、和弦字母已经另有身份，中心落在它们盒里的行不要。
-  const wordStrips = opts.wordOcr || opts.wantWordStrips || live?.word ? findWordStrips(raster.bin, pg.staves, unit) : [];
+  const wordStrips = opts.wordOcr || opts.wantWordStrips || live?.word ? findWordStrips(raster.bin, lifted, unit) : [];
   // 带里的方框（排练号、框着的段落名）另切一条单独读（`findFrameStrips`）
   wordStrips.push(...findFrameStrips(wordStrips, unit));
   // 声部名带（行首缩进与页边）：认字同文字指示带，归位另走（`partNameLines`）
-  const nameStrips = opts.wordOcr || opts.wantWordStrips || live?.word ? findNameStrips(raster.bin, pg.systems, unit) : [];
+  const nameStrips = opts.wordOcr || opts.wantWordStrips || live?.word ? findNameStrips(raster.bin, pg.systems.map((sy) => ({ staves: sy.staves.map((st) => lifted[pg.staves.indexOf(st)]) })), unit) : [];
   const wordOcr = opts.wordOcr ?? (live?.word ? await live.word([...wordStrips, ...nameStrips]) : undefined);
   if (wordOcr) pg.partNames = partNameLines(pg, nameStrips, wordOcr);
   // 页眉（曲首页）：标题、词曲作者。认字同文字指示带，缓存另放
-  let headerStrip: HeaderStrip | null = carry.wantHeader ? findHeaderStrip(raster.bin, pg.staves, unit) : null;
+  let headerStrip: HeaderStrip | null = carry.wantHeader ? findHeaderStrip(raster.bin, lifted, unit) : null;
   // 谱图里切不出页眉带、谱图又没顶到页顶的（排版软件出的 PDF，标题是另贴的小图块与文字层）：拼出谱图上方那一段（`pagecompose.ts`）
   let layerLines: WordLine[] = [];
   if (carry.wantHeader && !headerStrip) {
@@ -696,7 +742,17 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
   const headerOcr = opts.headerOcr ?? (headerStrip && live?.header ? await live.header([headerStrip]) : undefined);
   // 首行谱上方那一段（`creditFrom` 以下）只留像署名的行，其余归文字指示带；留下的那几行文字指示带就不再读
   const ocrLines = headerStrip ? headerOcr?.get(wordKey(headerStrip)) : undefined;
-  const headRows = ocrLines || layerLines.length ? mergeLayerLines(ocrLines ?? [], layerLines) : undefined;
+  // 页眉带底常压着首行谱上方的和弦行：OCR 偶尔把和弦字母连着符干读成汉字（有一位神「F♯m」读成「衡拉」），
+  // 框有一半落在认出的和弦上的行不算页眉（页眉带在谱图里从页顶切起，带内坐标就是页面坐标，挪列只差几像素）
+  const onChord = (l: WordLine) =>
+    !!headerStrip &&
+    harmonies.some((t) => {
+      const x = headerStrip!.box.x + l.x, y = headerStrip!.box.y + l.y;
+      const ix = Math.min(x + l.w, t.box.x + t.box.w) - Math.max(x, t.box.x);
+      const iy = Math.min(y + l.h, t.box.y + t.box.h) - Math.max(y, t.box.y);
+      return ix > 0 && iy > 0 && ix * iy > l.w * l.h * 0.5;
+    });
+  const headRows = ocrLines || layerLines.length ? mergeLayerLines((ocrLines ?? []).filter((l) => !onChord(l)), layerLines) : undefined;
   const headerLines = headRows && headerStrip?.creditFrom !== undefined ? headerZoneLines(headRows, headerStrip.creditFrom, headerStrip.w) : headRows;
   const headerZone: Rect[] =
     headerLines && headerStrip?.creditFrom !== undefined
@@ -734,7 +790,7 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
         if (n.rest || n.stemUp !== null) return false;
         const b = n.sym.box;
         const cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
-        if (cy > n.staff.box.top - unit.space * 0.5 && cy < n.staff.box.bottom + unit.space * 0.5) return false;
+        if (cy > n.staff.topAt(cx) - unit.space * 0.5 && cy < n.staff.bottomAt(cx) + unit.space * 0.5) return false;
         return wordBoxes.some((q) => cx >= q.x - pad && cx <= q.x + q.w + pad && cy >= q.y - pad && cy <= q.y + q.h + pad);
       };
       for (let i = notes.length - 1; i >= 0; i--) {
@@ -994,7 +1050,7 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
   const runArcs = new Set<SlurArc>();
   {
     const sp = unit.space;
-    const runNl = removeStaffLinesByRun(raster.bin, staffLines.map((l) => l.y), unit);
+    const runNl = removeStaffLinesByRun(raster.bin, staffLines, unit);
     const runMap = traceContours(runNl, unit, contourStaves);
     const taken = slurs.map((sl) => sl.obj.box);
     const heads = notes.filter((n) => !n.rest).map((n) => n.sym.box);
@@ -1093,12 +1149,12 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
     }
   }
   mergeArcPieces(slurs, unit.space);
-  extendArcEnds(slurs, nl, (y) => gridYs.some((ly) => Math.abs(ly - y) <= unit.lineThick), unit.space);
-  traceSteepArcEnds(slurs, raster.bin, (y) => gridYs.some((ly) => Math.abs(ly - y) <= unit.lineThick / 2 + 0.5), unit.lineThick, unit.space);
-  traceLongArcTails(slurs, raster.bin, (y) => gridYs.some((ly) => Math.abs(ly - y) <= unit.lineThick / 2 + 0.5), notes.filter((n) => !n.rest).map((n) => n.sym.box), pg.staves.map((st) => st.box), unit.space);
+  extendArcEnds(slurs, nl, (y: number, x?: number) => grid.onLine(y, unit.lineThick, x), unit.space);
+  traceSteepArcEnds(slurs, raster.bin, (y: number, x?: number) => grid.onLine(y, unit.lineThick / 2 + 0.5, x), unit.lineThick, unit.space);
+  traceLongArcTails(slurs, raster.bin, (y: number, x?: number) => grid.onLine(y, unit.lineThick / 2 + 0.5, x), notes.filter((n) => !n.rest).map((n) => n.sym.box), pg.staves.map((st) => st.box), unit.space);
   // 续过谱线之后再并一次：跨谱表的大弧下截续过右手第一线才够到上截（宁静 p1 m9–12 钢琴 F2→F4 那几条）
   mergeArcPieces(slurs, unit.space);
-  bridgeArcPieces(slurs, unit.space, (x, y) => x >= 0 && y >= 0 && x < raster.bin.w && y < raster.bin.h && !!raster.bin.data[y * raster.bin.w + x], (y) => gridYs.some((ly) => Math.abs(ly - y) <= unit.lineThick / 2 + 0.5));
+  bridgeArcPieces(slurs, unit.space, (x, y) => x >= 0 && y >= 0 && x < raster.bin.w && y < raster.bin.h && !!raster.bin.data[y * raster.bin.w + x], (y: number, x?: number) => grid.onLine(y, unit.lineThick / 2 + 0.5, x));
   attachSlurs(slurs, notes, unit.space);
   // 放宽那遍不给歌词账上来的弧、碰着整页文字框的弧（字的笔画）
   attachSlursByStem(slurs, notes, unit.space, (sl) => {
@@ -1210,7 +1266,7 @@ export async function finishRasterPage(s: PageFinishInput): Promise<RasterPageRe
     const xa = Math.max(0, Math.round(x0)), xb = Math.min(bin.w, Math.round(x1));
     const ya = Math.max(0, Math.round(y0)), yb = Math.min(bin.h - 1, Math.round(y1));
     const rows: number[] = [];
-    for (let y = ya; y <= yb; y++) if (!gridYs.some((ly) => Math.abs(ly - y) <= unit.lineThick)) rows.push(y);
+    for (let y = ya; y <= yb; y++) if (!grid.onLine(y, unit.lineThick, (xa + xb) / 2)) rows.push(y);
     if (xb <= xa || !rows.length) return 0;
     let hit = 0;
     for (let x = xa; x < xb; x++) if (rows.some((y) => bin.data[y * bin.w + x])) hit++;

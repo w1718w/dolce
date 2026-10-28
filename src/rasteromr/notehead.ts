@@ -127,7 +127,7 @@ export function findRasterHeads(
   stems: LineSeg[],
   unit: RasterUnit,
   /** 「这个 y 落在谱线网格的延长线上吗」——判剪出来的细横笔是不是加线。 */
-  onLedgerGrid: (y: number) => boolean = () => false,
+  onLedgerGrid: (y: number, x?: number) => boolean = () => false,
   /**
    * 「这个 y 在某行谱的五条线之内吗」（含上下各一格）。**只用来卡空心符头**：
    * 谱表上方的声部标签（"Women"/"Men"）、曲名里的 `o`/`e`/`D` 是接近正方的空心块，
@@ -135,7 +135,7 @@ export function findRasterHeads(
    * （实测宁静 p2 的 "Women" 里那个 `o` 成了上加一线的 A5 **全音符**）。
    * 实心符头不受这一条限制——谱表外带加线的黑符头是常态。
    */
-  inStaffBand: (y: number) => boolean = () => true,
+  inStaffBand: (y: number, x?: number) => boolean = () => true,
   /**
    * **空心符头拿模板再验一道**（`rasterglyphs.ts::matchTemplate`，Maestro 的
    * `noteheadWhole` / `noteheadHalf`）。空心块是位图上最容易认错的一档：
@@ -145,9 +145,11 @@ export function findRasterHeads(
    */
   matchHollow: ((box: Rect) => { smufl: SmuflName; dist: number } | null) | null = null,
   /** 「这个 y 在谱表五条线之外、隔着至少一格吗」——只在那里查「底是开口的弧」（延长记号）。 */
-  offStaff: (y: number) => boolean = () => false,
+  offStaff: (y: number, x?: number) => boolean = () => false,
   /** 因「盒里没有被围住的白」剔掉的块记在这里（块 id → 当时的头盒）：别的几路不再按空心头收它们。 */
   notHollow?: Map<number, Rect>,
+  /** 原图上像内腔的孔（`contour.ts::cavityLike`）：窄块借干那一档用。 */
+  cavities: Rect[] = [],
 ): RasterHead[] {
   const sp = unit.space;
   const out: RasterHead[] = [];
@@ -161,6 +163,15 @@ export function findRasterHeads(
       // 和弦里挂在干中段的头也算（救主降生 m2 低音 F3/B♭2 一根朝下的干，B♭2 去线后只剩 0.82 格）：只借宽度，挂干照旧按端点。
       // 中段这一档要块有一整个头高：被线切开的空心头下半片也贴着干中段（称谢歌伴奏 m7、m12 的二分头读成低一级的四分）
       const s0 = stemOf(b, stems, unit, undefined, b.h >= sp * NARROW_MID_H);
+      // 干对面挨着一个像内腔的孔、孔从块里（或贴着块边）一直伸到块外：这块是空心头连着干的那一截圈
+      //（爱是从神而来 p1 m11 低音 G3 二分，圈的左上角连着干、15×11 读成实心头，挡住了按内腔认的二分）
+      const ring = s0 && cavities.some((h) => {
+        const left = (s0.x0 + s0.x1) / 2 < b.x + b.w / 2;
+        const reach = left ? h.x <= b.x + b.w + sp * 0.2 && h.x + h.w > b.x + b.w : h.x + h.w >= b.x - sp * 0.2 && h.x < b.x;
+        const ov = Math.min(b.y + b.h, h.y + h.h) - Math.max(b.y, h.y);
+        return reach && ov >= Math.min(b.h, h.h) * 0.5;
+      });
+      if (ring) continue;
       if (s0) {
         const sx = (s0.x0 + s0.x1) / 2;
         const half = Math.max(1, (s0.lw ?? unit.lineThick) / 2);
@@ -188,7 +199,7 @@ export function findRasterHeads(
     const stem = stemOf(b, stems, unit);
     // 剪掉了列，且高度落在谱线网格的延长线上 → 那两截细横笔是加线
     const ledger: LineSeg | null =
-      t.trimmed && t.ledgerY != null && onLedgerGrid(t.ledgerY)
+      t.trimmed && t.ledgerY != null && onLedgerGrid(t.ledgerY, c.bbox.x + c.bbox.w / 2)
         ? { x0: c.bbox.x, y0: t.ledgerY, x1: c.bbox.x + c.bbox.w - 1, y1: t.ledgerY, lw: unit.lineThick, maxLw: unit.lineThick }
         : null;
     let code: SmuflName;
@@ -200,7 +211,7 @@ export function findRasterHeads(
       // 真符头是闭合的一圈：中间那几列上下都有墨。只看够一整个头高的——骑线的空心头被去线切开，
       // 上半截本来就是一道弧（那一路交给碎块并回）；也只看谱表外隔一格以上的：斜椭圆的二分头
       // 底笔不一定在一行里横满中段，谱表里照查会误伤（圣哉三一歌伴奏 −0.6、齐来谢主歌 −1.3）。
-      if (h >= OPEN_ARC_H && offStaff(b.y + b.h / 2) && openBelow(bin, b)) continue;
+      if (h >= OPEN_ARC_H && offStaff(b.y + b.h / 2, b.x + b.w / 2) && openBelow(bin, b)) continue;
       // **盒里没有被围住的白不是空心头**：圆滑线起笔的斜笔连着一截没去净的谱线（是爱 p1 m15，28×17、过了宽高比），
       // 斜笔下方的白左右都不封口。真空心头的内腔即使被线切开，每一片也是上下左右都挨着墨
       if (!rayEnclosed(bin, b, sp)) {
@@ -215,7 +226,7 @@ export function findRasterHeads(
       if (m && (m.smufl === "noteheadWhole" || m.smufl === "noteheadHalf")) code = m.smufl;
       else {
         if (w / h < R_HOLLOW_MIN) continue;
-        if (!inStaffBand(b.y + b.h / 2)) continue;
+        if (!inStaffBand(b.y + b.h / 2, b.x + b.w / 2)) continue;
         // 两条线索都要：全音符**又宽又没有符干**。单看宽度，带符干残根的二分音符
         // 会被顶到 1.5 格以上；单看符干，空心符头的右侧笔画与符干在竖笔画掩模里
         // 连成一块、抽不出独立的符干段（304 个空心块里容差放到两格也只有 98 个找得到）。
@@ -325,7 +336,7 @@ function openBelow(bin: Binary, b: Rect): boolean {
  * 于是两截都不成符头、字典也认不出——实测宁静 p3 那行「附点二分音符 + 四分休止」
  * 只认出了休止，整行五个小节全成了「一个 0.25 的音」。
  */
-export function judgeHeadBox(bin: Binary, box: Rect, unit: RasterUnit, stems: LineSeg[], inStaffBand: (y: number) => boolean): SmuflName | null {
+export function judgeHeadBox(bin: Binary, box: Rect, unit: RasterUnit, stems: LineSeg[], inStaffBand: (y: number, x?: number) => boolean): SmuflName | null {
   const sp = unit.space;
   const w = box.w / sp;
   const h = box.h / sp;
@@ -339,7 +350,7 @@ export function judgeHeadBox(bin: Binary, box: Rect, unit: RasterUnit, stems: Li
   if (fill < 0.3) return null;
   if (fill >= FILL_SOLID) return "noteheadBlack";
   if (w < W_HOLLOW_MIN || w / h < R_HOLLOW_MIN) return null;
-  if (!inStaffBand(box.y + box.h / 2)) return null;
+  if (!inStaffBand(box.y + box.h / 2, box.x + box.w / 2)) return null;
   return w >= W_WHOLE && !stemOf(box, stems, unit) ? "noteheadWhole" : "noteheadHalf";
 }
 
@@ -417,6 +428,27 @@ function extendStem(s: LineSeg, b: Rect): void {
   else if (bottom < b.y) up ? (s.y1 = b.y) : (s.y0 = b.y);
 }
 
+/**
+ * **叠成一摞的空心头，圈的左沿（或右沿）竖着连成一道墨**，沿盒边量墨柱时当成了一根干，上下两个头读成二分
+ *（爱是从神而来 p5 m62 低音 E♭3/G3/B♭3 三个全音符）。真干总有一端伸出头外；
+ * 这一道两端各压着一个像内腔的孔、孔都在它同一侧、两头都没伸出孔外半格。
+ */
+export function ringEdgeSeg(st: LineSeg, holes: Rect[], sp: number): boolean {
+  const x = (st.x0 + st.x1) / 2;
+  const top = Math.min(st.y0, st.y1);
+  const bot = Math.max(st.y0, st.y1);
+  // 不到谱表高：小节线两端也常挨着头的内腔
+  if (bot - top < sp * 1.5 || bot - top > sp * 3.2) return false;
+  const at = (y: number) =>
+    holes.filter((h) => h.w / sp >= HOLE_W[0] && h.w / sp <= HOLE_W[1] && h.h / sp >= HOLE_H[0] && Math.abs(h.y + h.h / 2 - y) <= sp * 0.6 && Math.abs(h.x + h.w / 2 - x) <= sp);
+  const a = at(top);
+  const b = at(bot);
+  if (!a.length || !b.length) return false;
+  const side = (h: Rect) => Math.sign(h.x + h.w / 2 - x);
+  if (![...a, ...b].every((h) => side(h) === side(a[0]))) return false;
+  return Math.min(...a.map((h) => h.y)) - top < sp * 0.5 && bot - Math.max(...b.map((h) => h.y + h.h)) < sp * 0.5;
+}
+
 /** 贴在这个符头左缘或右缘、且纵向相交的竖段。 */
 export function stemOf(b: Rect, stems: LineSeg[], unit: RasterUnit, nl?: Binary, mid = false): LineSeg | null {
   const tol = Math.max(unit.lineThick * 2, unit.space * 0.25);
@@ -485,6 +517,8 @@ const HOLE_RATIO_WHOLE = 0.6;
 /** 二分符头一定带符干（全音符才不带，靠宽度分）。放开这一条实测音符 69.57% → 67.81%。 */
 const HOLE_NEED_STEM = true;
 const FILL_RING = [0.3, 0.75] as const;
+/** 没干的内腔按圈外缘收全音符时，外缘宽高比下限：全音符约 2:1。 */
+const WHOLE_OUTER_RATIO = 1.4;
 /** 图上量出的墨柱往一头伸出多长（格）才算符干：够一根干，又不是花括号、谱号那种长竖笔。 */
 const INK_STEM = [2.5, 7] as const;
 /** 墨柱往另一头至多伸出这么多格（`hollowHeadsFromHoles`）。 */
@@ -493,7 +527,7 @@ const INK_STEM_BACK = 1.5;
 const MATE_GAP = 3.5;
 
 /** 把被谱线豁开的内腔并回一个。 */
-export function mergeHoles(holes: Rect[], unit: RasterUnit, onLine: (y: number) => boolean = () => false): Rect[] {
+export function mergeHoles(holes: Rect[], unit: RasterUnit, onLine: (y: number, x?: number) => boolean = () => false): Rect[] {
   const sp = unit.space;
   // **先按尺寸筛一道再并**。页面上最大的一批「孔」是**谱线之间被小节线围住的那些间**
   // （实测 28×20 格一个），不筛就会顺着它们连锁并成整页一个盒（实测并完只剩 155 个、
@@ -515,7 +549,7 @@ export function mergeHoles(holes: Rect[], unit: RasterUnit, onLine: (y: number) 
         // 12×5 与 11×5 两半、重叠 0.45）。两半都扁、中间只隔一条线宽的，重叠四成就并。
         const gapY = r.y > box.y ? box.y + box.h + gap / 2 : r.y + r.h + gap / 2;
         // 缝要落在谱线/加线网格上：棋盘网纹底本满页是小孔，不卡网格就并出假内腔（父恩广大 −1.8）
-        const lineCut = ov >= Math.min(box.w, r.w) * HOLE_OVERLAP_CUT && gap <= unit.lineThick + 1 && box.h <= sp * 0.4 && r.h <= sp * 0.4 && onLine(gapY);
+        const lineCut = ov >= Math.min(box.w, r.w) * HOLE_OVERLAP_CUT && gap <= unit.lineThick + 1 && box.h <= sp * 0.4 && r.h <= sp * 0.4 && onLine(gapY, box.x + box.w / 2);
         if (!lineCut && ov < Math.min(box.w, r.w) * HOLE_OVERLAP) continue;
         if (gap > sp * HOLE_VGAP) continue;
         const x0 = Math.min(box.x, r.x);
@@ -531,6 +565,21 @@ export function mergeHoles(holes: Rect[], unit: RasterUnit, onLine: (y: number) 
   return out;
 }
 
+/** 盒左右各四分之一宽里，有没有一列墨从盒上沿往上、或下沿往下接着伸出 0.4 格以上（粘在头边的临时记号的竖笔）。 */
+function pokesOut(bin: Binary, box: Rect, sp: number): boolean {
+  const reach = Math.ceil(sp * 0.4);
+  const q = Math.max(1, Math.round(box.w / 4));
+  const ink = (x: number, y: number) => x >= 0 && y >= 0 && x < bin.w && y < bin.h && bin.data[y * bin.w + x] !== 0;
+  for (const x0 of [box.x, box.x + box.w - q])
+    for (let x = x0; x < x0 + q; x++) {
+      let up = 0, dn = 0;
+      while (up < reach && ink(x, box.y - 1 - up)) up++;
+      while (dn < reach && ink(x, box.y + box.h + dn)) dn++;
+      if (up >= reach || dn >= reach) return true;
+    }
+  return false;
+}
+
 /**
  * 内腔 → 空心符头。返回还没被认出来的那些（与已认出的符头盒重叠的会跳过）。
  *
@@ -542,9 +591,15 @@ export function hollowHeadsFromHoles(
   holes: Rect[],
   unit: RasterUnit,
   stems: LineSeg[],
-  inStaffBand: (y: number) => boolean,
+  inStaffBand: (y: number, x?: number) => boolean,
   taken: Rect[],
   bars: LineSeg[] = [],
+  /** 认成休止斜笔的竖段：挂上它的头当没干（见下「内腔扁而偏」） */
+  restStrokes: ReadonlySet<LineSeg> = new Set(),
+  /** 收下来的：被并排两个全音符挤掉的「头」（两圈相接处那块实墨，见下 `seamMid`），调用方从已认出的头里删掉 */
+  seams: Rect[] = [],
+  /** 切开的「8」字两半 → 切口所在的 y（`hollowHeadsFromStackedHoles` 给）：量圈外缘时截到这里 */
+  stackMid?: ReadonlyMap<Rect, number>,
 ): { box: Rect; code: SmuflName; weak?: boolean }[] {
   const sp = unit.space;
   const ring = Math.max(2, Math.round(sp * RING));
@@ -586,6 +641,8 @@ export function hollowHeadsFromHoles(
     });
     if (walled) continue;
     let pairedWhole = false; // 并排有同形内腔的全音符（见下）
+    let seamMid: number | undefined; // 并排两个全音符内腔之间的中线 x
+    let fromOuter = false; // 头盒按圈外缘量（全音符）
     // 内腔占满一个间的细圈头（望十架 p1 m4 的 F4 二分：内腔 0.86 格高），上下圈压在两条谱线里，照满圈外扩盒就高出 `H_MAX`：
     // 上下那一圈收到正好够得上 `H_MAX`
     const ringY = Math.max(1, Math.min(ring, Math.floor((sp * H_MAX - hole.h) / 2)));
@@ -598,6 +655,10 @@ export function hollowHeadsFromHoles(
       let clipped = false; // 并排有同形内腔
       // 同一高度左右紧挨着另一个内腔的（两个声部同音的全音符并排贴着，我灵镇静末小节），两个头的圈连成一段，
       // 外缘量到了邻头那边（1.9 格，超了上限）：截到两个内腔之间的中线
+      const sm = stackMid?.get(hole);
+      if (outer && sm !== undefined) {
+        outer = hole.y < sm ? { ...outer, h: Math.min(outer.y + outer.h, sm) - outer.y } : { ...outer, y: Math.max(outer.y, sm), h: outer.y + outer.h - Math.max(outer.y, sm) };
+      }
       if (outer) {
         const hcy = hole.y + hole.h / 2;
         for (const o of holes) {
@@ -607,9 +668,11 @@ export function hollowHeadsFromHoles(
           if ((o.x >= hole.x + hole.w && o.x - (hole.x + hole.w) < sp * 1.2) || (o.x + o.w <= hole.x && hole.x - (o.x + o.w) < sp * 1.2)) clipped = true;
           if (o.x >= hole.x + hole.w && o.x - (hole.x + hole.w) < sp * 1.2) {
             const mid = Math.round((hole.x + hole.w + o.x) / 2);
+            seamMid = mid;
             if (mid < outer.x + outer.w) outer = { ...outer, w: mid - outer.x };
           } else if (o.x + o.w <= hole.x && hole.x - (o.x + o.w) < sp * 1.2) {
             const mid = Math.round((o.x + o.w + hole.x) / 2);
+            seamMid = mid;
             if (mid > outer.x) outer = { ...outer, x: mid, w: outer.x + outer.w - mid };
           }
         }
@@ -619,12 +682,18 @@ export function hollowHeadsFromHoles(
       if (!outer || outer.w / sp < (clipped ? 1.25 : W_WHOLE)) continue;
       pairedWhole = clipped && outer.w / sp < W_WHOLE;
       box = outer;
+      fromOuter = true;
     }
     const w = box.w / sp;
     const h = box.h / sp;
-    if (w < W_HOLLOW_MIN || w > W_MAX || h < H_MIN || h > H_MAX) continue;
+    // 按圈外缘量的全音符宽度上限同下「干是休止斜笔」那一档放到 1.2 倍（是爱 p4 m55 低音 C3 手写全音符外缘 1.86 格）；
+    // 只给不挂干的：带干的放宽了会让 m49 手写斜二分和弦按宽盒先收、挤掉短干那一路
+    if (w < W_HOLLOW_MIN || w > W_MAX * (fromOuter && !stemOf(box, stems, unit, nl) && !stemThrough(box, stems, unit) ? 1.2 : 1) || h < H_MIN || h > H_MAX) continue;
     if (w / h < R_HOLLOW_MIN) continue;
-    if (!inStaffBand(box.y + box.h / 2)) continue;
+    if (!inStaffBand(box.y + box.h / 2, box.x + box.w / 2)) continue;
+    // 放宽收下的不能是粘着临时记号的头：爱是从神而来 p2 m24 二分 A4 左边粘着还原号、内腔从底下漏出去，外缘把还原号一起围进来（2.01 格），
+    // 读成不带还原号的全音符。还原号竖笔伸出头盒上下 8px，是爱手写全音符圈边至多 1px
+    if (w > W_MAX && pokesOut(nl, box, sp)) continue;
     // 圈要**围得住**：盒里的墨占三成到七成（全实心的是实心符头、太空的是别的东西的空隙）
     let ink = 0;
     for (let y = box.y; y < box.y + box.h; y++)
@@ -632,10 +701,17 @@ export function hollowHeadsFromHoles(
         if (x >= 0 && y >= 0 && x < nl.w && y < nl.h && nl.data[y * nl.w + x]) ink++;
     const fill = ink / Math.max(1, box.w * box.h);
     if (fill < FILL_RING[0] || fill > FILL_RING[1]) continue;
-    // 已经认出来的符头不重复收
-    if (taken.some((t) => overlaps(t, box, sp * 0.4))) continue;
+    // 已经认出来的符头不重复收。并排两个全音符（「oo」）两圈相接处是一块实墨，不推平之后常被判头那一路收成一个实心头
+    //（我灵镇静末小节两声部同音 F4 全音符读成一个四分）：挡路的只是一个窄过一格、正骑在两内腔中线上的头，就当它是接缝，挤掉
+    const block = taken.filter((t) => overlaps(t, box, sp * 0.4));
+    const seam = (t: Rect) => seamMid !== undefined && t.w < sp * 1.2 && Math.abs(t.x + t.w / 2 - seamMid) < sp * 0.4;
+    if (block.length && !(seamMid !== undefined && block.every(seam))) continue;
+    for (const t of block) if (!seams.includes(t)) seams.push(t);
     let stem: LineSeg | true | null = stemOf(box, stems, unit, nl);
-    if (!stem) {
+    // 挂上的「干」是休止的斜笔：头当没干，下面按圈外缘看是不是全音符
+    const restStem = !!stem && restStrokes.has(stem);
+    if (restStem) stem = null;
+    if (!stem && !restStem) {
       // 竖段表里没有的干：闭合谱男声 B3 往下一根干穿过整个谱表到 G♯2（齐来称颂），
       // 长得像小节线，没进竖段表。照 Audiveris `HeadLinker` 的做法直接在图上沿盒边量墨柱，
       // 往一头伸出 2.5~7 格就算有干。
@@ -656,7 +732,7 @@ export function hollowHeadsFromHoles(
           const tcy = t.y + t.h / 2;
           return edge <= sp * 0.3 && (Math.abs(tcy - col[0]) <= sp * 0.6 || Math.abs(tcy - col[1]) <= sp * 0.6) && side(t) !== side(box);
         });
-      if (reach >= sp * INK_STEM[0] && reach <= sp * INK_STEM[1] && !owner) stem = true;
+      if (reach >= sp * INK_STEM[0] && reach <= sp * INK_STEM[1] && !owner && !ringEdgeSeg({ x0: col![2], y0: col![0], x1: col![2], y1: col![1], lw: 1, maxLw: 1 }, holes, sp)) stem = true;
     }
     if (!stem) {
       const through = stemThrough(box, stems, unit);
@@ -665,12 +741,26 @@ export function hollowHeadsFromHoles(
     // 二分符头一定带符干，全音符才不带（宽度那一档与 `judgeHeadBox` 共用 `W_WHOLE`）。
     // 试过把全音符的宽度门槛单独抬到 1.65：时值 90.3% → 90.5%，但音符 69.60% → 69.52%，
     // 不划算。
-    if (HOLE_NEED_STEM && !stem && w < W_WHOLE && !pairedWhole) continue;
+    if (HOLE_NEED_STEM && !stem && w < W_WHOLE && !pairedWhole) {
+      // 干是休止斜笔、内腔扁而偏、外扩一圈够不上全音符宽的：按圈量到外缘再看（是爱 p1 m16 低音 F3 手写全音符，头顶上的八分休止斜笔伸到头上，
+      // 内腔 1 格宽、圈 2 格宽）。不限干的来历时新编 204 两个二分和弦旁的空当也收成全音符
+      const outer = !restStem ? null : ringOuter(nl, hole, sp);
+      if (!outer || outer.w / sp < W_WHOLE || outer.w / sp > W_MAX * 1.2 || outer.h / sp > H_MAX || outer.w < outer.h * WHOLE_OUTER_RATIO || taken.some((t) => overlaps(t, outer, sp * 0.4))) continue;
+      // 圈要像空心头：外缘盒里的墨占比在空心头那一档（升号中间的方孔外扩出去是一团交叉的粗笔，望十架 p7 m55）
+      let ink2 = 0;
+      for (let y = outer.y; y < outer.y + outer.h; y++) for (let x = outer.x; x < outer.x + outer.w; x++) if (nl.data[y * nl.w + x]) ink2++;
+      const fill2 = ink2 / Math.max(1, outer.w * outer.h);
+      if (fill2 < FILL_RING[0] || fill2 > FILL_RING[1]) continue;
+      out.push({ box: outer, code: "noteheadWhole" });
+      taken.push(outer);
+      continue;
+    }
     // 靠墨柱认下的头标 `weak`：不进空心头模板的样本（`buildHollowMasks`）。它们多半拖着
     // 一根穿过窗口的长干，混进去模板就偏了——善牧恩慈歌两处真二分头认出来，却让模板
     // 再也配不上后面的全音符和弦（音符 90.0% → 89.3%，不进样本 → 91.4%）。
     if (stem && stem !== true) extendStem(stem, box);
-    out.push({ box, code: (w >= W_WHOLE || pairedWhole) && !stem ? "noteheadWhole" : "noteheadHalf", ...(stem === true ? { weak: true } : {}) });
+    // 宽过 `W_MAX` 放宽收下的全音符也标 `weak`：进了空心模板样本，是爱 p4 m49 手写斜二分叠头就配不上了
+    out.push({ box, code: (w >= W_WHOLE || pairedWhole) && !stem ? "noteheadWhole" : "noteheadHalf", ...(stem === true || w > W_MAX ? { weak: true } : {}) });
     taken.push(box);
   }
   // **叠置空心和弦**：符干从一端的头穿过另一个头往外伸（齐来称颂 A4/E4 二分和弦，
@@ -697,6 +787,84 @@ export function hollowHeadsFromHoles(
     if (!mate) continue;
     out.push({ box: m.box, code: "noteheadHalf" });
     taken.push(m.box);
+  }
+  return out;
+}
+
+/**
+ * 「8」字叠头的最后一道：并成一个高孔、别的几路都没认的上下两个空心头，从中线切开按内腔那一路各走一遍。
+ * 两半都收成头才留（只收一半的多半不是叠头）。
+ */
+export function hollowHeadsFromStackedHoles(
+  nl: Binary,
+  holes: Rect[],
+  unit: RasterUnit,
+  stems: LineSeg[],
+  inStaffBand: (y: number, x?: number) => boolean,
+  taken: Rect[],
+  bars: LineSeg[] = [],
+  restStrokes: ReadonlySet<LineSeg> = new Set(),
+): { box: Rect; code: SmuflName; weak?: boolean }[] {
+  const sp = unit.space;
+  const ring = Math.max(2, Math.round(sp * RING));
+  // 「8」字叠头：上下叠着的两个空心头（我灵镇静低音 m16 A3/C♯4 全音符，一个骑顶线、一个骑上加一线），两个内腔只隔一道圈，
+  // `mergeHoles` 照「纵缝不到 HOLE_VGAP」并成了一个 1.8 格高的孔、尺寸关上被扔掉。并成 1.4~2.1 格高、宽在内腔档、
+  // 正中一带横着一道满宽的墨（两头之间的圈）、又没挂着干的，从中线切回上下两个内腔，量圈外缘时截到中线。
+  // 只当**最后一道**：按内腔、按音高逐位配模板、沿加线这几路都走完，这块地方还空着才切（`stages/heads.ts`）。
+  // 放进按内腔那一路的主循环里先切：半个内腔当了别的内腔的「并排同形内腔」、又占住位置，按音高那一路认得齐的三四个头一摞的手写全音符和弦
+  // 只剩切出来的两个（是爱 p2 m19、m30 和弦音跟着丢）。
+  // 试过在 `mergeHoles` 里一律不并出超过内腔上限的孔：别处碎片不再被吞进大孔扔掉、冒出假头，我灵镇静 67 → 82 步，撤了。
+  const stackPairs: { up: Rect; dn: Rect; mid: number }[] = [];
+  for (const hole of holes) {
+    const hh = hole.h / sp;
+    if (hh < 1.4 || hh > 2.1 || hole.w < sp * HOLE_W[0] || hole.w > sp * HOLE_W[1]) continue;
+    const mid = Math.round(hole.y + hole.h / 2);
+    let solid = 0;
+    for (let y = mid - 2; y <= mid + 2; y++) {
+      let n = 0;
+      for (let x = hole.x; x < hole.x + hole.w; x++) if (nl.data[y * nl.w + x]) n++;
+      if (n >= hole.w * 0.8) solid++;
+    }
+    if (!solid) continue;
+    // 只管不带干的（全音符）：带干的叠置空心和弦另有按音高逐位配模板那一路（`hollowHeadsByPitch`），这里抢先切开反而认偏
+    //（不限干时新编 44 首降）
+    const around = { x: hole.x - ring, y: hole.y - ring, w: hole.w + ring * 2, h: hole.h + ring * 2 };
+    if (stemOf(around, stems, unit, nl) || stemThrough(around, stems, unit)) continue;
+    // 左右两圈之内有一列墨从孔上沿一直通到孔下沿、还往外伸出 0.6 格以上的也不切：那是干（竖段表里未必有），
+    // 干、实心头与旁边斜空心头围出的白（新编 050 低音 m2）。全音符的圈伸不出孔外那么远
+    const inkCol = (x: number) => {
+      if (x < 0 || x >= nl.w) return false;
+      const on = (y: number) => y >= 0 && y < nl.h && !!nl.data[y * nl.w + x];
+      for (let y = hole.y; y < hole.y + hole.h; y++) if (!on(y)) return false;
+      let a = hole.y, b = hole.y + hole.h - 1;
+      while (on(a - 1)) a--;
+      while (on(b + 1)) b++;
+      return hole.y - a >= sp * 0.6 || b - (hole.y + hole.h - 1) >= sp * 0.6;
+    };
+    let stemBeside = false;
+    for (let k = 1; k <= ring * 2 && !stemBeside; k++) stemBeside = inkCol(hole.x - k) || inkCol(hole.x + hole.w - 1 + k);
+    if (stemBeside) continue;
+    const up = { x: hole.x, y: hole.y, w: hole.w, h: mid - hole.y }, dn = { x: hole.x, y: mid, w: hole.w, h: hole.y + hole.h - mid };
+    stackPairs.push({ up, dn, mid });
+  }
+  // 已被别的路认了（哪怕只认了一部分）的不动
+  const free = stackPairs.filter((q) => !taken.some((t) => overlaps(t, { x: q.up.x, y: q.up.y, w: q.up.w, h: q.dn.y + q.dn.h - q.up.y }, 1)));
+  if (!free.length) return [];
+  const mids = new Map<Rect, number>();
+  for (const q of free) { mids.set(q.up, q.mid); mids.set(q.dn, q.mid); }
+  const sub = hollowHeadsFromHoles(nl, [...mids.keys()], unit, stems, inStaffBand, taken, bars, restStrokes, [], mids);
+  const out: { box: Rect; code: SmuflName; weak?: boolean }[] = [];
+  for (const q of free) {
+    const mine = sub.filter((o) => {
+      const cx = o.box.x + o.box.w / 2, cy = o.box.y + o.box.h / 2;
+      return cx >= q.up.x - ring && cx <= q.up.x + q.up.w + ring && cy >= q.up.y - ring && cy <= q.dn.y + q.dn.h + ring;
+    });
+    const both = mine.some((o) => o.box.y + o.box.h / 2 < q.mid) && mine.some((o) => o.box.y + o.box.h / 2 >= q.mid);
+    for (const o of mine) {
+      if (both) { out.push(o); continue; }
+      const ti = taken.indexOf(o.box);
+      if (ti >= 0) taken.splice(ti, 1);
+    }
   }
   return out;
 }
@@ -749,7 +917,7 @@ export function hollowHeadsFromCavities(
   cavities: Rect[],
   unit: RasterUnit,
   stems: LineSeg[],
-  inStaffBand: (y: number) => boolean,
+  inStaffBand: (y: number, x?: number) => boolean,
   taken: Rect[],
   size: { w: number; h: number },
   /**
@@ -775,7 +943,7 @@ export function hollowHeadsFromCavities(
     if (cw < HOLE_W[0] || cw > HOLE_W[1] || ch < HOLE_H[0] || ch > HOLE_H[1]) continue;
     const cx = cav.x + cav.w / 2;
     const cy = cav.y + cav.h / 2;
-    if (!inStaffBand(cy)) continue;
+    if (!inStaffBand(cy, cx)) continue;
     const box: Rect = { x: Math.round(cx - size.w / 2), y: Math.round(cy - size.h / 2), w: size.w, h: size.h };
     let ink = 0;
     for (let y = box.y; y < box.y + box.h; y++)
@@ -842,6 +1010,10 @@ const CAVITY_MIN = 0.5;
 const PAIR_SCORE = 0.25;
 const PAIR_CAVITY = 0.7;
 const PAIR_INK = 0.32;
+/** 内腔窄的手写页上三头内腔区放宽收头的模板分门槛（`hollowHeadsByPitch`）。 */
+const HAND_SCORE = 0.2;
+/** 一摞头里没找着干的那个（在摞的一端），墨柱往摞外伸出这么多格就跟着别的头算二分（`hollowHeadsByPitch`）。 */
+const STACK_STEM_REACH = 1.5;
 
 /** 一个音高位置：中心 y，以及它是不是线位（含加线位）。 */
 export interface PitchStep {
@@ -943,10 +1115,12 @@ function pitchScorer(bin: Binary, nl: Binary, rawHoles: Rect[], allMasks: HeadMa
     let stem: LineSeg | true | null = stemOf(box, stems, unit);
     let ink: LineSeg | undefined;
     if (!stem) {
-      const col = inkColumn(nl, box, unit);
+      // 断口容到一条谱线厚：去线图上干被每条谱线切断（是爱线厚 4px，只容两行的话叠头和弦的干在第一条线处就断了，p4 m60 D5/F5 二分找不着干）。
+      // 别处（`hollowHeadsFromHoles`、补全音符那一路）不放：一放破碎扫描 p4 m55 男声行多认一个 C4、丢一个 G3
+      const col = inkColumn(nl, box, unit, false, Math.max(2, Math.round(unit.lineThick)));
       const cy = box.y + box.h / 2;
       const reach = col ? Math.max(cy - col[0], col[1] - cy) : 0;
-      if (col && reach >= sp * INK_STEM[0] && reach <= sp * INK_STEM[1]) {
+      if (col && reach >= sp * INK_STEM[0] && reach <= sp * INK_STEM[1] && !ringEdgeSeg({ x0: col[2], y0: col[0], x1: col[2], y1: col[1], lw: 1, maxLw: 1 }, rawHoles, sp)) {
         stem = true;
         ink = { x0: col[2], y0: col[0], x1: col[2], y1: col[1], lw: unit.lineThick, maxLw: unit.lineThick * 2 };
       }
@@ -1036,9 +1210,9 @@ export function hollowHeadsByPitch(
   holes: Rect[],
   allMasks: HeadMask[],
   unit: RasterUnit,
-  stepsIn: (y0: number, y1: number) => PitchStep[],
+  stepsIn: (y0: number, y1: number, x?: number) => PitchStep[],
   stems: LineSeg[],
-  inStaffBand: (y: number) => boolean,
+  inStaffBand: (y: number, x?: number) => boolean,
   taken: Rect[],
   cavW?: number,
 ): { box: Rect; code: SmuflName; weak?: boolean; noSample?: boolean }[] {
@@ -1058,15 +1232,19 @@ export function hollowHeadsByPitch(
     const tall = cavScale < 1 && hh > STACK_H[1] && hh <= STACK3_H;
     if (hw < stackW || hw > HOLE_W[1] || hh <= STACK_H[0] || (hh > STACK_H[1] && !tall)) continue;
     const cx0 = hole.x + hole.w / 2;
-    if (!inStaffBand(hole.y + hole.h / 2)) continue;
+    if (!inStaffBand(hole.y + hole.h / 2, hole.x + hole.w / 2)) continue;
     const bw = hole.w + ring * 2;
     const cands: { x: number; y: number; s: number }[] = [];
     const loose: { x: number; y: number; s: number }[] = [];
-    for (const st of stepsIn(hole.y - sp * 0.3, hole.y + hole.h + sp * 0.3)) {
+    for (const st of stepsIn(hole.y - sp * 0.3, hole.y + hole.h + sp * 0.3, hole.x + hole.w / 2)) {
       const b = best(st, cx0 - sp * 0.2, cx0 + sp * 0.2);
       if (!b) continue;
       const cav = cavity(b.x, st.y, cavScale < 1);
-      if (b.s >= PAIR_SCORE && cav >= PAIR_CAVITY && inkIn(b.x, st.y, hole.w + ring * 2) >= PAIR_INK) loose.push({ x: b.x, y: st.y, s: b.s });
+      // 三头内腔区（`tall`，只在内腔窄的手写页）内腔佐证按平常那一档、模板分放到 `HAND_SCORE`：手写斜缝内腔真头只有 0.6~0.66，
+      // 两头之间的位置 0.15~0.19（是爱 p4 m57 D5/F5/A5 二分），成对那一档的 0.7 一个都过不了；手写头倾角各不相同，
+      // 模板分低到 0.21~0.24（m58 F4/A4/C5 的 F4），两头之间的位置只有 0.08~0.14。
+      // 成对的区不放：新编 285、291 的低音十六分和弦被收成二分叠头（+27、+9），是爱 p4 m60 D5/F5 那对因此仍漏（阈值冲突）
+      if (b.s >= (tall ? HAND_SCORE : PAIR_SCORE) && cav >= (tall ? CAVITY_MIN : PAIR_CAVITY) && inkIn(b.x, st.y, hole.w + ring * 2) >= PAIR_INK) loose.push({ x: b.x, y: st.y, s: b.s });
       if (b.s < PITCH_SCORE || cav < CAVITY_MIN) continue;
       cands.push({ x: b.x, y: st.y, s: b.s });
     }
@@ -1099,8 +1277,20 @@ export function hollowHeadsByPitch(
     // 放宽收来的一对**要找得到干**：找不到干的会记成全音符，而那种叠头后面「空心头按模板再搜」
     // 那一路认得对（大地风光 m8 的 B3/D4 二分，抢过来就成了全音符）。
     if (relaxed && picked.some((b) => codeOf(b, picked)?.code !== "noteheadHalf")) continue;
-    for (const box of picked) {
-      let c = codeOf(box, picked);
+    // 一摞头共用一根干：有的够得着干、有的离干端不到 `INK_STEM` 下限（摞在干端那个头）的，一起算二分（是爱 p4 m58 C5，墨柱离头心 2.47 格）。
+    // 墨柱要从这个头**往摞外**伸出 `STACK_STEM_REACH` 格（干从摞的一端伸出去）：往摞里量会穿过别的头接上另一声部的干
+    //（爱是从神而来 p4 m44 低音 E3/G3 全音符摞在 C3 二分上，墨柱从 G3 往下穿过 E3 接上 C3 朝下的干）
+    const codes = picked.map((b) => codeOf(b, picked));
+    const half = codes.find((c) => c?.code === "noteheadHalf");
+    const onStem = (b: Rect): boolean => {
+      const cy = b.y + b.h / 2;
+      const top = picked.every((o) => o.y + o.h / 2 >= cy);
+      const bottom = picked.every((o) => o.y + o.h / 2 <= cy);
+      const col = inkColumn(nl, b, unit, false, Math.max(2, Math.round(unit.lineThick)));
+      return !!col && ((top && cy - col[0] >= sp * STACK_STEM_REACH) || (bottom && col[1] - cy >= sp * STACK_STEM_REACH));
+    };
+    for (const [k, box] of picked.entries()) {
+      let c = codes[k]?.code === "noteheadWhole" && half && onStem(box) ? half : codes[k];
       let wide = false;
       // 内腔窄的页（`cavScale` < 1）按内腔外扩的盒比真头窄：没干时按这一行墨的实宽再判全音符
       if (!c && cavScale < 1) {
@@ -1191,7 +1381,7 @@ export function reseatHollowHeads(
   rawHoles: Rect[],
   allMasks: HeadMask[],
   unit: RasterUnit,
-  stepsIn: (y0: number, y1: number) => PitchStep[],
+  stepsIn: (y0: number, y1: number, x?: number) => PitchStep[],
   stems: LineSeg[],
   heads: { box: Rect; code: string }[],
 ): number {
@@ -1221,7 +1411,7 @@ export function reseatHollowHeads(
     }
     if (!v) continue;
     const vx = (v.x0 + v.x1) / 2;
-    const steps = stepsIn(cy - sp * 0.8, cy + sp * 0.8);
+    const steps = stepsIn(cy - sp * 0.8, cy + sp * 0.8, vx);
     if (steps.length < 2) continue;
     const own = steps.reduce((p, q) => (Math.abs(q.y - cy) < Math.abs(p.y - cy) ? q : p));
     const ownB = bestMasked(own, cx - sp * 0.3, cx + sp * 0.3, vx);
@@ -1268,7 +1458,7 @@ export function hollowHeadsOnStemSeeds(
   rawHoles: Rect[],
   allMasks: HeadMask[],
   unit: RasterUnit,
-  stepsIn: (y0: number, y1: number) => PitchStep[],
+  stepsIn: (y0: number, y1: number, x?: number) => PitchStep[],
   stems: LineSeg[],
   syms: { box: Rect; code: string }[],
   beams: Rect[],
@@ -1312,7 +1502,7 @@ export function hollowHeadsOnStemSeeds(
     for (const end of ["top", "bot"] as const) {
       const e = end === "top" ? top : bot;
       const cx = end === "top" ? vx + w / 2 : vx - w / 2;
-      const steps = end === "top" ? stepsIn(e - sp * SEED_OUT, e + sp * SEED_IN) : stepsIn(e - sp * SEED_IN, e + sp * SEED_OUT);
+      const steps = end === "top" ? stepsIn(e - sp * SEED_OUT, e + sp * SEED_IN, cx) : stepsIn(e - sp * SEED_IN, e + sp * SEED_OUT, cx);
       for (const st of steps) {
         const b = bestMasked(st, cx - sp * SEED_XW, cx + sp * SEED_XW, vx);
         if (!b || b.s < ALONG_SCORE) continue;
@@ -1345,7 +1535,7 @@ export function hollowHeadsAlongStems(
   rawHoles: Rect[],
   allMasks: HeadMask[],
   unit: RasterUnit,
-  stepsIn: (y0: number, y1: number) => PitchStep[],
+  stepsIn: (y0: number, y1: number, x?: number) => PitchStep[],
   stems: LineSeg[],
   heads: { box: Rect; code: string }[],
 ): { box: Rect; code: SmuflName; weak?: boolean }[] {
@@ -1416,7 +1606,7 @@ export function hollowHeadsAlongStems(
   for (const { ref, vx, y0, y1, end, beyond, third, tip, deep, flip } of ranges) {
     if (y1 <= y0) continue;
     const cx = flip ? 2 * vx - (ref.box.x + ref.box.w / 2) : ref.box.x + ref.box.w / 2;
-    for (const st of stepsIn(y0, y1)) {
+    for (const st of stepsIn(y0, y1, cx)) {
       // 干端那一级：干必挂着头，模板分放宽；干端以外的位置照常
       const atEnd = end !== undefined && Math.abs(st.y - end) <= sp * ALONG_END_TOL;
       // 模板沿用本页对齐过的空心模板，谱线行与这根干的列不计（`scoreAtMasked`）；墨占比、内腔都在微调后的头心上量
@@ -1488,7 +1678,7 @@ export function hollowHeadsOnLedgers(
   allMasks: HeadMask[],
   unit: RasterUnit,
   ledgers: { x0: number; x1: number; y: number }[],
-  stepsIn: (y0: number, y1: number) => PitchStep[],
+  stepsIn: (y0: number, y1: number, x?: number) => PitchStep[],
   stems: LineSeg[],
   taken: Rect[],
   /** 出参：靠墨柱判出来的干（竖段表里没有，`buildNotes` 定时值要用）。 */
@@ -1505,7 +1695,7 @@ export function hollowHeadsOnLedgers(
   for (const l of ledgers) {
     const len = (l.x1 - l.x0) / sp;
     if (len < LEDGER_LEN[0] || len > LEDGER_LEN[1]) continue;
-    for (const st of stepsIn(l.y - sp * 0.7, l.y + sp * 0.7)) {
+    for (const st of stepsIn(l.y - sp * 0.7, l.y + sp * 0.7, (l.x0 + l.x1) / 2)) {
       const b = best(st, l.x0 + sp * 0.4, l.x1 - sp * 0.4);
       if (!b || b.s < LEDGER_SCORE) continue;
       const cv = cavity(b.x, st.y);
@@ -1541,13 +1731,13 @@ export function hollowHeadsOnLedgers(
  * 竖段表之外、直接在图上量的符干：盒左右缘附近各列，从盒中心往上下沿墨走（断口 ≤2 像素），
  * 取纵向最长的一列，返回 `[上端, 下端, 列 x]`。
  */
-export function inkColumn(nl: Binary, b: Rect, unit: RasterUnit, sided = false): [number, number, number] | null {
+export function inkColumn(nl: Binary, b: Rect, unit: RasterUnit, sided = false, gapMax = 2): [number, number, number] | null {
   const tol = Math.round(Math.max(unit.lineThick * 2, unit.space * 0.25));
   const cy = Math.round(b.y + b.h / 2);
   const at = (x: number, y: number) => x >= 0 && y >= 0 && x < nl.w && y < nl.h && nl.data[y * nl.w + x] === 1;
   const walk = (x: number, dir: number): number => {
     let last = cy;
-    for (let y = cy, miss = 0; miss <= 2 && y >= 0 && y < nl.h; y += dir) {
+    for (let y = cy, miss = 0; miss <= gapMax && y >= 0 && y < nl.h; y += dir) {
       if (at(x, y)) {
         last = y;
         miss = 0;
@@ -1700,10 +1890,10 @@ export function headsBetweenStemPairs(
   stems: LineSeg[],
   heads: Rect[],
   unit: RasterUnit,
-  snap: (y: number) => number | null,
+  snap: (y: number, x?: number) => number | null,
   size: { w: number; h: number },
   bin: Binary,
-  onLine: (y: number) => boolean,
+  onLine: (y: number, x?: number) => boolean,
   isBar: (s: LineSeg) => boolean,
 ): { box: Rect; code: SmuflName; ids: number[]; weak: true }[] {
   const sp = unit.space;
@@ -1714,7 +1904,7 @@ export function headsBetweenStemPairs(
   const inkIn = (cx: number, cy: number, w: number, h: number): number => {
     let n = 0, ink = 0;
     for (let y = Math.round(cy - h / 2); y <= Math.round(cy + h / 2); y++) {
-      if (y < 0 || y >= bin.h || onLine(y)) continue;
+      if (y < 0 || y >= bin.h || onLine(y, cx)) continue;
       for (let x = Math.round(cx - w / 2); x <= Math.round(cx + w / 2); x++) {
         if (x < 0 || x >= bin.w) continue;
         n++;
@@ -1734,7 +1924,7 @@ export function headsBetweenStemPairs(
       if (ux - dx < sp * 0.8 || ux - dx > sp * 1.7 || Math.abs(uy - dy) > sp * 0.7) continue;
       if (headAt(dx, dy) || headAt(dx, dBot)) continue;
       const cx = (ux + dx) / 2;
-      const cy = snap((uy + dy) / 2) ?? (uy + dy) / 2;
+      const cy = snap((uy + dy) / 2, cx) ?? (uy + dy) / 2;
       const fill = inkIn(cx, cy, size.w * 0.9, size.h * 0.9);
       if (fill < 0.12) continue;
       const core = inkIn(cx, cy, sp * 0.6, sp * 0.4);
@@ -1755,6 +1945,8 @@ const BARE_W = [0.8, 1.6] as const;
 const BARE_H1 = [0.8, 1.35] as const;
 const BARE_H2 = [1.6, 2.5] as const;
 const BARE_FILL = [0.15, 0.6] as const;
+/** 收到的墨近干一边离干不到这么多格的，按补到干上量（贴干那半个头连在干上被干认领了）：望十架 p9 长笛 0.43。 */
+const BARE_STEM_GAP = 0.5;
 /** 头心墨占比：空心头的斜缝内腔实测 0.0~0.51（我灵镇静一处糊的 0.74），实心头 1.0。扫过 0.7 / **0.8**：92.10 / 92.14%。 */
 const BARE_CORE = 0.8;
 /** 压线头按放宽的窗口量头心时，判空心的上限。 */
@@ -1769,14 +1961,14 @@ const BAR_ARC_FILL = 0.35;
 const BARE_NETTED = 0.45;
 
 /** 盒里不碰盒边的白连通块（谱线行算白）中最大的一块像素数。 */
-function largestHole(bin: Binary, b: Rect, onLine: (y: number) => boolean, linesInk = true): number {
+function largestHole(bin: Binary, b: Rect, onLine: (y: number, x?: number) => boolean, linesInk = true): number {
   const W = b.w;
   const H = b.h;
   if (W <= 2 || H <= 2) return 0;
   const white = (x: number, y: number) => {
     const X = b.x + x;
     const Y = b.y + y;
-    return X < 0 || Y < 0 || X >= bin.w || Y >= bin.h || (linesInk && onLine(Y)) ? false : !bin.data[Y * bin.w + X] || onLine(Y);
+    return X < 0 || Y < 0 || X >= bin.w || Y >= bin.h || (linesInk && onLine(Y, X)) ? false : !bin.data[Y * bin.w + X] || onLine(Y, X);
   };
   const seen = new Uint8Array(W * H);
   let best = 0;
@@ -1830,10 +2022,10 @@ function solidAtEnd(bin: Binary, s: LineSeg, end: "top" | "bottom", sp: number):
 export function headsOnBareStems(
   probes: BareStemProbe[],
   unit: RasterUnit,
-  snap: (y: number) => number | null,
+  snap: (y: number, x?: number) => number | null,
   size: { w: number; h: number },
   bin: Binary,
-  onLine: (y: number) => boolean,
+  onLine: (y: number, x?: number) => boolean,
 ): { box: Rect; code: SmuflName; ids: number[]; weak: true }[] {
   const sp = unit.space;
   /** 头心一小块（0.6×0.4 格）在原图里的墨占比，谱线那几行不算。实心头近 1，空心头的斜缝内腔低得多。 */
@@ -1859,7 +2051,7 @@ export function headsOnBareStems(
     let ink = 0;
     let rows = 0;
     for (let y = Math.round(cy - sp * half); y <= Math.round(cy + sp * half); y++) {
-      if (y < 0 || y >= bin.h || onLine(y) || ledgerRow(cx, y)) continue;
+      if (y < 0 || y >= bin.h || onLine(y, cx) || ledgerRow(cx, y)) continue;
       rows++;
       for (let x = Math.round(cx - sp * 0.3); x <= Math.round(cx + sp * 0.3); x++) {
         if (x < 0 || y < 0 || x >= bin.w || y >= bin.h) continue;
@@ -1881,7 +2073,7 @@ export function headsOnBareStems(
   const widest = (box: Rect, y: number): number => {
     let most = 0;
     for (let yy = Math.round(y - sp * 0.25); yy <= Math.round(y + sp * 0.25); yy++) {
-      if (yy < 0 || yy >= bin.h || onLine(yy)) continue;
+      if (yy < 0 || yy >= bin.h || onLine(yy, box.x + box.w / 2)) continue;
       let x0 = -1;
       let x1 = -1;
       for (let x = box.x; x < box.x + box.w; x++)
@@ -1900,14 +2092,14 @@ export function headsOnBareStems(
     if (w < BARE_W[0] || w > BARE_W[1] || fill < BARE_FILL[0]) return null;
     let ys: number[];
     if (h >= BARE_H1[0] && h <= BARE_H1[1]) {
-      const c = snap(box.y + box.h / 2);
+      const c = snap(box.y + box.h / 2, box.x + box.w / 2);
       if (c === null) return null;
       ys = [c];
     } else if (h >= BARE_H2[0] && h <= BARE_H2[1]) {
       // 两个头各高 box.h − 1 格（中心隔一格）
       const hh = Math.max(sp * 0.8, box.h - sp);
-      const a = snap(box.y + hh / 2);
-      const b = snap(box.y + box.h - hh / 2);
+      const a = snap(box.y + hh / 2, box.x + box.w / 2);
+      const b = snap(box.y + box.h - hh / 2, box.x + box.w / 2);
       if (a === null || b === null || Math.abs(Math.abs(b - a) - sp) > sp * 0.3) return null;
       ys = [a, b];
     } else return null;
@@ -1929,6 +2121,37 @@ export function headsOnBareStems(
     // 只取端头窗口里扣掉干、加线之后的那一截再判一次（万福泉源歌 m21 E♭4/C4「8」字叠头、耶和华是我的牧者 m11
     // 两根干共用的 A3 空心头）。先判原块：两个头高的叠头照原块判得对，削过反倒切坏（我灵镇静 m15、m23）
     let got = judge(p.box, p.area);
+    // 收拢来的墨只有头离干远的那半：贴着干的那半连在干上、跟着干被认领了（望十架 p9 m69 长笛花斑实心头，收出 0.68 格宽）。
+    // 墨的近干一边离干不到 `BARE_STEM_GAP` 格、不够一个头宽、只一个头高的，盒补到干上再判（面积按原图盒里的墨重数）。
+    // 两个头高的不补：多是叠头和弦与邻音的墨，补出来的头错位（新编 101、147、244）
+    if (!got && p.box.w < sp * BARE_W[0] && p.box.h <= sp * BARE_H1[1]) {
+      const sx = (p.stem.x0 + p.stem.x1) / 2;
+      const gap = p.end === "bottom" ? sx - (p.box.x + p.box.w) : p.box.x - sx;
+      // 头贴着干端：盒的端边离干端不过半格（降号的竖笔当了光杆干，肚子在竖笔下段，望十架 p7 m55）
+      const e = p.end === "top" ? Math.min(p.stem.y0, p.stem.y1) : Math.max(p.stem.y0, p.stem.y1);
+      const atEnd = Math.abs((p.end === "top" ? p.box.y : p.box.y + p.box.h) - e) <= sp * 0.5;
+      if (atEnd && gap >= -1 && gap < sp * BARE_STEM_GAP) {
+        const x0 = Math.round(p.end === "bottom" ? p.box.x : sx);
+        const x1 = Math.round(p.end === "bottom" ? sx : p.box.x + p.box.w);
+        const box = { x: x0, y: p.box.y, w: x1 - x0, h: p.box.h };
+        // 盒里干以外还有一根竖笔伸出头外的是升号、还原号（另一根竖笔当了光杆干，爱是从神而来 p2 m16 G♯3 的升号读成 G3/B3 二分）
+        const otherStroke = (() => {
+          for (let x = box.x; x < box.x + box.w; x++) {
+            if (Math.abs(x - sx) <= Math.max(2, p.stem.lw)) continue;
+            let run = 0;
+            for (let y = Math.max(0, Math.round(box.y - sp)); y <= Math.min(bin.h - 1, Math.round(box.y + box.h + sp)); y++) {
+              run = bin.data[y * bin.w + x] ? run + 1 : 0;
+              if (run >= sp * 1.5) return true;
+            }
+          }
+          return false;
+        })();
+        let area = 0;
+        for (let y = box.y; y < box.y + box.h; y++) for (let x = box.x; x < box.x + box.w; x++) if (!onLine(y, x) && bin.data[y * bin.w + x]) area++;
+        got = otherStroke ? null : judge(box, area);
+        if (got) p.box = box;
+      }
+    }
     if (!got && p.box.h / sp > BARE_H1[1]) {
       const cut = endInk(bin, p, sp, onLine);
       if (cut) got = judge(cut.box, cut.area, true);
@@ -1959,7 +2182,7 @@ export function headsOnBareStems(
  * 光杆干端头窗口里（与 `probeBareStems` 同一个窗口）的墨，扣掉干本身那几列、谱线行与加线行（横向一格半以上的薄行），
  * 再把上下两头只剩一根竖笔（不到 0.4 格宽）的行削掉——另一个声部朝反方向伸出去的干。返回那一截的盒与墨量。
  */
-function endInk(bin: Binary, p: BareStemProbe, sp: number, onLine: (y: number) => boolean): { box: Rect; area: number } | null {
+function endInk(bin: Binary, p: BareStemProbe, sp: number, onLine: (y: number, x?: number) => boolean): { box: Rect; area: number } | null {
   const s = p.stem;
   const sx = (s.x0 + s.x1) / 2;
   const e = p.end === "top" ? Math.min(s.y0, s.y1) : Math.max(s.y0, s.y1);
@@ -1971,7 +2194,7 @@ function endInk(bin: Binary, p: BareStemProbe, sp: number, onLine: (y: number) =
   const lw = Math.max(1, s.lw);
   const rows: { y: number; x0: number; x1: number; n: number; span: number }[] = [];
   for (let y = ya; y <= yb; y++) {
-    if (onLine(y)) continue;
+    if (onLine(y, sx)) continue;
     // 这一行在窗口外左右各一格也算上的墨宽：加线比头宽，只在窗口里数分不开
     let span = 0;
     for (let x = Math.max(0, xa - Math.round(sp)); x <= Math.min(bin.w - 1, xb + Math.round(sp)); x++) span += bin.data[y * bin.w + x];
@@ -2011,7 +2234,7 @@ function endInk(bin: Binary, p: BareStemProbe, sp: number, onLine: (y: number) =
   // 窗口干那一侧的边外还有头那么宽的墨：头比窗口还长（和弦五度的两个头，齐来谢主歌 m3），窗口截出来的尺寸不作数
   for (let k = 1; k <= 2; k++) {
     const y = p.end === "bottom" ? ya - k : yb + k;
-    if (y < 0 || y >= bin.h || onLine(y)) continue;
+    if (y < 0 || y >= bin.h || onLine(y, sx)) continue;
     let n = 0;
     for (let x = xa; x <= xb; x++) if (Math.abs(x - sx) > lw && bin.data[y * bin.w + x]) n++;
     if (n >= sp * 0.4) return null;
@@ -2122,11 +2345,12 @@ export function hollowSlit(bin: Binary, b: Rect, sp: number): boolean {
  * 贴线那头不会是最宽的（斜缝各行差不多宽，椭圆中间最宽）。
  * 谱线从头中间横穿的（骑线头），线另一边盒中段接着还有墨，不算。
  */
-export function archCavity(bin: Binary, box: Rect, onLine0: (y: number) => boolean): boolean {
+export function archCavity(bin: Binary, box: Rect, onLine0: (y: number, x?: number) => boolean): boolean {
   // 紧挨谱线、整行八成以上是墨的也算谱线行：扫描件谱线上的白点让那一行量出一两像素的「缝」，混进内腔，形状就量歪了（望十架 p7 m55）
   const onLine = (y: number): boolean => {
-    if (onLine0(y)) return true;
-    if (y < 0 || y >= bin.h || !(onLine0(y - 1) || onLine0(y + 1))) return false;
+    const cx = box.x + box.w / 2;
+    if (onLine0(y, cx)) return true;
+    if (y < 0 || y >= bin.h || !(onLine0(y - 1, cx) || onLine0(y + 1, cx))) return false;
     let n = 0;
     const x0 = Math.max(0, box.x), x1 = Math.min(bin.w, box.x + box.w);
     for (let x = x0; x < x1; x++) if (bin.data[y * bin.w + x]) n++;
@@ -2182,8 +2406,10 @@ export function archCavity(bin: Binary, box: Rect, onLine0: (y: number) => boole
  * 但干从头中间穿过、或压在圈上的字体里也会直接挨着（万口欢唱的骑线二分和弦），所以只配合「落在符尾里」用。
  * 从盒中段离中心最近的白点灌出内腔（碰到盒边的不算封闭内腔），逐行看内腔最左、最右的白外面挨着的墨，
  * 那一列的竖墨长两格以上的行过六成就算。
+ * `vOpen`：内腔碰到盒的上下沿也算——尾弯回来的那块白常一直通到尾梢，头盒只罩住上半截（望十架 p3 m30 女高女低 E5/G4 八分，
+ * 干、尾、谱线围出的白收成 E4 空心头）；左右沿照旧不许碰（贴着干的那一侧本该是墨）。
  */
-export function stemWalledCavity(bin: Binary, box: Rect, sp: number): boolean {
+export function stemWalledCavity(bin: Binary, box: Rect, sp: number, vOpen = false): boolean {
   const x0 = Math.max(0, box.x);
   const y0 = Math.max(0, box.y);
   const x1 = Math.min(bin.w - 1, box.x + box.w - 1);
@@ -2205,11 +2431,11 @@ export function stemWalledCavity(bin: Binary, box: Rect, sp: number): boolean {
   const rowMax = new Map<number, number>();
   while (stack.length) {
     const [x, y] = stack.pop()!;
-    if (x === x0 || x === x1 || y === y0 || y === y1) return false; // 碰到盒边：不是封闭的内腔
+    if (x === x0 || x === x1 || (!vOpen && (y === y0 || y === y1))) return false; // 碰到盒边：不是封闭的内腔
     rowMin.set(y, Math.min(rowMin.get(y) ?? x, x));
     rowMax.set(y, Math.max(rowMax.get(y) ?? x, x));
     for (const [nx, ny] of [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]] as const) {
-      if (ink(nx, ny)) continue;
+      if (ny < y0 || ny > y1 || ink(nx, ny)) continue;
       const k = (ny - y0) * w + nx - x0;
       if (seen[k]) continue;
       seen[k] = 1;
@@ -2223,12 +2449,14 @@ export function stemWalledCavity(bin: Binary, box: Rect, sp: number): boolean {
     while (d < bin.h - 1 && ink(x, d + 1)) d++;
     return d - t + 1;
   };
+  // 贴边那一列量不够时再看外面一列（干三四像素宽，挨着内腔那列在谱线处错开一像素就断：是爱 p4 m56 低音 E3 的干，贴边列 17px、外一列 64px）
+  const wall = (x: number, d: number, y: number) => ink(x, y) && (run(x, y) >= sp * 2 || (ink(x + d, y) && run(x + d, y) >= sp * 2));
   let left = 0;
   let right = 0;
   for (const [y, a] of rowMin) {
-    if (ink(a - 1, y) && run(a - 1, y) >= sp * 2) left++;
+    if (wall(a - 1, -1, y)) left++;
     const b = rowMax.get(y)!;
-    if (ink(b + 1, y) && run(b + 1, y) >= sp * 2) right++;
+    if (wall(b + 1, 1, y)) right++;
   }
   return rowMin.size >= 2 && Math.max(left, right) >= rowMin.size * 0.6;
 }

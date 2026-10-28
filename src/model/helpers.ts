@@ -21,7 +21,7 @@ import type {
 // ───────────────────────── id 分配 ─────────────────────────
 
 /** 元素 id 分配器。**全文档唯一、不随数组增删变化**——`Mark`、歌词锚点、`playOrder`
- *  都引用 id，用数组下标的话插一个元素就全错（`PuDoc` 就是那样）。 */
+ *  都引用 id，用数组下标的话插一个元素就全错（`FanqieDoc` 就是那样）。 */
 export class IdGen {
   private _next = 1;
   next(): ElementId {
@@ -176,8 +176,11 @@ export function sectionMarkOf(m: Measure, prev?: Measure | null): string | null 
   for (const el of m.elements) {
     if (el.kind !== "chord") continue;
     for (const host of [el, ...(el.sustains ?? [])]) {
-      const w = sectionWordOf(host.sectionWord);
-      if (w !== null) return w;
+      // 分行的几条逐条认（「副歌」与演奏提示叠在一个音上）
+      for (const line of (host.sectionWord ?? "").split("\n")) {
+        const w = sectionWordOf(line || undefined);
+        if (w !== null) return w;
+      }
     }
   }
   return null;
@@ -235,7 +238,7 @@ export function emptyDoc(sourceFormat: ScoreDoc["sourceFormat"]): ScoreDoc {
   return { sourceFormat, songs: [], diagnostics: [] };
 }
 
-/** 第一首。多曲文件里绝大多数调用方只关心它（对应 `pu/ast.ts::primaryMetadata` 的用法）。 */
+/** 第一首。多曲文件里绝大多数调用方只关心它（对应 `jianpu/ast.ts::primaryMetadata` 的用法）。 */
 export function primarySong(doc: ScoreDoc): Song | null {
   return doc.songs[0] ?? null;
 }

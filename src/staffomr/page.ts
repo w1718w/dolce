@@ -26,9 +26,9 @@ import {
   sortByLeft,
   sortByTop,
 } from "./model";
-import { isFlag, isNoteHead, isRest } from "./glyphs";
+import { isFlag, isNoteHead, isPitchedHead, isRest } from "./glyphs";
 import { shapeSig } from "../omrkit/glyphdict";
-import { isWhite, subPaths, thinRectAxis } from "./vecgeom";
+import { isFill, isStroke, isWhite, subPaths, thinRectAxis } from "./vecgeom";
 import { classifyBarlines, tagRepeatDots } from "./barlines";
 
 // 以下比例一律相对**小节线高度 H**（`SPage.barlineHeight`），别改成绝对点值。
@@ -98,6 +98,8 @@ function segsOf(o: PObj, minLen: number): Seg[] {
       if (s.len >= minLen) out.push(s);
       continue;
     }
+    // 填充的粗四边形（八段锦的符杠：十六分的短副杠 7×2.5 点、斜杠）不拆边：上下两条边会冒充加线，斜杠两端的竖边冒充系统线
+    if (sp.pts.length >= 4 && sp.pts.length <= 5 && isFill(p) && !isStroke(p)) continue;
     // 多段折线：逐段收（这一批 PDF 里整行谱线就是这么画的）
     if (sp.pts.length > 2) {
       for (let i = 1; i < sp.pts.length; i++) {
@@ -191,10 +193,11 @@ function mergeOne(segs: Seg[], tol: number, out: Seg[]): void {
 }
 
 /** 建页：路径对象与文字对象各包一层 `PObj`，再从路径里抽出直线段。 */
-export function buildPage(index: number, width: number, height: number, paths: VecObj[], runs: VecTextRun[]): SPage {
+export function buildPage(index: number, width: number, height: number, paths: VecObj[], runs: VecTextRun[], barlineHeight?: number): SPage {
   const pg = new SPage(index, width, height);
   let id = 0;
-  pg.barlineHeight = estimateBarlineHeight(runs, width);
+  // 转曲的谱没有音乐字体可量字号：调用方按谱线量好谱表高给进来（`outlineomr/`）
+  pg.barlineHeight = barlineHeight ?? estimateBarlineHeight(runs, width);
   const raw: Seg[] = [];
   for (const p of paths) {
     const o = new PObj(id++, p, null);
@@ -217,6 +220,10 @@ export function buildPage(index: number, width: number, height: number, paths: V
  * 一次 showText 里混着认得与不认得的字形是常态。
  */
 export function findSymbols(pg: SPage, look: StaffGlyphLookup): void {
+  // **同一个符头印了两遍**（八段锦小钗 m94：同一字形在同一位置、外框分毫不差地画了两次）：只收一个，不然多出一个和弦音。
+  // 休止不丢：两个声部共用的休止，Sibelius 每个声部各画一遍、叠在一处（小钗 m92 的二分休止、m96 的四分休止），
+  // 两声部凑拍子都要它（丢了一个，下声部短一拍就被拆出第三个声部，小钗 m74）；第二个记 `redrawn`，写出时不显示
+  const heads = new Set<string>();
   for (const o of pg.objs) {
     if (o.hasAnyTag()) continue;
     const run = o.run;
@@ -226,7 +233,15 @@ export function findSymbols(pg: SPage, look: StaffGlyphLookup): void {
     for (const g of run.glyphs) {
       const code = look.lookup(run.font, g, run.sizeDev);
       if (!code) continue;
+      let redrawn = false;
+      if (isPitchedHead(code) || isRest(code)) {
+        const k = `${code}|${Math.round(g.bbox.x * 10)}|${Math.round(g.bbox.y * 10)}|${Math.round(g.bbox.w * 10)}|${Math.round(g.bbox.h * 10)}`;
+        if (heads.has(k) && !isRest(code)) continue;
+        redrawn = heads.has(k);
+        heads.add(k);
+      }
       const s = new Sym(o, i++, g, code);
+      if (redrawn) s.redrawn = true;
       o.symbols.push(s);
       pg.symbols.push(s);
     }
@@ -417,6 +432,74 @@ function glyphStaves(pg: SPage): Staff[] {
   return out;
 }
 
+// ── findMultiRests ──────────────────────────────────────────────────────────
+
+/**
+ * **多小节休止**：谱表中线上一道粗横条、两端各一笔竖线，上方印小节数（`6`、`22`）。
+ *
+ * 字体里有现成字形（`restHBar`）的照字形收；八段锦（Sibelius 经 XPS 转出）把它画成路径：
+ * 一块填充矩形（高约半格、宽三格以上、骑在中线上）+ 两端两笔描边竖线（高约两格，同样骑在中线上）。
+ * 路径那种就地造一个 `restHBar` 符号，后面当整小节休止走；数字（横向落在横条上方、离谱表顶不出四格）
+ * 记进 `Sym.multiRest`，`toxml` 照它展开成几个小节、写 `<multiple-rest>`。
+ */
+export function findMultiRests(pg: SPage): void {
+  const sp = pg.normalStaffSpace || pg.space;
+  const bars: Sym[] = [];
+  for (const o of pg.objs) {
+    const p = o.path;
+    if (o.hasAnyTag() || !p || p.curves || !/fill/i.test(p.paint)) continue;
+    const w = o.box.right - o.box.left;
+    const h = o.box.bottom - o.box.top;
+    if (w < sp * 3 || h < sp * 0.3 || h > sp * 0.8) continue;
+    const cy = (o.box.top + o.box.bottom) / 2;
+    const st = pg.staves.find((q) => Math.abs((q.box.top + q.box.bottom) / 2 - cy) < sp * 0.4 && o.box.left >= q.box.left && o.box.right <= q.box.right + sp);
+    if (!st) continue;
+    const ends = pg.objs.filter((t) => {
+      if (t === o || t.hasAnyTag() || !t.path || t.path.curves) return false;
+      const tw = t.box.right - t.box.left;
+      const th = t.box.bottom - t.box.top;
+      const tx = (t.box.left + t.box.right) / 2;
+      return tw < sp * 0.3 && th > sp * 1.2 && th < sp * 3 && Math.abs((t.box.top + t.box.bottom) / 2 - cy) < sp * 0.5 && (Math.abs(tx - o.box.left) < sp * 0.3 || Math.abs(tx - o.box.right) < sp * 0.3);
+    });
+    const lx = (t: PObj) => (t.box.left + t.box.right) / 2;
+    // 两笔竖线也可能是同一条路径的两段（中音笙：一条描边路径 M-L-M-L，外框与横条同宽）
+    const pair = pg.objs.find((t) => {
+      if (t === o || t.hasAnyTag() || !t.path || t.path.curves || /fill/i.test(t.path.paint)) return false;
+      const th = t.box.bottom - t.box.top;
+      return Math.abs(t.box.left - o.box.left) < sp * 0.3 && Math.abs(t.box.right - o.box.right) < sp * 0.3 && th > sp * 1.2 && th < sp * 3 && Math.abs((t.box.top + t.box.bottom) / 2 - cy) < sp * 0.5;
+    });
+    if (pair) ends.push(pair);
+    else if (!ends.some((t) => Math.abs(lx(t) - o.box.left) < sp * 0.3) || !ends.some((t) => Math.abs(lx(t) - o.box.right) < sp * 0.3)) continue;
+    const box = { left: o.box.left, right: o.box.right, top: Math.min(...ends.map((t) => t.box.top)), bottom: Math.max(...ends.map((t) => t.box.bottom)) };
+    const glyph = {
+      code: 0, fontChar: "", unicode: "", bboxEstimated: false, outline: null, advance: box.right - box.left, ctm: [1, 0, 0, 1, 0, 0] as [number, number, number, number, number, number],
+      bbox: { x: box.left, y: box.top, w: box.right - box.left, h: box.bottom - box.top }, ox: box.left, oy: cy,
+    };
+    const sym = new Sym(o, 0, glyph, "restHBar");
+    o.symbols.push(sym);
+    pg.symbols.push(sym);
+    o.addTag("Symbol");
+    for (const t of ends) t.addTag("MultiRest");
+    bars.push(sym);
+  }
+  for (const s of pg.symbols) if (s.code === "restHBar" && !bars.includes(s)) bars.push(s);
+  for (const s of bars) {
+    const cx = (s.box.left + s.box.right) / 2;
+    const top = Math.min(s.box.top, ...pg.staves.filter((q) => overlapY(q.box, s.box)).map((q) => q.box.top));
+    const num = pg.objs.find((t) => {
+      if (!t.run || t.hasAnyTag() || musicFamily(t.run.font)) return false;
+      const txt = t.run.glyphs.map((g) => g.unicode).join("").trim();
+      if (!/^\d{1,3}$/.test(txt)) return false;
+      return Math.abs((t.box.left + t.box.right) / 2 - cx) < sp * 2 && t.box.bottom <= top + sp * 0.5 && t.box.bottom > top - sp * 4;
+    });
+    if (!num) continue;
+    const n = Number(num.run!.glyphs.map((g) => g.unicode).join("").trim());
+    if (n < 2) continue;
+    s.multiRest = n;
+    num.addTag("MultiRest");
+  }
+}
+
 // ── findNoteheads ───────────────────────────────────────────────────────────
 
 /** `Page::findNoteheads`：给每个符头/休止找它属于哪一行谱。 */
@@ -498,13 +581,16 @@ function adoptCompositeNotes(pg: SPage): void {
   for (const s of pg.symbols) {
     const base = COMPOSITE_NOTES[s.code];
     if (base === undefined || s.hasAnyTag()) continue;
+    // 按符头那一端判在不在谱表里，不按整枚字形的中心：干朝下、头落在底线上的（八段锦小钗下声部的八分），整枚的中心在谱表下面一格多
+    const up = compositeStemUp(s.glyph);
+    const sp0 = pg.normalStaffSpace || pg.space;
+    const headY = up ? s.box.bottom - sp0 / 2 : s.box.top + sp0 / 2;
     const stf = pg.staves.find((q) => {
-      const sp = q.stepDistance() || (pg.normalStaffSpace || pg.space) / 2;
-      return s.py > q.box.top - sp && s.py < q.box.bottom + sp;
+      const sp = q.stepDistance() || sp0 / 2;
+      return (s.py > q.box.top - sp && s.py < q.box.bottom + sp) || (headY > q.box.top - sp && headY < q.box.bottom + sp);
     });
     if (!stf) continue;
     const space = (stf.stepDistance() || 0) * 2 || pg.normalStaffSpace || pg.space;
-    const up = compositeStemUp(s.glyph);
     s.compositeBase = base;
     s.compositeStemUp = up;
     // 符干朝上 → 符头在**左下**（符尾往右上甩）；朝下 → 符头在**右上**（符干贴左边往下）。
@@ -528,7 +614,10 @@ export function findStaffForNote(pg: SPage, nt: Sym, lines: Seg[]): boolean {
   let distA = Infinity;
   let distB = Infinity;
   for (const st of pg.staves) {
-    const dist = y - st.cy;
+    // 位图路弯、斜的谱行按音符所在 x 处的首末线（`Staff.topAt`）；矢量路就是盒的上下沿
+    const top = st.topAt(nt.px);
+    const bottom = st.bottomAt(nt.px);
+    const dist = y - (top + bottom) / 2;
     const dd = Math.abs(dist);
     let sp = st.stepDistance();
     let valid = false;
@@ -536,7 +625,7 @@ export function findStaffForNote(pg: SPage, nt: Sym, lines: Seg[]): boolean {
       if (dd < pg.normalStaffSpace && nt.code === "restHBar") valid = true;
       sp = pg.normalStaffSpace / 2;
     }
-    if (y > st.box.top - sp && y < st.box.bottom + sp) valid = true;
+    if (y > top - sp && y < bottom + sp) valid = true;
     if (valid) {
       nt.ownerStaff = st;
       nt.addTag("Note");
@@ -574,7 +663,9 @@ export function findStaffForNote(pg: SPage, nt: Sym, lines: Seg[]): boolean {
 
 /** `Page::findLegers`：谱表外的符头要有足够多条加线撑着才认。 */
 export function findLegers(nt: Sym, stf: Staff, lines: Seg[]): boolean {
-  const y2 = stf.cy;
+  // 中线与音级按符头所在 x 取（位图路弯、斜的谱行；矢量路 `topAt` 就是盒的上下沿）：按整行名义中线算，
+  // 谱行往右斜下几像素，挂在末线下的 D4 就数成 C4、要一条加线（望十架 p6 女低三个 D4 整串丢掉）
+  const y2 = (stf.topAt(nt.px) + stf.bottomAt(nt.px)) / 2;
   const stepDist = stf.stepDistance();
   // 往谱表反方向再让半格，免得贴着符头的那条加线被区间端点切掉
   const y1 = nt.py > y2 ? nt.py + stepDist : nt.py - stepDist;
@@ -587,6 +678,8 @@ export function findLegers(nt: Sym, stf: Staff, lines: Seg[]): boolean {
     // 加线按**符头宽**量：黑符头一格出头、全音符两格，加线各自跟着长。
     // 按线距写死一个上限，全音符那一档就整批落选。
     if (l.len > (nt.box.right - nt.box.left) * 3) continue;
+    // 加线是细线：厚过 0.4 格的是符杠（八段锦柳琴高音区，十六分的两截短杠正横在加线的位置上、长短也合格）
+    if (l.lw > stepDist * 0.8) continue;
     if (between(l.cy, y1, y2)) poss.push(l);
   }
   // **整数除**：musicpp 是 `abs(step)/2-2`，C++ 的整数除法让 |step| ≤ 5 时 need ≤ 0
@@ -594,14 +687,14 @@ export function findLegers(nt: Sym, stf: Staff, lines: Seg[]): boolean {
   // 因为它们本来就没有加线。移植成浮点除再加一道 `need > 0` 的闸，
   // 这些音符会全被丢掉；丢掉的符头连带它的符干也无人认领，那根符干随后被当成小节线
   // （实测 p100 的 x=409 就是这么来的）。
-  const need = Math.floor(Math.abs(stf.middleStep(nt.py)) / 2) - 2;
+  const need = Math.floor(Math.abs(stf.middleStep(nt.py, nt.px)) / 2) - 2;
   // 要三条以上加线的，只数从谱表边缘起**按线距连成一串**的：谱表间歌词、简谱字的横笔也横跨符头、长短合格，
   // 会替离谱表很远的假头「数够」加线。两条以内不查：和弦里错开的头，近谱表那条加线只横跨旁边那个头
   //（向主唱新歌 m7 A3 下面的 C4 线只跨 C♯4）
   if (need >= 3) {
     const sp = stepDist * 2;
     const down = nt.py > y2;
-    let at = down ? stf.box.bottom : stf.box.top;
+    let at = down ? stf.bottomAt(nt.px) : stf.topAt(nt.px);
     let chain = 0;
     for (const l of poss.slice().sort((a, b) => (down ? a.cy - b.cy : b.cy - a.cy))) {
       const gap = down ? l.cy - at : at - l.cy;
@@ -637,11 +730,11 @@ export function isLeadNoteBarline(l: Seg, nt: Sym, stf: Staff): boolean {
   const cy = (nt.box.top + nt.box.bottom) / 2;
   if (Math.abs(cy - l.bottom) > sp || Math.abs(cy - l.top) <= sp) return false;
   if (Math.abs(nt.box.left - l.cx) >= Math.abs(nt.box.right - l.cx)) return false;
-  return Math.abs(l.top - stf.box.top) <= sp * 0.25 && Math.abs(l.bottom - stf.box.bottom) <= sp * 0.25;
+  return Math.abs(l.top - stf.topAt(l.cx)) <= sp * 0.25 && Math.abs(l.bottom - stf.bottomAt(l.cx)) <= sp * 0.25;
 }
 
 /** 窄头挂干窗口的下限（格），与算窄的盒宽（格）。 */
-const STEM_WIN_MIN = 0.3;
+const STEM_WIN_MIN = 0.4;
 const STEM_WIN_NARROW = 1.15;
 /** 空心头盒里离缘这么多格以内的干也算贴缘（见 `findStems`）。 */
 export const HOLLOW_IN = 0.4;
@@ -666,8 +759,9 @@ export function findStems(pg: SPage): void {
     if (nt.code !== "noteheadBlack" && nt.code !== "noteheadHalf") continue;
     const stf = nt.ownerStaff;
     const space = stf.stepDistance() * 2 || pg.space;
-    // 窄头（小字号，盒宽不到 `STEM_WIN_NARROW` 格）窗口下限 0.3 格：细线页两倍线宽只有 4 像素，
-    // 小字号头的盒右缘离自己的干 5 像素（以马内利来临歌 m23 附点二分读成全音符）。
+    // 窄头（小字号，盒宽不到 `STEM_WIN_NARROW` 格）窗口下限 `STEM_WIN_MIN` 格：细线页两倍线宽只有 4 像素，
+    // 小字号头的盒右缘离自己的干 5 像素（以马内利来临歌 m23 附点二分读成全音符）；
+    // 扫描件上贴着干与谱线的头盒被截窄，干离盒缘 4.5 像素（0.39 格，望十架 p8 m62 低音 G2 八分读成四分），0.3 → 0.4。
     // 不分宽窄都放，宁静的伯利恒少一个满拍小节
     const narrow = nt.box.right - nt.box.left < space * STEM_WIN_NARROW;
     const lw = Math.max((stf.lines[0]?.lw ?? pg.barlineHeight * 0.02) * 2, narrow ? space * STEM_WIN_MIN : 0);
@@ -713,14 +807,14 @@ export function findStems(pg: SPage): void {
     // （符杠切开的两截纵向是错开的），挂两端离谱表外线远的那根，像小节线的留给小节线——
     // 坚固保障第三行，头盒右缘把旁边的小节线也框进来，干离缘 3.0、小节线 3.5，按远近分不开。
     // 不卡「像小节线」、并排重叠的一律只挂一根，合唱谱扫描件音符 −0.12（粗干断成并排两截）。
-    const edge = (l: Seg) => Math.abs(l.top - stf.box.top) + Math.abs(l.bottom - stf.box.bottom);
+    const edge = (l: Seg) => Math.abs(l.top - stf.topAt(l.cx)) + Math.abs(l.bottom - stf.bottomAt(l.cx));
     for (const side of [0, 1]) {
       const cs = cand.filter((c) => c.side === side);
       const dMin = Math.min(...cs.map((c) => c.d));
       const near = cs.filter((c) => c.d <= dMin + lw * 0.5).sort((p, q) => edge(q.l) - edge(p.l));
       const kept: Seg[] = [];
       for (const c of near) {
-        const barShaped = Math.abs(c.l.top - stf.box.top) <= space * 0.25 && Math.abs(c.l.bottom - stf.box.bottom) <= space * 0.25;
+        const barShaped = Math.abs(c.l.top - stf.topAt(c.l.cx)) <= space * 0.25 && Math.abs(c.l.bottom - stf.bottomAt(c.l.cx)) <= space * 0.25;
         if (barShaped && kept.some((k) => Math.min(k.bottom, c.l.bottom) - Math.max(k.top, c.l.top) > Math.min(k.len, c.l.len) * 0.5)) continue;
         kept.push(c.l);
         c.l.addTag("Stem");
@@ -820,10 +914,11 @@ export function findBarlines(pg: SPage): boolean {
   // ——实测 Opus 那 68 页（都是大谱表）因此一条小节线都没认出来，整页只切出一个小节。
   // 改判「盖满」：上端不低于第五线、下端不高于第一线，容差半格。
   /** 竖段有一端伸出这行谱 0.3 格以上、又没落在任何一行谱的外线上。 */
+  // 谱表上下界一律按竖线所在的 x 取（位图路的弯、斜谱线，见 `Staff.topAt`；矢量路就是包围盒）
   const overshoots = (l: Seg, st: Staff): boolean => {
     const out = (s2: Staff) => (s2.stepDistance() || 1) * 0.6;
-    const lands = (y: number) => pg.staves.some((s2) => Math.abs(y - s2.box.top) <= out(s2) || Math.abs(y - s2.box.bottom) <= out(s2));
-    return (l.top < st.box.top - out(st) && !lands(l.top)) || (l.bottom > st.box.bottom + out(st) && !lands(l.bottom));
+    const lands = (y: number) => pg.staves.some((s2) => Math.abs(y - s2.topAt(l.cx)) <= out(s2) || Math.abs(y - s2.bottomAt(l.cx)) <= out(s2));
+    return (l.top < st.topAt(l.cx) - out(st) && !lands(l.top)) || (l.bottom > st.bottomAt(l.cx) + out(st) && !lands(l.bottom));
   };
   const topStaff = new Map<Seg, Staff>();
   const covers = new Set<Seg>();
@@ -861,9 +956,10 @@ export function findBarlines(pg: SPage): boolean {
       // 两端离第五线、第一线都不过 0.4 格，长度仍要够一个谱表高（差不到四分之一格）；
       // 符干的下端在头中心，头只落在线上或间里（0 或 0.5 格），碰不上这个口子。
       // 上端不卡的话，从谱表上方一格多伸下来的长符干也进来（齐来谢主歌、父恩广大各多切一刀）。
-      const shifted =
-        l.len >= boxH(st.box) - tol && Math.abs(l.top - st.box.top) <= tol * 1.6 && Math.abs(l.bottom - st.box.bottom) <= tol * 1.6;
-      if ((l.top <= st.box.top + tol && l.bottom >= st.box.bottom - tol) || shifted) {
+      const top = st.topAt(l.cx);
+      const bottom = st.bottomAt(l.cx);
+      const shifted = l.len >= bottom - top - tol && Math.abs(l.top - top) <= tol * 1.6 && Math.abs(l.bottom - bottom) <= tol * 1.6;
+      if ((l.top <= top + tol && l.bottom >= bottom - tol) || shifted) {
         // **伸出谱表的那一端要落在某行谱的外线上**：真小节线两端压在第五线、第一线上，
         // 伸出去也只伸到大谱表另一行的外线。和弦的符干上端高出一格、或两头各伸出 0.3~0.4 格，
         // 头是认不出的「8」字形空心三度，贴头那道闸拦不住（我灵镇静多切四刀）。
@@ -889,10 +985,10 @@ export function findBarlines(pg: SPage): boolean {
       const g = groups.find((x) => x.includes(ts));
       if (!g) continue;
       const sp = ts.stepDistance() * 2 || pg.space;
-      const spans = (m: Seg, st: Staff) => m.top <= st.box.top + sp * 0.25 && m.bottom >= st.box.bottom - sp * 0.25;
+      const spans = (m: Seg, st: Staff) => m.top <= st.topAt(m.cx) + sp * 0.25 && m.bottom >= st.bottomAt(m.cx) - sp * 0.25;
       // 没挂成符干、压着那一行够半个谱表高的也算：小节线被符头、字压断成两截时没有哪一截盖满
       //（颂主化功歌第一行高音谱表的小节线都是半截的，靠下面「短小节线」那一步按同 x 收回来）
-      const half = (m: Seg, st: Staff) => !m.hasTag("Stem") && Math.min(m.bottom, st.box.bottom) - Math.max(m.top, st.box.top) >= boxH(st.box) * 0.5;
+      const half = (m: Seg, st: Staff) => !m.hasTag("Stem") && Math.min(m.bottom, st.bottomAt(m.cx)) - Math.max(m.top, st.topAt(m.cx)) >= boxH(st.box) * 0.5;
       if (!g.some((st) => st !== ts && (spans(l, st) || allV.some((m) => m !== l && Math.abs(m.cx - l.cx) <= sp * 0.6 && (spans(m, st) || half(m, st)))))) covers.delete(l);
     }
   }
@@ -939,7 +1035,13 @@ export function findBarlines(pg: SPage): boolean {
 
   // Anastasia：小节线是字形
   for (const s of pg.symbols) {
-    if (s.code === "barlineSingle" || s.code === "barlineFinal" || s.code === "barlineDouble") s.addTag("BarLine");
+    // 系统括号那一笔粗竖线（`bracket`）也拿来画粗小节线（八段锦反复起 `‖:` 的粗笔）：不在谱表左端的就是粗小节线
+    if (s.code === "bracket" && !s.hasAnyTag()) {
+      const sp = pg.normalStaffSpace || pg.space;
+      const st = pg.staves.find((q) => overlapY(q.box, s.box));
+      if (st && s.box.left > st.box.left + sp) s.code = "barlineHeavy";
+    }
+    if (s.code === "barlineSingle" || s.code === "barlineFinal" || s.code === "barlineDouble" || s.code === "barlineHeavy") s.addTag("BarLine");
   }
   void syslines;
   return found;
@@ -961,10 +1063,11 @@ export function tagSystemBarlines(pg: SPage): void {
     if (g.length < 2) continue;
     const sp = g[0].stepDistance() * 2 || pg.space;
     const tol = sp * 0.3;
-    const lands = (y: number) => g.some((st) => Math.abs(y - st.box.top) <= tol || Math.abs(y - st.box.bottom) <= tol);
+    // 外线按竖线所在 x 取（位图路弯、斜的谱线；矢量路就是盒的上下沿）
+    const lands = (y: number, x: number) => g.some((st) => Math.abs(y - st.topAt(x)) <= tol || Math.abs(y - st.bottomAt(x)) <= tol);
     /** 这根竖线盖满 st、两端都落在本系统某行的外线上 */
     const barOn = (l: Seg, st: Staff) =>
-      l.top <= st.box.top + tol && l.bottom >= st.box.bottom - tol && lands(l.top) && lands(l.bottom) && Math.abs(st.box.left - l.cx) >= Math.max(l.lw, 1) * 2;
+      l.top <= st.topAt(l.cx) + tol && l.bottom >= st.bottomAt(l.cx) - tol && lands(l.top, l.cx) && lands(l.bottom, l.cx) && Math.abs(st.box.left - l.cx) >= Math.max(l.lw, 1) * 2;
     // 一端挂着符头的是干，不是小节线：头缘贴着这根线、头心落在线端半格内。小节线与相邻的干多半隔一格以上，
     // 可密排的十六分会把最后一个音的干挤到小节线前几个像素（破碎 p7 m70 钢琴右手 D4，干在小节线左边 6 像素、从第一线伸到头上），
     // 下面按 x 收同伴时一并收进来，那个头就丢了干、被并进前一个音的和弦
@@ -973,7 +1076,9 @@ export function tagSystemBarlines(pg: SPage): void {
       heads.some((h) => {
         const edge = Math.min(Math.abs(h.box.left - l.cx), Math.abs(h.box.right - l.cx));
         const cy = (h.box.top + h.box.bottom) / 2;
-        return edge <= Math.max(l.lw * 2, sp * 0.15) && (Math.abs(cy - l.top) <= sp * 0.5 || Math.abs(cy - l.bottom) <= sp * 0.5);
+        // 头心离线端 0.4 格以内：外侧间里的头心离外线正好半格，卡半格就落在刀刃上（赞美三一歌 006 低音 G3 贴着小节线，
+        // 头心离线端 10.5 像素、半格 11，小节线被当成干）。干止于头心，那种头的干到不了外线，本就过不了 `barOn`
+        return edge <= Math.max(l.lw * 2, sp * 0.15) && (Math.abs(cy - l.top) <= sp * 0.4 || Math.abs(cy - l.bottom) <= sp * 0.4);
       });
     const per = g.map((st) => vlines.filter((l) => barOn(l, st) && !headEnd(l)));
     // 上下两行的 x 容 0.6 格：扫描件歪一点，隔着十几格歌词的两行就错开三四个像素（赞美三一歌 234 对 230）；
@@ -1014,7 +1119,9 @@ const SYS_BREAK_GAP = 0.8;
 export function systemGroups(pg: SPage): Staff[][] {
   const marks: Box[] = [
     ...pg.segsWithTag("SysLine").map((s) => s.box),
-    ...pg.symbols.filter((s) => s.code === "bracket" || s.code === "brace").map((s) => s.box),
+    ...pg.symbols.filter((s) => s.code === "bracket").map((s) => s.box),
+    // 花括号可以是上下两截字形，各只盖一行（八段锦扬琴 Anastasia 的大谱表）：上下相接的并成一个再用
+    ...joinStacked(pg.symbols.filter((s) => s.code === "brace").map((s) => s.box), pg.normalStaffSpace || pg.space),
     // 位图路的系统括号（`findSystemBrackets`）：方括号的上下衬线会把粗竖笔与
     // 细系统线连成一块，那一块过不了竖笔画的宽度闸，`SysLine` 一条都抽不出来。
     ...pg.objs.filter((o) => o.hasTag("SysBracket")).map((o) => o.box),
@@ -1034,6 +1141,18 @@ export function systemGroups(pg: SPage): Staff[][] {
   }
   for (const st of pg.staves) if (!done.has(st)) out.push([st]);
   return joinByGap(out);
+}
+
+/** 上下相接（缝不出半格）、横向重叠的几个框并成一个。 */
+function joinStacked(boxes: Box[], sp: number): Box[] {
+  const out: Box[] = [];
+  for (const b of [...boxes].sort((p, q) => p.top - q.top)) {
+    const last = out[out.length - 1];
+    if (last && b.top <= last.bottom + sp * 0.5 && b.left < last.right && b.right > last.left)
+      out[out.length - 1] = { left: Math.min(last.left, b.left), right: Math.max(last.right, b.right), top: last.top, bottom: Math.max(last.bottom, b.bottom) };
+    else out.push({ ...b });
+  }
+  return out;
 }
 
 /**
@@ -1057,6 +1176,28 @@ function joinByGap(groups: Staff[][]): Staff[][] {
   }
   return out;
 }
+
+/**
+ * **描边加粗的字**：八段锦（Sibelius 打谱、经 XPS 转出的 PDF）每个宋体/楷体字（含「【】」）除了文字层那一次，
+ * 还拿字的轮廓**另描一遍边**（只描不填的路径，外框与那段字重合），整页的中文都是这样。
+ * 不收走的话楷体字的弯笔被当成圆滑线（「欢快」两个字读成两条弧）、直笔进了线段池。
+ * 判据：只描边、外框整个落在某段**正文字体**文字的外框里（容半点）。收走：打 `TextInk`，线段一并撤出线段池。
+ */
+export function markTextInk(pg: SPage): void {
+  const texts = pg.objs.filter((o) => o.run && !musicFamily(o.run.font) && objTextLen(o) > 0);
+  if (!texts.length) return;
+  const ink = new Set<PObj>();
+  for (const o of pg.objs) {
+    const p = o.path;
+    if (!p || o.hasAnyTag() || /fill/i.test(p.paint) || !/stroke/i.test(p.paint)) continue;
+    const b = o.box;
+    if (texts.some((t) => b.left >= t.box.left - 0.5 && b.right <= t.box.right + 0.5 && b.top >= t.box.top - 0.5 && b.bottom <= t.box.bottom + 0.5)) ink.add(o);
+  }
+  for (const o of ink) o.addTag("TextInk");
+  if (ink.size) pg.segs = pg.segs.filter((s) => !ink.has(s.obj));
+}
+
+const objTextLen = (o: PObj): number => o.run!.glyphs.filter((g) => g.unicode.trim()).length;
 
 // ── 收尾 ────────────────────────────────────────────────────────────────────
 
@@ -1084,7 +1225,7 @@ export function unknownSegs(pg: SPage): Seg[] {
 
 /** 谱表的小节：由已认的小节线切开。`System::makeBars` 的页面级前身。
  *  小节线的**样式与反复**由 `barlines.ts` 归组后给出，这里顺带记到 `Bar` 上。 */
-export function makeBars(pg: SPage): void {
+export function makeBars(pg: SPage, opts: { keepRoomyHead?: boolean } = {}): void {
   /** 右端没有小节线收口的末条（最后一根小节线到谱线右端那一截）。 */
   const openTail = new Set<Bar>();
   for (const stf of pg.staves) {
@@ -1093,11 +1234,12 @@ export function makeBars(pg: SPage): void {
     const xs = marks.map((m) => m.x);
     let left = stf.box.left;
     let pendingLeftRepeat = false;
-    // 一行谱的第一小节，左端反复要从**上一行末尾**接过来（跨行的 `|:` 印在行首）
-    let prevLeftRepeat = marks[0]?.repeat === "forward" || marks[0]?.repeat === "both";
     // **两条小节线挨得比两个线距还近，就是同一处**（细+粗的终止线、反复线的两笔）。
     // 原先用半个线距当门槛，实测会在终止线处切出一个 4pt 宽、一个音符都没有的空小节。
     const minBar = (stf.stepDistance() || 1) * 4;
+    // 一行谱的第一小节，左端反复要从**上一行末尾**接过来（跨行的 `|:` 印在行首）。
+    // 头一根标记要真在行首：行首没有标记时它是行内第一根（祢話如甘霖第三行 m10 后的 `|:` 曾记到行首小节上）
+    let prevLeftRepeat = (marks[0]?.repeat === "forward" || marks[0]?.repeat === "both") && marks[0].x - stf.box.left < minBar;
     for (const x of xs) {
       if (x - left < minBar) {
         left = x;
@@ -1107,8 +1249,9 @@ export function makeBars(pg: SPage): void {
       bar.left = left;
       bar.right = x;
       const mk = marks.find((m) => m.x === x);
-      bar.rightStyle = mk?.style ?? null;
       bar.rightRepeat = mk?.repeat === "backward" || mk?.repeat === "both";
+      // 只是 `|:` 的那根（粗 + 细 + 点）：粗笔属于下一小节的反复记号，不是这一小节的终止线
+      bar.rightStyle = mk?.repeat === "forward" ? null : (mk?.style ?? null);
       // `|:` 记在**下一小节**的左端（MusicXML 的 forward repeat 挂在 location="left"）
       pendingLeftRepeat = mk?.repeat === "forward" || mk?.repeat === "both";
       bar.leftRepeat = prevLeftRepeat;
@@ -1151,8 +1294,15 @@ export function makeBars(pg: SPage): void {
         stf.bars[0].leftStyle = gone.rightStyle === "light-heavy" ? "heavy-light" : gone.rightStyle;
       }
     };
+    // 行首那条除了谱号调号拍号还空出三格以上的，是真的空小节（八段锦钢片琴 m12 什么都没印），不删。
+    // 只矢量路开（`keepRoomyHead`）：位图路行首的谱号调号不总认得全，量出来的空当不准，新编 088、281、352 多切出一个空小节
+    const headRoom = (stf: Staff) => {
+      const b = stf.bars[0];
+      const head = pg.symbols.filter((y) => (y.hasTag("Clef") || y.hasTag("Key") || y.hasTag("Time")) && overlapY(y.box, stf.box) && y.box.left >= b.left - sp && y.box.right <= b.right);
+      return b.right - Math.max(b.left, ...head.map((y) => y.box.right));
+    };
     for (;;) {
-      const emptyHead = (stf: Staff) => stf.bars.length > 1 && !stf.bars[0].notes.length;
+      const emptyHead = (stf: Staff) => stf.bars.length > 1 && !stf.bars[0].notes.length && !(opts.keepRoomyHead && headRoom(stf) >= sp * 3);
       const cand = g.filter(emptyHead);
       if (!cand.length) break;
       const aligned = g.every((stf) => stf.bars.length > 1 && Math.abs(stf.bars[0].right - g[0].bars[0].right) <= sp);

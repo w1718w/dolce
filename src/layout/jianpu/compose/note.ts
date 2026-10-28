@@ -1,16 +1,22 @@
 // 音符：数字、升降号、八度点、附点、和弦与注释、倚音、`&xx` 记号。
-import type { BarlineElement, MusicElement, NoteElement } from "../../../pu/ast";
+import type { BarlineElement, MusicElement, NoteElement } from "../../../jianpu/ast";
 import type { ElementId } from "../../../model/doc";
 import { AccidentalGlyph, type AccidentalKind } from "../../../engrave/accidental";
-import { ACCIDENTAL_GLYPH, ACCOMP_BRACKET } from "../../../pu/glyph";
-import { Font } from "../../font";
-import { Group, type JpNumber } from "../../pageitem";
+import { ACCIDENTAL_GLYPH, ACCOMP_BRACKET } from "../../../engrave/jpglyph";
+import { Font } from "../../../pagetree/font";
+import { GraphicPath, Group } from "../../../pagetree/pageitem";
+import { type JpNumber } from "../../../engrave/jpnumber";
 import { chordTextSegs, layoutHarmonySegs } from "../../../engrave/chord";
 import { highDotY, lowDotY } from "../../../engrave/stack";
+import type { Rect } from "../../../common/geom";
 import { augDotCenter } from "../../../engrave/augdot";
+import { jpTremoloCount, jpTremoloStrokes } from "../../../engrave/jptremolo";
 import { breathPath } from "../../../engrave/breath";
+import { jpSlideArrow, jpSlideOf } from "../../../engrave/jpslide";
 import type { PlacedItem, PlacedText } from "../place/model";
-import { graceLayout, noteBeams } from "../place/vertical";
+import { accidentalLeadOf, graceLayout, noteBeams, stackedDigits } from "../place/vertical";
+import { arpeggioGroup, JP_ARPEGGIO_SIZE } from "../../../engrave/arpeggio";
+import { MULTI_REST_WIDTH } from "../place/spacing";
 import { type OriginalCtx, digitItem, digitOrigin, dot, octaveDot, rect, stroke, text } from "./ctx";
 import { musicText } from "../../../engrave/prims";
 
@@ -43,7 +49,7 @@ export function paintBand(c: OriginalCtx, g: Group, el: MusicElement, kinds?: Re
     }
     // SMuFL 字形（奏法、力度、跳转字形）挂 `smufl`（`musicText`）：PPTX 按它转曲、成书按它落乐谱字体（同旧简谱引擎的 `SmuflText`）
     const family = t.face === "lyric" ? m.style.font.lyric.family : m.style.font.text.family;
-    const tf = t.face === "music" ? musicText(t.text, new Font("Bravura", t.size), c.ink) : text(t.text, x, y, new Font(family, t.size), c.ink);
+    const tf = t.face === "music" ? musicText(t.text, new Font("Bravura", t.size), c.ink) : text(t.text, x, y, new Font(family, t.size, !!t.bold), c.ink);
     if (t.face === "music") {
       tf.x = x;
       tf.y = y;
@@ -56,11 +62,41 @@ export function paintBand(c: OriginalCtx, g: Group, el: MusicElement, kinds?: Re
     } else if (t.kind === "key-label") tf.classes.add("key-change");
     else tf.classes.add(t.kind); // `artic` / `direction`（成书 line-check 认，`pdflayout/browser.ts::CLS_TAGS`）
     g.add(tf);
+    if (t.boxed) {
+      // 排练号的方框：`ink` 就是框（place/band.ts）
+      const b = t.ink.offset(o.x, o.y);
+      const p = stroke(c.ink, 1);
+      p.moveTo(b.left, b.top);
+      p.lineTo(b.right, b.top);
+      p.lineTo(b.right, b.bottom);
+      p.lineTo(b.left, b.bottom);
+      p.close();
+      p.classes.add("rehearsal");
+      g.add(p);
+    }
   }
 }
 
 const NOTE_TEXT = new Set<PlacedText["kind"]>(["chord", "section-word", "key-label"]);
 const NOTE_MARKS = new Set<PlacedText["kind"]>(["artic", "direction"]);
+
+/** 多小节休止（GB/T 46845 6.3.7.3「小节休止符」，谱例《豫北叙事曲》├─14─┤）：基线上一道横线、两头竖短线，横线上方居中印小节数。
+ *  照谱例量的（数字墨迹高 h）：横线与竖线一样粗 0.12 h，竖线高 0.8 h，数字墨迹底离横线约 0.25 h。
+ *  宽见 place/spacing.ts::MULTI_REST_WIDTH，`x` 是中点。 */
+function paintMultiRest(c: OriginalCtx, g: Group, bars: number, x: number, baseline: number): void {
+  const h = c.metrics.ink.noteHeight;
+  const w = h * MULTI_REST_WIDTH;
+  const t = h * 0.12;
+  g.add(rect(c.ink, x - w / 2, baseline - t / 2, w, t));
+  for (const ex of [x - w / 2, x + w / 2 - t]) g.add(rect(c.ink, ex, baseline - h * 0.4, t, h * 0.8));
+  // 小节数：数字墨迹底落在横线上方约四分之一个数字墨迹高处，多位数逐位排开
+  const label = [...String(bars)];
+  const step = c.digitFont.measureText("0");
+  label.forEach((ch, k) => {
+    const { dx, dy } = digitOrigin(c, ch);
+    g.add(digitItem(ch, x + dx + (k - (label.length - 1) / 2) * step, baseline + dy - h * 0.81, c.digitFont, c.ink));
+  });
+}
 
 export function paintNote(c: OriginalCtx,
   root: Group,
@@ -75,7 +111,8 @@ export function paintNote(c: OriginalCtx,
   g.data = note;
 
   let num: JpNumber | null = null;
-  if (!note.hidden) {
+  if (note.multiRest && !note.hidden) paintMultiRest(c, g, note.multiRest, x, baseline);
+  else if (!note.hidden) {
     const ch = note.sound === "rhythm" ? "X" : String(note.pitch);
     const { dx, dy } = digitOrigin(c, ch);
     num = digitItem(ch, x + dx, baseline + dy, c.digitFont, c.ink);
@@ -100,6 +137,39 @@ export function paintNote(c: OriginalCtx,
     for (let i = 0; i < -note.octave; i++) {
       g.add(octaveDot(c.ink, x, baseline + lowDotY(half, noteBeams(note), i, m.ink.stack), m.style.dot.octave));
     }
+
+    // 和音：叠在上面的数字（place/vertical.ts::stackedDigits 定落点），各带临时记号、八度点与附点；减时线只在最下面那个下
+    for (const sd of stackedDigits(note, m)) {
+      const sch = sd.pitch === 9 ? "X" : String(sd.pitch);
+      const o = digitOrigin(c, sch);
+      const by = baseline + sd.y;
+      g.add(digitItem(sch, x + o.dx, by + o.dy, c.digitFont, c.ink));
+      const sk = sd.accidental as AccidentalKind | undefined;
+      if (sk && ACCIDENTAL_GLYPH[sk]) {
+        const digit = { font: c.digitFont, text: sch, x: x + o.dx, y: by + o.dy };
+        g.add(new AccidentalGlyph(sk, digit, { music: new Font("Bravura", 20), color: c.ink, kind: m.style.look.accidentalStyle, scale: m.style.look.accidentalScale }).item);
+      }
+      for (let i = 0; i < sd.octave; i++) g.add(octaveDot(c.ink, x, by + highDotY(-half, i, m.ink.stack), m.style.dot.octave));
+      for (let i = 0; i < -sd.octave; i++) g.add(octaveDot(c.ink, x, by + lowDotY(half, 0, i, m.ink.stack), m.style.dot.octave));
+      const ink = o.b.offset(x + o.dx, by + o.dy);
+      for (let i = 0; i < note.dots; i++) {
+        const p = augDotCenter(ink, i, m.style.dot.aug, m.ink.stack.gap);
+        g.add(octaveDot(c.ink, p.cx, p.cy, m.style.dot.aug));
+      }
+      paintTremolo(c, g, note, ink);
+    }
+  }
+
+  // 琶音：竖波浪线从最低的数字画到最高的，在临时记号左边（画法与五线谱同一份，engrave/arpeggio.ts）
+  if (!note.hidden && note.ornaments.some((o) => o.name === "arp")) {
+    const H = m.ink.noteHeight;
+    const o = digitOrigin(c, String(note.pitch));
+    const inkLeft = x + o.dx + o.b.left;
+    const sd = stackedDigits(note, m);
+    const top = baseline + (sd.length ? sd[sd.length - 1]!.y : 0) - H / 2;
+    const accLead = accidentalLeadOf({ ...note, ornaments: [] }, m);
+    // 字形转过来后墨迹在定位点右边 0.39–0.84 个 staff space（= 0.12–0.25 H）：墨迹右缘离临时记号/数字左缘 0.25 H
+    g.add(arpeggioGroup(inkLeft - accLead - H * 0.5, top, baseline + H / 2, H * JP_ARPEGGIO_SIZE, c.ink));
   }
 
   // 附点：落点走公共那一份（engrave/augdot.ts：与数字墨迹中心等高，离数字墨迹右缘一道空）
@@ -113,6 +183,8 @@ export function paintNote(c: OriginalCtx,
     d.ident = { kind: "aug-dot" };
     g.add(d);
   }
+  if (!note.hidden && !note.multiRest) paintTremolo(c, g, note, digitInk);
+  if (!note.hidden && !note.multiRest) paintSlide(c, g, note, digitInk);
 
   // 和弦、注释、转调标签（定位端已按墨迹堆好，place/band.ts）
   paintBand(c, g, note, NOTE_TEXT);
@@ -130,6 +202,50 @@ export function paintNote(c: OriginalCtx,
   const id = c.doc?.idOf.get(note);
   if (id !== undefined) g.ident = { kind: "note", id, ...(c.pass !== undefined ? { pass: c.pass } : {}) };
   return num;
+}
+
+/** 同音高震音号：数字（连同附点）右下角几道左低右高的细斜线（`engrave/jptremolo.ts`，GB/T 46845 7.8.2.1）；和音每个数字各画 */
+function paintTremolo(c: OriginalCtx, g: Group, note: NoteElement, digitInk: Rect): void {
+  const n = jpTremoloCount(note.ornaments.map((o) => o.name));
+  if (n === 0) return;
+  const m = c.metrics;
+  const r = m.style.dot.aug;
+  const right = note.dots > 0 ? augDotCenter(digitInk, note.dots - 1, r, m.ink.stack.gap).cx + r : digitInk.right;
+  const cy = (digitInk.top + digitInk.bottom) / 2;
+  for (const s of jpTremoloStrokes(n, m.ink.noteHeight).strokes) {
+    // 两端水平截平的平行四边形（规范谱例的字形）
+    const p = new GraphicPath();
+    p.moveTo(right + s.x0 - s.thick / 2, cy + s.y0);
+    p.lineTo(right + s.x0 + s.thick / 2, cy + s.y0);
+    p.lineTo(right + s.x1 + s.thick / 2, cy + s.y1);
+    p.lineTo(right + s.x1 - s.thick / 2, cy + s.y1);
+    p.close();
+    p.fill = true;
+    p.fillColor = c.ink;
+    p.classes.add("artic");
+    p.ident = { kind: "deco" };
+    g.add(p);
+  }
+}
+
+/** 上 / 下滑音：数字（连同附点）右侧偏上一根直线短箭头 ↗ / ↘（`engrave/jpslide.ts`，GB/T 46845 7.6.4.3） */
+function paintSlide(c: OriginalCtx, g: Group, note: NoteElement, digitInk: Rect): void {
+  const dir = jpSlideOf(note.ornaments.map((o) => o.name));
+  if (!dir) return;
+  const m = c.metrics;
+  const r = m.style.dot.aug;
+  const right = note.dots > 0 ? augDotCenter(digitInk, note.dots - 1, r, m.ink.stack.gap).cx + r : digitInk.right;
+  const a = jpSlideArrow(dir === "up", m.ink.noteHeight);
+  const p = stroke(c.ink, a.lineWidth);
+  p.moveTo(right + a.x0, digitInk.bottom + a.y0);
+  p.lineTo(right + a.x1, digitInk.bottom + a.y1);
+  for (const [ax, ay] of a.arms) {
+    p.moveTo(right + ax, digitInk.bottom + ay);
+    p.lineTo(right + a.x1, digitInk.bottom + a.y1);
+  }
+  p.classes.add("artic");
+  p.ident = { kind: "deco" };
+  g.add(p);
 }
 
 /**

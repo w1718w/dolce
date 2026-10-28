@@ -9,7 +9,7 @@ import { recoverSpacesByInk } from "../omrkit/textspace";
 import type { Box, SPage, Staff } from "../staffomr/model";
 import type { StaffNote } from "../staffomr/notedata";
 import { chordCoverage, isChordLineCoverage, isWholeChord } from "../omrkit/chordgrammar";
-import type { RasterUnit } from "./staffline";
+import { liftRange, type RasterUnit } from "./staffline";
 import { contentKey } from "../omrkit/contentkey";
 
 /** 一条文字带：裸像素 + 它在页面上的盒。 */
@@ -34,13 +34,15 @@ const SIDE = 2;
 /**
  * 裁出各条文字带。**几何是死的**（只看谱行的盒），同一页跑几次裁出来一模一样，指纹才稳。
  */
-export function findWordStrips(bin: Binary, staves: { box: { left: number; right: number; top: number; bottom: number } }[], unit: RasterUnit): WordStrip[] {
+export function findWordStrips(bin: Binary, staves: WordStaff[], unit: RasterUnit): WordStrip[] {
   const sp = unit.space;
   const rows = [...staves].sort((a, b) => a.box.top - b.box.top);
   const out: WordStrip[] = [];
   // 页首行上方、页末行下方那条超出页面的，**照原高切、页外填白**（盒的 y 可以是负的）：贴着页边截断的窄带 DBNet 吃亏，
   // 破碎 p9 页顶「Soprano 1」离页边四点，截成 54 点高的带只读出「Soprano」
-  const cut = (y0: number, y1: number, left: number, right: number) => {
+  // 弯、斜的谱行：带的上下界取谱线在这一段的包络（罩得住整行的字），带里落进谱表（连让线那一点）的逐列刷白，
+  // 不让一头的谱线进带。`upper(x)` 以上是上一行谱、`lower(x)` 以下是下一行谱；平直的谱行两个都不给，带与原来逐像素相同
+  const cut = (y0: number, y1: number, left: number, right: number, upper?: (x: number) => number, lower?: (x: number) => number) => {
     const box = {
       x: Math.max(0, Math.round(left - sp * SIDE)),
       y: Math.round(y0),
@@ -52,23 +54,40 @@ export function findWordStrips(bin: Binary, staves: { box: { left: number; right
     if (box.w < 8 || Math.min(bin.h, box.y + box.h) - Math.max(0, box.y) < sp * 1.2) return;
     const data = new Uint8Array(box.w * box.h);
     let ink = 0;
-    for (let y = Math.max(0, -box.y); y < box.h && box.y + y < bin.h; y++)
-      for (let x = 0; x < box.w; x++) {
+    for (let x = 0; x < box.w; x++) {
+      const ya = upper ? Math.max(0, Math.round(upper(box.x + x)) - box.y) : 0;
+      const yb = lower ? Math.min(box.h, Math.round(lower(box.x + x)) - box.y) : box.h;
+      for (let y = Math.max(ya, -box.y); y < yb && box.y + y < bin.h; y++) {
         const v = bin.data[(box.y + y) * bin.w + box.x + x];
         data[y * box.w + x] = v;
         ink += v;
       }
+    }
     if (ink) out.push({ w: box.w, h: box.h, data, box });
   };
+  const clear = sp * LINE_CLEAR;
   rows.forEach((st, i) => {
     const prev = rows[i - 1];
     // 左右并排的两行谱（同一高度）不算上下邻行
     const above = prev && prev.box.bottom < st.box.top ? prev : undefined;
-    if (above) cut(above.box.bottom + sp * LINE_CLEAR, st.box.top - sp * LINE_CLEAR, Math.min(above.box.left, st.box.left), Math.max(above.box.right, st.box.right));
-    else cut(st.box.top - sp * EDGE_BAND, st.box.top - sp * LINE_CLEAR, st.box.left, st.box.right);
-    if (i === rows.length - 1) cut(st.box.bottom + sp * LINE_CLEAR, st.box.bottom + sp * EDGE_BAND, st.box.left, st.box.right);
+    const lift = st.lift;
+    const [lo, hi] = liftRange(lift, st.box.left, st.box.right);
+    const topAt = lift && ((x: number) => st.box.top + lift(x) - clear);
+    const botAt = lift && ((x: number) => st.box.bottom + lift(x) + clear);
+    if (above) {
+      const al = above.lift;
+      const [alo] = liftRange(al, above.box.left, above.box.right);
+      cut(above.box.bottom + alo + clear, st.box.top + hi - clear, Math.min(above.box.left, st.box.left), Math.max(above.box.right, st.box.right), al && ((x) => above.box.bottom + al(x) + clear), topAt);
+    } else cut(st.box.top + lo - sp * EDGE_BAND, st.box.top + hi - clear, st.box.left, st.box.right, undefined, topAt);
+    if (i === rows.length - 1) cut(st.box.bottom + lo + clear, st.box.bottom + hi + sp * EDGE_BAND, st.box.left, st.box.right, botAt);
   });
   return out;
+}
+
+/** 文字带要的谱行：盒（页面坐标），弯、斜的另带逐列偏移（`staffline.ts::liftOf`）。 */
+export interface WordStaff {
+  box: { left: number; right: number; top: number; bottom: number };
+  lift?: (x: number) => number;
 }
 
 /** 方框：边线粗不过这么多格；框高、框宽的范围（格）；框里四周垫白（格）。 */
@@ -178,7 +197,7 @@ const NAME_CLEAR = 1.5;
  * **声部名带**：每个系统谱行左边那一段（首行缩进里的全名「Soprano Alto」「Piano」、以后各行页边的缩写「S. A.」），
  * 上下到系统首尾谱行外一格。认字同文字指示带（同一个缓存、同一套 OCR），名字归哪个声部由 `staffomr/score.ts::nameParts` 按纵向定。
  */
-export function findNameStrips(bin: Binary, systems: { staves: { box: { left: number; top: number; bottom: number } }[] }[], unit: RasterUnit): WordStrip[] {
+export function findNameStrips(bin: Binary, systems: { staves: { box: { left: number; top: number; bottom: number }; lift?: (x: number) => number }[] }[], unit: RasterUnit): WordStrip[] {
   const sp = unit.space;
   const lefts = systems.flatMap((s) => s.staves.map((st) => st.box.left));
   if (!lefts.length) return [];
@@ -189,8 +208,10 @@ export function findNameStrips(bin: Binary, systems: { staves: { box: { left: nu
     const left = Math.min(...sys.staves.map((st) => st.box.left));
     const x0 = Math.max(0, Math.round(pageLeft - sp * NAME_REACH));
     const x1 = Math.round(left - sp * NAME_CLEAR);
-    const y0 = Math.max(0, Math.round(Math.min(...sys.staves.map((st) => st.box.top)) - sp));
-    const y1 = Math.min(bin.h, Math.round(Math.max(...sys.staves.map((st) => st.box.bottom)) + sp));
+    // 名字印在谱行左端外：弯、斜的谱行按左端那一列的线位
+    const at = (st: { box: { left: number }; lift?: (x: number) => number }) => st.lift?.(st.box.left) ?? 0;
+    const y0 = Math.max(0, Math.round(Math.min(...sys.staves.map((st) => st.box.top + at(st))) - sp));
+    const y1 = Math.min(bin.h, Math.round(Math.max(...sys.staves.map((st) => st.box.bottom + at(st))) + sp));
     if (x1 - x0 < sp * 2 || y1 - y0 < sp * 2) continue;
     const box = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     const data = new Uint8Array(box.w * box.h);
@@ -262,10 +283,11 @@ export type HeaderStrip = WordStrip & { creditFrom?: number };
  *   往上一路找到页顶。判空白行时不数页边「这一段里平均每列一成以上的行有墨」的列（`HEADER_BORDER`）。
  * - 密排的序言曾被凑成一行假谱表、把页眉带截在标题下面：找谱线之前已按文字框剔掉（`pagetext.ts`）。
  */
-export function findHeaderStrip(bin: Binary, staves: { box: { top: number } }[], unit: RasterUnit): HeaderStrip | null {
+export function findHeaderStrip(bin: Binary, staves: WordStaff[], unit: RasterUnit): HeaderStrip | null {
   if (!staves.length) return null;
   const sp = unit.space;
-  const top = Math.min(...staves.map((s) => s.box.top));
+  // 弯、斜的谱行取第一线最高的那一处：带底不切进谱线
+  const top = Math.min(...staves.map((s) => s.box.top + liftRange(s.lift, s.box.left, s.box.right)[0]));
   let y1 = Math.min(bin.h - 1, Math.round(top - sp * LINE_CLEAR));
   let y0 = Math.min(y1, Math.round(top - sp * EDGE_BAND));
   if (y0 < sp * 2) return null;
@@ -297,9 +319,21 @@ export function findHeaderStrip(bin: Binary, staves: { box: { top: number } }[],
   if (y0 < sp * 2) return null;
   y1 = retreat(y1, y0);
   const box = { x: 0, y: 0, w: bin.w, h: y1 };
+  // 弯、斜的页上页眉也斜（晨曦破晓整页斜一格，斜体小字的词缝在斜行里找不到空白列，补不出空格）：按第一行谱曲线两端连线的
+  // 平均斜率（整页的旋转）逐列挪整像素取条，挪出原范围的填白。平直的页条逐像素不变。
+  // 按条里字块自己的排列量（`lyric.ts::textSkew`）试过：页眉是几栏错落的短行，斜到 2.8% 也凑得出尖剖面（晨曦破晓页眉 62.5 → 46.9）
+  const first = staves.reduce<WordStaff | null>((a, s) => (!a || s.box.top < a.box.top ? s : a), null);
+  const x0 = bin.w / 2;
+  const skew = first?.lift ? (first.lift(first.box.right) - first.lift(first.box.left)) / Math.max(1, first.box.right - first.box.left) : 0;
   const data = new Uint8Array(box.w * box.h);
   let ink = 0;
-  for (let i = 0; i < data.length; i++) ink += data[i] = bin.data[i];
+  for (let x = 0; x < box.w; x++) {
+    const d = Math.round(skew * (x - x0));
+    for (let y = 0; y < box.h; y++) {
+      const sy = y + d;
+      if (sy >= 0 && sy < box.h) ink += data[y * box.w + x] = bin.data[sy * bin.w + x];
+    }
+  }
   return ink ? { w: box.w, h: box.h, data, box, creditFrom: y0 } : null;
 }
 
@@ -568,10 +602,10 @@ export function attachWordLines(
   unit: RasterUnit,
   skip: Rect[],
   lyricZones: Rect[],
-): { words: PlacedWord[]; dynamics: { px: number; py: number; text: string }[]; chords: { text: string; box: Rect }[] } {
+): { words: PlacedWord[]; dynamics: { px: number; py: number; text: string; srcBox?: { left: number; right: number; top: number; bottom: number } }[]; chords: { text: string; box: Rect }[] } {
   const sp = unit.space;
   const words: PlacedWord[] = [];
-  const dynamics: { px: number; py: number; text: string }[] = [];
+  const dynamics: { px: number; py: number; text: string; srcBox?: { left: number; right: number; top: number; bottom: number } }[] = [];
   const inside = (q: Rect, x: number, y: number) => x >= q.x && x <= q.x + q.w && y >= q.y && y <= q.y + q.h;
   // 先收齐各行（页面坐标），同一处被上下两条带各读一遍的只留一份
   const lines: { text: string; box: Rect; strip: WordStrip }[] = [];
@@ -641,7 +675,9 @@ export function attachWordLines(
     const dyn = DYNAMIC_RE.exec(text);
     const rest = dyn ? text.slice(dyn[0].length).trimStart() : "";
     if (dyn && (!rest || /^[\u4e00-\u9fff]/.test(rest))) {
-      dynamics.push({ px: box.x + Math.min(box.w, box.h * 0.6 * dyn[0].length) / 2, py: cy, text: dyn[0] });
+      const w = Math.min(box.w, box.h * 0.6 * dyn[0].length);
+      // `srcBox`：字行起头那几个字母的大致范围，只给识别对照画框（不当墨迹框用：挂音、写出照旧按没量到框走）
+      dynamics.push({ px: box.x + w / 2, py: cy, text: dyn[0], srcBox: { left: box.x, right: box.x + w, top: box.y, bottom: box.y + box.h } });
       continue;
     }
     if (skip.some((q) => inside(q, cx, cy))) continue;
@@ -706,17 +742,19 @@ export function attachWordLines(
     let above = true;
     for (const st of pg.staves) {
       if (cx < st.box.left - sp * SIDE || cx > st.box.right + sp * SIDE) continue;
-      const d = cy < st.box.top ? st.box.top - cy : cy > st.box.bottom ? cy - st.box.bottom : 0;
+      // 首末线按字心所在 x 取（弯、斜的谱线）
+      const t = st.topAt(cx), b = st.bottomAt(cx);
+      const d = cy < t ? t - cy : cy > b ? cy - b : 0;
       if (d < bd) {
         bd = d;
         stf = st;
-        above = cy < (st.box.top + st.box.bottom) / 2;
+        above = cy < (t + b) / 2;
       }
     }
     if (!stf) continue;
     // 两个系统之间的空当：文字指示、排练号、段落名都印在它管的那个系统**上方**，挂在上一系统末行下方的少（`rit.` 印在谱表下也贴着谱表）。
     // 离下一系统首行不比离上一系统末行远出 `INTER_SYS_BIAS` 倍就归下一系统（宁静 p5「Interelude」框字离上面钢琴左手 4 格、离下面右手 6 格）
-    if (cy > stf.box.bottom) {
+    if (cy > stf.bottomAt(cx)) {
       const sys = pg.systems.find((s) => s.staves.includes(stf!));
       const next = sys && pg.systems.filter((s) => s !== sys && s.box.top > stf!.box.bottom).sort((a, b) => a.box.top - b.box.top)[0];
       const low = next?.staves.reduce<Staff | undefined>((a, s) => (!a || s.box.top < a.box.top ? s : a), undefined);
@@ -733,6 +771,7 @@ export function attachWordLines(
       const bpm = Number(metro[2].replace(/ /g, ""));
       // 拍子单位只认四分：音符字形 OCR 读成 `J` / `d` 都有（烛光颂曲的四分读成 `d`），字母分不出
       note.metronome = { unit: "quarter", bpm, ...(metro[1] ? { text: `c. ${bpm}` } : {}), ...(paren ? { parentheses: true } : {}) };
+      note.tempoBox = { left: box.x, right: box.x + box.w, top: box.y, bottom: box.y + box.h };
     }
     // 速度文字与节拍器同一行的（`Andante ♩=76`）写进同一个 `<direction>`（见 `staffomr/textanalyze.ts::attachDirectionTexts`）
     if (metro && isWord && text) {
@@ -741,7 +780,7 @@ export function attachWordLines(
       words.push({ text, above, box, note });
     } else if (isWord && text) {
       // 行底当基线（文字指示多是不带下伸笔的西文，墨迹底就在基线上）：写源谱版面时照原位放
-      (note.words ??= []).push({ text, above, size: pg.inkTextSize?.(box, text) || box.h, baseY: box.y + box.h });
+      (note.words ??= []).push({ text, above, size: pg.inkTextSize?.(box, text) || box.h, baseY: box.y + box.h, box: { left: box.x, right: box.x + box.w, top: box.y, bottom: box.y + box.h } });
       words.push({ text, above, box, note });
     }
   }

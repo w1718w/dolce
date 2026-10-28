@@ -1,5 +1,5 @@
 // 原样文档布局的定位结构：排版行视图 → 各符号、记号、声部、谱组、页的位置。只有数据，算法在同目录各文件。
-import type { InlineLayerElement, LyricSyllable, Mark, MusicElement, ScoreLine, VoiceGroup } from "../../../pu/ast";
+import type { InlineLayerElement, LyricSyllable, Mark, MusicElement, ScoreLine, VoiceGroup } from "../../../jianpu/ast";
 import type { JianpuGrid } from "../metrics";
 import type { Rect } from "../../../common/geom";
 
@@ -37,12 +37,14 @@ export interface PlacedMark {
   y?: number;
   /** 弧罩住的音符够多（`arc.flatNotes`，成书用），不论跨度都画扁平式（同 `Line.addSlurTie`） */
   flat?: true;
+  /** 和音最下面那个音单连的延音线：画在叠印下方、开口朝上，`y` 是弧端那条线（数字、减时线、低音点之下一道空） */
+  below?: true;
   /** 嵌套层数或 `+` 抬高级别 */
   level: number;
   /** 左端续自上一行 / 右端续到下一行（弧线与跳房子支持跨行） */
   openLeft: boolean;
   openRight: boolean;
-  /** 两端实际落在哪两个符号上。`PuMark.start/end` 是**行内下标**不是元素 id，
+  /** 两端实际落在哪两个符号上。`FanqieMark.start/end` 是**行内下标**不是元素 id，
    *  可视化编辑要按元素 id 认这条弧，只能从这里取（`DocView.idOf`）。排版不读。 */
   startEl?: MusicElement;
   endEl?: MusicElement;
@@ -100,6 +102,8 @@ export interface PlacedVoice {
   /** 头顶最高的墨迹（相对基线，负为上）与其中字的最高墨迹顶（组间让位用，`vertical.ts::groupHeadroom`） */
   top: number;
   textTop: number | null;
+  /** 器乐谱谱行下方那条带（力度、渐强渐弱）的墨迹底（相对基线），没有就不写（`band.ts::placeBelow`） */
+  bottom?: number;
 }
 
 /** 上方带里的一件：和弦、段落词（音符注释）、转调标签、力度/术语/跳转字、奏法记号字形。 */
@@ -117,6 +121,10 @@ export interface PlacedText {
   ink: Rect;
   /** 逐字笔位（相对 `x`，标点挤压后的，`engrave/sectionword.ts::sectionWordRun`）：段落词才有 */
   xs?: number[] | null;
+  /** 外面套方框（排练号）：`ink` 已含框 */
+  boxed?: boolean;
+  /** 粗体（排练号，GB/T 46845 5.9.5 谱例） */
+  bold?: boolean;
 }
 
 export interface PlacedGroup {

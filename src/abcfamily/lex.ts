@@ -102,6 +102,8 @@ export abstract class AbcFamilyLexer {
 
   /** 音乐体里的 `&` 是不是小节内临时多声部分隔（ABC §7.4 voice overlay）。123 没有这个记号。 */
   protected readonly voiceOverlay: boolean = false;
+  /** 节奏音符后可跟 `@E5` 记谱表上的显示位置（123） */
+  protected readonly rhythmPositions: boolean = false;
 
   /** 落单的 `]` 算不算收尾线（野外 ABC 的容错）。123 不认。 */
   protected readonly strayBracketIsFinal: boolean = false;
@@ -130,7 +132,14 @@ export abstract class AbcFamilyLexer {
     return null;
   }
 
-  /** 同时发声的和弦（ABC 的 `[CEG]`）。123 靠多声部表达，这一档没有。 */
+  /** 看着是和音、却写错了的方括号（123）：返回诊断与要跳过的长度；不是返回 null。 */
+  protected malformedChordGroup(line: string, i: number): { message: string; len: number } | null {
+    void line;
+    void i;
+    return null;
+  }
+
+  /** 同时发声的和音（ABC 的 `[CEG]`、123 的 `[13]`）。不认返回 null。 */
   protected scanChordGroup(
     line: string,
     i: number,
@@ -269,9 +278,17 @@ export abstract class AbcFamilyLexer {
         continue;
       }
 
+      // 写错了的和音（`[03]` 放了休止、`[1X]` 混了节奏音符、`[13_]` 时值写进括号）：报清楚、整段跳过，不落成房号
+      const badGroup = this.malformedChordGroup(line, i);
+      if (badGroup) {
+        errors.push({ message: badGroup.message, source: span(start, badGroup.len) });
+        i += badGroup.len;
+        continue;
+      }
       // 房号 `[1` `[1,3` `[1-3` `[1,3,5-7`（ABC §4.9/§4.10）。**必须排在小节线之前**判，
       // 否则 `[|` 会先吃掉 `[`；反过来 `[|]`/`[|` 已在上面的 inline 判断后、这里之前轮到。
-      if (ch === "[" && /^\[\d/.test(line.slice(i))) {
+      // 123 的和音 `[13]` 也以 `[数字` 起头：`[` 后紧跟音符、中间无空格、`]` 收住的归和音（见下面的 scanChordGroup）
+      if (ch === "[" && /^\[\d/.test(line.slice(i)) && !this.scanChordGroup(line, i)) {
         const m = /^\[([\d,\-]+)/.exec(line.slice(i))!;
         const nums = expandEndingNumbers(m[1]!);
         i += m[0].length;
@@ -411,6 +428,12 @@ export abstract class AbcFamilyLexer {
       if (this.rhythmLetters.includes(ch)) {
         i++;
         const t: Omit<Token, "source"> = { kind: "rhythm", text: ch };
+        // 123 的 `X@E5`：谱表上的显示位置（MusicXML `<unpitched>` 的 display-step/octave）
+        const pos = this.rhythmPositions ? /^@([A-G])(\d)/.exec(line.slice(i)) : null;
+        if (pos) {
+          t.value = pos[1]! + pos[2]!;
+          i += pos[0].length;
+        }
         const mod = this.scanDuration(line, i);
         if (mod) {
           i = mod.next;
@@ -452,14 +475,23 @@ export abstract class AbcFamilyLexer {
         );
         // `cg.dur.next` 是行内绝对下标（scanChordGroup 从 `]` 之后接着扫的）
         i = cg.dur ? cg.dur.next : i + cg.text.length;
-        const t: Omit<Token, "source"> = {
+        // 同时敲的几个节奏音符 `[X@E5X@F5]`：落成一个带几个位置的节奏音符
+        const rhythms = inner.tokens.filter((x) => x.kind === "rhythm");
+        const t: Omit<Token, "source"> = rhythms.length >= 2 ? { kind: "rhythm", text: line.slice(start, i), notes: rhythms } : {
           kind: "chordGroup",
           text: line.slice(start, i),
-          notes: inner.tokens.filter((x) => x.kind === "note"),
+          notes: inner.tokens.flatMap((x, k) => {
+            if (x.kind !== "note") return [];
+            // 123 的 `[1~3]`、ABC 的 `[C-E]`
+            const nx = inner.tokens[k + 1]?.kind;
+            return nx === "arcNext" || nx === "tie" ? [{ ...x, tieNext: true }] : [x];
+          }),
         };
         if (cg.dur) {
-          t.num = cg.dur.num;
-          t.den = cg.dur.den;
+          if (cg.dur.num !== undefined) t.num = cg.dur.num;
+          if (cg.dur.den !== undefined) t.den = cg.dur.den;
+          if (cg.dur.beams) t.beams = cg.dur.beams;
+          if (cg.dur.dots) t.dots = cg.dur.dots;
         }
         push(t, start, i - start);
         continue;
@@ -482,6 +514,7 @@ export abstract class AbcFamilyLexer {
         t.dots = rest.dots;
         if (rest.num !== undefined) t.num = rest.num;
         if (rest.den !== undefined) t.den = rest.den;
+        if (rest.bars !== undefined) t.bars = rest.bars;
         push(t, start, i - start);
         continue;
       }
